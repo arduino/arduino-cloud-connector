@@ -1,0 +1,473 @@
+# This file is part of arduino-cloud-connector.
+#
+# SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# OpenAPI 3.0 description of the arduino-cloud-connector daemon localhost REST API.
+# Generated as a reference from internal/api/*. Keep in sync with the handlers.
+
+openapi: 3.0.3
+
+info:
+  title: Arduino Cloud Connector REST API
+  description: |
+    Localhost REST API exposed by the `arduino-cloud-connector` daemon. Consumed by
+    App Lab (identity / provisioning / status) and by Cloud Brick Apps (cloud
+    variables CRUD + Server-Sent Events).
+
+    All endpoints are served on `127.0.0.1` only. CORS is allowed for
+    `wails://*` and `http://localhost:*` origins; every route also answers
+    `OPTIONS` with `204 No Content` (CORS preflight).
+
+    The `mock` build (`-tags mock`) exposes the exact same surface and JSON
+    shapes; only `GET /v1/version` differs (a `-mock` suffix on the version
+    string).
+  version: 1.0.0
+  license:
+    name: GPL-3.0-or-later
+    url: https://www.gnu.org/licenses/gpl-3.0.html
+
+servers:
+  - url: http://127.0.0.1:5683
+    description: Default localhost address (port from RFC §11; overridable via ARDUINO_CLOUD_CONNECTOR__PORT)
+
+tags:
+  - name: System
+    description: Health and version probes.
+  - name: Identity & Provisioning
+    description: Board identity, daemon status, and provisioning trigger (App Lab).
+  - name: Cloud Variables
+    description: Cloud variable registry CRUD and inbound value event stream (Cloud Brick Apps).
+
+paths:
+  /v1/version:
+    get:
+      tags: [System]
+      summary: Daemon build version
+      operationId: getVersion
+      responses:
+        "200":
+          description: The daemon version string. Mock builds carry a `-mock` suffix.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+              examples:
+                production:
+                  value: { version: "0.1.0" }
+                mock:
+                  value: { version: "0.1.0-mock" }
+
+  /v1/health:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Daemon is alive. Empty body.
+
+  /v1/identity:
+    get:
+      tags: [Identity & Provisioning]
+      summary: Board identity (board token + public key + UHWID)
+      description: |
+        Returns a freshly-minted short-lived ES256 board token, the
+        provisioning public key (PEM), and the board's UHWID. App Lab forwards
+        the board token to the Arduino backend to authenticate the board.
+      operationId: getIdentity
+      responses:
+        "200":
+          description: Identity payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityResponse"
+        "500":
+          description: |
+            Could not load the provisioning key, generate the board token, or
+            load the public key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                cannotLoadKey:
+                  value: { error: "cannot load provisioning key", details: "open .../private_provisioning_key.pem: no such file or directory" }
+                cannotGenerateToken:
+                  value: { error: "cannot generate board token", details: "..." }
+                cannotLoadPublicKey:
+                  value: { error: "cannot load public key", details: "..." }
+
+  /v1/status:
+    get:
+      tags: [Identity & Provisioning]
+      summary: Composed daemon + provisioning + cloud status
+      operationId: getStatus
+      responses:
+        "200":
+          description: |
+            Composed snapshot. The `cloud` object is present only when the
+            daemon FSM is in the `Run` state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+              examples:
+                unprovisioned:
+                  value: { provisioning: "unprovisioned", daemon: "Provisioning" }
+                provisioningError:
+                  value: { provisioning: "error", daemon: "Provisioning" }
+                running:
+                  value:
+                    provisioning: "provisioned"
+                    daemon: "Run"
+                    device_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    organization_id: "a1b2c3d4-5566-7788-99aa-bbccddeeff00"
+                    cloud: { state: "Steady", thing_id: "9f1c2d3e-4567-89ab-cdef-0123456789ab" }
+                runningNoThing:
+                  value:
+                    provisioning: "provisioned"
+                    daemon: "Run"
+                    device_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                    cloud: { state: "AwaitingThingID" }
+
+  /v1/provisioning/start:
+    post:
+      tags: [Identity & Provisioning]
+      summary: Trigger (re)provisioning
+      description: |
+        Asks the daemon FSM to (re)provision. The call BLOCKS until the
+        synchronous prelude — write the in-flight marker and wipe the old
+        credentials — has run, so the response reflects whether that committed
+        step succeeded; the longer CSR attempt (with retry) then proceeds
+        asynchronously. A request while the FSM is not parked waiting for a
+        command (an attempt already in flight, or a non-command state such as
+        CheckInternet) returns `409`. If the prelude itself fails (e.g. a disk
+        error), `500` is returned and the caller can safely retry.
+
+        The request body is optional and may carry an `organization_id`; when
+        supplied it is persisted as part of the prelude. Omit it (or send an
+        empty body) to provision without an associated organization.
+      operationId: startProvisioning
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartProvisioningRequest"
+            example: { organization_id: "a1b2c3d4-5566-7788-99aa-bbccddeeff00" }
+      responses:
+        "202":
+          description: |
+            Prelude committed (marker written, old credentials wiped); the CSR
+            attempt runs asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedResponse"
+              example: { status: "accepted" }
+        "409":
+          description: A provisioning is already in progress, or the daemon is not ready to accept the request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "provisioning already in progress", details: "daemon: not ready to reprovision (busy or already in progress)" }
+        "500":
+          description: The provisioning prelude failed (e.g. could not write the marker or wipe credentials); safe to retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "provisioning prelude failed", details: "..." }
+
+  /v1/variables/{name}:
+    put:
+      tags: [Cloud Variables]
+      summary: Set a variable value (outbound to cloud)
+      description: |
+        Stores the variable's value (with the current timestamp), notifies SSE
+        subscribers, and publishes it to the cloud property topic. The variable
+        is created on first use — there is no separate registration step.
+
+        Requires an assigned thing (the cloud FSM in steady state). If no thing
+        is assigned yet the value is **not** queued and the call returns `409`
+        with error `thing_unavailable`, so the app can keep the value locally and
+        retry once the thing is available (see the `thing_unavailable` /
+        `lastvalue` / `lastvalue_missing` SSE frames on the events stream).
+      operationId: setVariableValue
+      parameters:
+        - $ref: "#/components/parameters/VariableName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendValueRequest"
+            examples:
+              float:
+                value: { value: 21.5 }
+              bool:
+                value: { value: true }
+              string:
+                value: { value: "hello" }
+      responses:
+        "204":
+          description: Value set. Empty body.
+        "400":
+          description: Malformed JSON body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "invalid request body", details: "unexpected EOF" }
+        "409":
+          description: |
+            No thing assigned yet (cloud not steady). The value was not queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "thing_unavailable", details: "daemon: no thing assigned (cloud not steady)" }
+
+  /v1/variables/{name}/events:
+    get:
+      tags: [Cloud Variables]
+      summary: Stream value updates (Server-Sent Events)
+      description: |
+        Opens a `text/event-stream` connection (the variable is created on
+        first use if it does not exist yet). The **first frame is always** one of
+        three sync events telling the app how to seed its local value:
+
+        - `thing_unavailable`: no thing is assigned yet (cloud not steady). The
+          app keeps its local value and waits; once the cloud reaches steady
+          state a resync frame (`lastvalue` or `lastvalue_missing`) is sent on
+          this same stream.
+        - `lastvalue`: a thing is assigned and this variable has a cloud last
+          value (replayed with `last_value: true`) — the app resolves local vs
+          cloud according to its sync policy.
+        - `lastvalue_missing`: a thing is assigned but this variable has no cloud
+          value — the app's local value wins and is pushed up.
+
+        Every subsequent live cloud-side change is sent as an `update` event.
+        Multiple apps may subscribe to the same variable concurrently — each
+        receives its own first frame. Ordering is FIFO per subscriber; a slow
+        consumer never blocks the producer and no event is dropped.
+      operationId: streamVariableEvents
+      parameters:
+        - $ref: "#/components/parameters/VariableName"
+      responses:
+        "200":
+          description: |
+            SSE stream established. Body is an open `text/event-stream`; each
+            event has the form
+            `event: <thing_unavailable|lastvalue|lastvalue_missing|update>\ndata: {"name":...,"value":...,"timestamp":...}\n\n`.
+            The `thing_unavailable` and `lastvalue_missing` frames carry only `{"name":...}`.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: "no-cache" }
+            Connection:
+              schema: { type: string, example: "keep-alive" }
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/UpdateEvent"
+              example: { name: "temperature", value: 22.7, timestamp: "2026-06-22T10:00:00Z", last_value: true }
+
+components:
+  parameters:
+    VariableName:
+      name: name
+      in: path
+      required: true
+      description: The registered variable name.
+      schema:
+        type: string
+      example: temperature
+
+  schemas:
+    VersionResponse:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: string
+          description: Daemon build version. Mock builds end with `-mock`.
+          example: "0.1.0"
+
+    IdentityResponse:
+      type: object
+      required: [board_token, public_key_pem, uhwid]
+      properties:
+        board_token:
+          type: string
+          description: |
+            Short-lived ES256 JWT. The `iss` claim carries the UHWID; the
+            server enforces a 10-minute window on `iat` (no `exp`).
+          example: "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhMWIyYzMuLi4ifQ.SIG"
+        public_key_pem:
+          type: string
+          description: Provisioning public key in PEM format.
+          example: "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZI...\n-----END PUBLIC KEY-----\n"
+        uhwid:
+          type: string
+          description: Unique hardware ID — 64-char lowercase hex SHA-256. Same value as the token's `iss` claim.
+          pattern: "^[0-9a-f]{64}$"
+          example: "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b"
+
+    StatusResponse:
+      type: object
+      required: [provisioning, daemon]
+      properties:
+        provisioning:
+          $ref: "#/components/schemas/ProvisioningState"
+        daemon:
+          $ref: "#/components/schemas/DaemonState"
+        device_id:
+          type: string
+          format: uuid
+          description: |
+            Device UUID assigned by the cloud at provisioning time. Present only
+            when stored on disk (i.e. the board is provisioned); omitted otherwise.
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        organization_id:
+          type: string
+          description: |
+            Organization the device was provisioned into. Optional — present only
+            when an `organization_id` was supplied to /v1/provisioning/start;
+            omitted otherwise (even for a provisioned board).
+          example: "a1b2c3d4-5566-7788-99aa-bbccddeeff00"
+        cloud:
+          allOf:
+            - $ref: "#/components/schemas/CloudStatus"
+          description: Present only when `daemon` == `Run`; omitted otherwise.
+
+    CloudStatus:
+      type: object
+      required: [state]
+      properties:
+        state:
+          $ref: "#/components/schemas/CloudState"
+        thing_id:
+          type: string
+          format: uuid
+          description: Attached Thing UUID. Omitted when no Thing is attached yet.
+          example: "9f1c2d3e-4567-89ab-cdef-0123456789ab"
+
+    ProvisioningState:
+      type: string
+      description: |
+        Provisioning service state, derived from disk (no dedicated state file):
+        the in-flight marker takes precedence over the credential files.
+        `provisioning` = an attempt is in flight within its retry window;
+        `error` = an in-flight attempt exceeded the retry window and is awaiting a
+        new /v1/provisioning/start; `provisioned` = credentials present, no marker;
+        `unprovisioned` = no credentials and no attempt in flight.
+      enum: [unprovisioned, provisioning, provisioned, error]
+
+    DaemonState:
+      type: string
+      description: Top-level daemon FSM macro state.
+      enum: [CheckInternet, Provisioning, Run]
+
+    CloudState:
+      type: string
+      description: Nested Cloud FSM lifecycle state (only meaningful while daemon == Run).
+      enum:
+        - Disconnected
+        - Reconnecting
+        - Connecting
+        - AnnouncingDevice
+        - AwaitingThingID
+        - SyncingLastValues
+        - Steady
+
+    StartProvisioningRequest:
+      type: object
+      description: Optional body for POST /v1/provisioning/start.
+      properties:
+        organization_id:
+          type: string
+          description: |
+            Organization the board should be provisioned into. Optional; when
+            absent or empty the board is provisioned without an associated
+            organization.
+          example: "a1b2c3d4-5566-7788-99aa-bbccddeeff00"
+
+    AcceptedResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+          example: accepted
+
+    Variable:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          example: temperature
+        value:
+          description: |
+            Current value (any JSON value — number, bool, string, object,
+            array). Omitted when no value has been set yet.
+          example: 21.5
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            Moment the current value was last set, locally or by the cloud
+            (the "last value" timestamp). Omitted when no value has been set.
+          example: "2026-06-22T10:00:00Z"
+
+    SendValueRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          description: |
+            New value for the variable. Any JSON value (number, string,
+            boolean, object, array, null).
+          example: 21.5
+
+    UpdateEvent:
+      type: object
+      description: "One Server-Sent Event payload (the JSON after the SSE `data:` prefix)."
+      required: [name, value, timestamp]
+      properties:
+        name:
+          type: string
+          example: temperature
+        value:
+          description: New value. Any JSON value.
+          example: 22.7
+        timestamp:
+          type: string
+          format: date-time
+          description: Moment the value was set (cloud change time, or local PUT time).
+          example: "2026-06-22T10:00:00Z"
+        last_value:
+          type: boolean
+          description: |
+            True only on the first event of a stream (the `lastvalue` event,
+            replaying the current stored value). Omitted (false) on live
+            `update` events.
+          example: true
+
+    Error:
+      type: object
+      description: Standard error envelope returned by failing endpoints.
+      required: [error, details]
+      properties:
+        error:
+          type: string
+          description: Human-readable error category.
+          example: variable not found
+        details:
+          type: string
+          description: Underlying error message.
+          example: 'variable "temperature" not found'

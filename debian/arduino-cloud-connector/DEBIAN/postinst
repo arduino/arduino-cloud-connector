@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" = "configure" ]; then
+	update-ca-certificates --fresh
+fi
+
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+	systemctl enable arduino-cloud-connector
+	systemctl restart arduino-cloud-connector || systemctl start arduino-cloud-connector
+fi

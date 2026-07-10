@@ -1,0 +1,6 @@
+Package: arduino-cloud-connector
+Version: $VERSION
+Architecture: $ARCH
+Maintainer: arduino <support@arduino.cc>
+Description: Arduino IoT Cloud connector for Linux boards
+Depends: awk, ca-certificates, needrestart

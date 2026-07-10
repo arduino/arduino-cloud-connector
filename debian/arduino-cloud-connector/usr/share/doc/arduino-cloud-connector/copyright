@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: arduino-cloud-connector
+Upstream-Contact: support@arduino.cc
+Source: https://github.com/arduino/arduino-cloud-connector
+
+Files: *
+Copyright: Arduino s.r.l. and/or its affiliated companies
+License: GPL-3.0-or-later

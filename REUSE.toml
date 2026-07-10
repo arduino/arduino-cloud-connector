@@ -1,0 +1,40 @@
+version = 1
+
+# Debian build scripts
+[[annotations]]
+path = "debian/**"
+SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Docs
+[[annotations]]
+path = [
+  "HANDOFF.md",
+  "docs/**",
+]
+SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Scripts
+[[annotations]]
+path = "scripts/**"
+SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Tool-generated or configuration files.
+[[annotations]]
+path = [
+  ".licenses/**",
+  ".editorconfig",
+  ".golangci.yml",
+  ".gitignore",
+  ".licensed.yml",
+  "dprint.json",
+  "Taskfile.yml",
+  "go.mod",
+  "go.sum",
+  "README.md",
+  "internal/api/docs/**",
+]
+SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
+SPDX-License-Identifier = "GPL-3.0-or-later"

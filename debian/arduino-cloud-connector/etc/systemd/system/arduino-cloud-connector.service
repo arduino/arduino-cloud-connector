@@ -1,0 +1,41 @@
+[Unit]
+Description=Arduino Cloud Connector
+Documentation=https://docs.arduino.cc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=1000
+Group=arduino
+StandardOutput=journal
+StandardError=journal
+ExecStart=/usr/bin/arduino-cloud-connector daemon
+Restart=on-failure
+RestartSec=5s
+
+# Environment — all values can be overridden in /etc/arduino-cloud-connector/env
+Environment=ARDUINO_CLOUD_CONNECTOR__DATA_DIR=/home/arduino/.local/share/arduino-cloud-connector
+Environment=ARDUINO_CLOUD_CONNECTOR__PORT=5683
+Environment=ARDUINO_CLOUD_CONNECTOR__MQTT_BROKER=mqtts://iot.arduino.cc:8885
+Environment=ARDUINO_CLOUD_CONNECTOR__PROVISIONING_API=https://api2.arduino.cc/provisioning
+Environment=ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL=info
+
+# Harden the service: restrict access to the rest of the filesystem.
+ProtectSystem=strict
+ProtectHome=false
+TemporaryFileSystem=/home:ro
+BindPaths=/home/arduino/.local/share/arduino-cloud-connector
+ReadWritePaths=/home/arduino/.local/share/arduino-cloud-connector
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Create /run/arduino-cloud-connector (owned by the service user) for the daemon's
+# UNIX-socket API. Preserve it across daemon restarts so a container that
+# bind-mounts the directory keeps a stable mount (only the socket file is
+# recreated; the daemon clears a stale one on start).
+RuntimeDirectory=arduino-cloud-connector
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+
+# Path to the data directory.
+DATA_DIR="/home/arduino/.local/share/arduino-cloud-connector"
+
+# Check if the directory does NOT exist yet (First-time install)
+if [ ! -d "$DATA_DIR" ]; then
+    mkdir -p "$DATA_DIR"
+    chown -R arduino:arduino "$DATA_DIR"
+    chmod -R 700 "$DATA_DIR"
+fi

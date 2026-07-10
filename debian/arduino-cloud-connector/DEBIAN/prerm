@@ -1,0 +1,4 @@
+#!/bin/sh
+
+systemctl disable arduino-cloud-connector || true
+systemctl stop arduino-cloud-connector || true

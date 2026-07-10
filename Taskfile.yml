@@ -1,0 +1,258 @@
+version: "3"
+
+dotenv: [".env.local", ".env"]
+
+vars:
+  GOLANGCI_LINT_VERSION: v2.11.4
+  GOIMPORTS_VERSION: v0.42.0
+  DPRINT_VERSION: 0.48.0
+  VERSION:
+    sh: echo "${VERSION:-0.0.0-$(git rev-parse --short HEAD)}"
+  BINARY: arduino-cloud-connector
+  ARCH: '{{.ARCH | default "arm64"}}'
+
+tasks:
+  init:
+    desc: Setup local env
+    deps:
+      - install:linter
+      - install:goimports
+      - install:dprint
+      - install:reuse
+
+  install:reuse:
+    cmds:
+      - uv tool install reuse
+
+  install:goimports:
+    cmds:
+      - go install golang.org/x/tools/cmd/goimports@{{ .GOIMPORTS_VERSION }}
+
+  install:dprint:
+    cmds:
+      - curl -fsSL https://dprint.dev/install.sh | sh -s {{ .DPRINT_VERSION }}
+      - mkdir -p .bin && cp $HOME/.dprint/bin/dprint .bin/dprint # workaround for local install
+
+  build:
+    desc: Build the binary locally
+    cmds:
+      - go build -v -ldflags="-X main.Version={{.VERSION}}" -o ./build/{{.BINARY}} ./cmd/{{.BINARY}}
+
+  build:mock:
+    desc: |
+      Build the mock binary for App Lab FE development. It talks to the REAL
+      Provisioning API and the REAL MQTT broker, exactly like production; the
+      only differences are dev-host conveniences: UHWID is random and persisted
+      to <dataDir>/mock_uhwid (the FE registers it server-side after calling
+      /v1/identity), and the keystore POSIX-permission check is skipped. The
+      mock binary is named <BINARY>-mock so it can never be confused with the
+      production one; the build tag is set at compile time.
+    cmds:
+      - go build -v -tags mock -ldflags="-X main.Version={{.VERSION}}-mock" -o ./build/{{.BINARY}}-mock ./cmd/{{.BINARY}}
+
+  run:
+    desc: Build and start the daemon
+    deps: [build]
+    cmds:
+      - ./build/{{.BINARY}} daemon
+
+  run:mock:
+    desc: |
+      Build and start the mock daemon (for App Lab FE development).
+
+      Default data dir: $HOME/.cache/arduino-cloud-connector-mock — picked so the
+      same task works cleanly on the team's two dev shapes:
+        - WSL on Windows: $HOME lives on the native ext4 inside the WSL
+          distro, NOT on /mnt/c (which does not honour POSIX mode bits and
+          would break the keystore permission check on production builds).
+        - macOS: $HOME lives on APFS, POSIX modes honoured.
+
+      The production default /var/lib/arduino-cloud-connector is avoided here
+      because it requires root on the dev host.
+
+      Override MOCK_DATA_DIR to point elsewhere if needed:
+        MOCK_DATA_DIR=/tmp/mydaemon task run:mock
+    deps: [build:mock]
+    vars:
+      MOCK_DATA_DIR: '{{.MOCK_DATA_DIR | default "$HOME/.cache/arduino-cloud-connector-mock"}}'
+    cmds:
+      - mkdir -p {{.MOCK_DATA_DIR}}
+      - ARDUINO_CLOUD_CONNECTOR__DATA_DIR={{.MOCK_DATA_DIR}} ./build/{{.BINARY}}-mock daemon
+
+  clean:mock:
+    desc: Wipe the mock daemon's data directory (forces a fresh UHWID + keystore on next run).
+    vars:
+      MOCK_DATA_DIR: '{{.MOCK_DATA_DIR | default "$HOME/.cache/arduino-cloud-connector-mock"}}'
+    cmds:
+      - rm -rf {{.MOCK_DATA_DIR}}
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./... -v -race {{.CLI_ARGS}}
+
+  test:cbor:
+    desc: |
+      Run CBOR command encode/decode tests (internal/mqtt/command).
+      Golden bytes are derived from the Arduino IoT Cloud C++ library test suite
+      (extras/test/src/test_command_encode.cpp and test_command_decode.cpp) and
+      represent the canonical wire format expected by the cloud backend.
+    cmds:
+      - go test -v -race ./internal/mqtt/command/... {{.CLI_ARGS}}
+
+  test:senml:
+    desc: |
+      Run SenML+CBOR property encode/decode tests (internal/senml).
+      Golden bytes are derived from the Arduino IoT Cloud C++ library test suite
+      (extras/test/src/test_decode.cpp) and cover bool, int, float, string, and
+      multi-variable payloads with BaseTime resolution.
+    cmds:
+      - go test -v -race ./internal/senml/... {{.CLI_ARGS}}
+
+  test:cloud:
+    desc: |
+      Run Cloud FSM tests (internal/daemon/cloud).
+      Uses a fake in-process MQTT client with millisecond-scale back-off timers
+      so the full handshake, detach, reassignment, and reconnect scenarios run
+      without any real network access.
+    cmds:
+      - go test -v -race ./internal/daemon/cloud/... {{.CLI_ARGS}}
+
+  test:protocol:
+    desc: Run both CBOR command and SenML tests (shortcut for test:cbor + test:senml)
+    cmds:
+      - go test -v -race ./internal/mqtt/command/... ./internal/senml/... {{.CLI_ARGS}}
+
+  test:cover:
+    desc: Run tests with coverage report
+    cmds:
+      - go test ./... -coverprofile=coverage.out
+      - go tool cover -html=coverage.out
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - .bin/golangci-lint run --fix -v --timeout 300s {{.CLI_ARGS}}
+
+  install:linter:
+    cmds:
+      - curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b .bin/ v2.11.4
+
+  fmt:
+    desc: Format Go code
+    cmds:
+      - goimports -l -w .
+
+  generate:
+    desc: Run go generate
+    cmds:
+      - go generate ./...
+
+  build-deb:
+    desc: |
+      Build the .deb package via Docker.
+      Pass RELEASE=true to strip debug symbols (used by CI on tagged releases).
+      Examples:
+        task build-deb                              # local, debug symbols kept
+        task build-deb ARCH=arm64                   # cross-compile for arm64
+        task build-deb VERSION=v1.2.3 RELEASE=true  # same as CI release build
+    cmds:
+      - docker build
+          --build-arg BINARY_NAME={{.BINARY}}
+          --build-arg DEB_NAME={{.BINARY}}
+          --build-arg VERSION={{.VERSION}}
+          --build-arg ARCH={{.ARCH}}
+          {{if .RELEASE}}--build-arg RELEASE=true{{end}}
+          --output={{.OUTPUT}}
+          -f debian/Dockerfile .
+    vars:
+      ARCH: '{{.ARCH | default "arm64"}}'
+      OUTPUT: '{{.OUTPUT | default "./build"}}'
+
+  release:
+    desc: "Tag and push a release (usage: task release -- v1.2.3)"
+    cmds:
+      - |
+          if [ -z "{{.CLI_ARGS}}" ]; then
+            echo "Usage: task release -- <version>"
+            exit 1
+          fi
+      - git tag -a "{{.CLI_ARGS}}" -m "Release {{.CLI_ARGS}}"
+      - git push origin "{{.CLI_ARGS}}"
+
+  board:install:
+    desc: Install arduino-cloud-connector on the board
+    interactive: true
+    cmds:
+      - rm ./build/*.deb || true
+      - task: build-deb
+      - adb shell rm /tmp/*.deb || true
+      - adb push ./build/{{.BINARY}}_*_arm64.deb /tmp/
+      - ./scripts/run-remote-sudo.sh "dpkg -i /tmp/{{.BINARY}}*_arm64.deb && needrestart -r a"
+
+  # Source: https://github.com/arduino/tooling-project-assets/blob/main/workflow-templates/assets/check-dependencies-task/Taskfile.yml
+  general:cache-dep-licenses:
+    desc: Cache dependency license metadata
+    deps:
+      - task: general:prepare-deps
+    cmds:
+      - |
+          if
+            ! which licensed \
+            &>/dev/null
+          then
+            if [[ {{OS}} == "windows" ]]; then
+              echo "Licensed does not have Windows support."
+              echo "Please use Linux/macOS or download the dependencies cache from the GitHub Actions workflow artifact."
+            else
+              echo "licensed not found or not in PATH."
+              echo "Please install: https://github.com/licensee/licensed#installation"
+            fi
+            exit 1
+          fi
+      - licensed cache
+      - licensed notices
+
+  # Source: https://github.com/arduino/tooling-project-assets/blob/main/workflow-templates/assets/check-dependencies-task/Taskfile.yml
+  general:check-dep-licenses:
+    desc: Check for unapproved dependency licenses
+    deps:
+      - task: general:cache-dep-licenses
+    cmds:
+      - |
+          MATCHES="$(
+            find \
+              .licenses \
+              -regex '.+\.yml' \
+              -type f \
+              -print0 \
+            | \
+              xargs \
+                --null \
+                go tool \
+                  github.com/mikefarah/yq/v4 \
+                    'select(.license == "other") | filename'
+          )"
+          if [[ "$MATCHES" != "" ]]; then
+            printf "%s" "$MATCHES"
+            echo
+            echo "The license cache files above have the license set to 'other'. Please manually define the license type and retry."
+            echo "See: https://github.com/arduino/tooling-project-assets/blob/main/workflow-templates/check-go-dependencies-task.md#unrecognized-licenses"
+            exit 1
+          fi
+      - licensed status
+
+  # Source: https://github.com/arduino/tooling-project-assets/blob/main/workflow-templates/assets/check-go-dependencies-task/Taskfile.yml
+  general:prepare-deps:
+    desc: Prepare project dependencies for license check
+    # No preparation is needed for Go module-based projects.
+
+  go:check-license-headers:
+    desc: verify presence of license headers and exit with non-zero code if missing
+    cmds:
+      - uvx reuse lint
+
+  go:update-license-headers:
+    desc: Update license headers in Go files with reuse template
+    cmds:
+      - uvx reuse annotate --template {{.BINARY}} --exclude-year --copyright "Arduino s.r.l. and/or its affiliated companies"  --license GPL-3.0-or-later -r  $(find . -name "*.go" -o -name "*.sh" -type f -print0 | xargs -0)
