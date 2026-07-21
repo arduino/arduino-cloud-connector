@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/arduino/arduino-cloud-connector/internal/senml"
@@ -319,14 +320,77 @@ func TestDecode_InvalidCBOR(t *testing.T) {
 }
 
 func TestDecode_EmptyName(t *testing.T) {
-	// A record with no Name and no BaseName — should fail validation.
+	// A VALUE-bearing record with no Name and no BaseName — should fail
+	// validation (a value with no name is unaddressable).
 	// [{2: 42}] = 81 A1 02 18 2A
 	payload := []byte{0x81, 0xA1, 0x02, 0x18, 0x2A}
 	_, err := senml.Decode(payload)
 	require.Error(t, err)
 }
 
+// TestDecode_ColoredLightWithBaseRecords is the regression for the daemon
+// silently dropping every ColoredLight update: a multi-value property message
+// may carry value-less BASE records (BaseName/BaseTime), which are valid SenML
+// (RFC 8428). They must be skipped, not cause the whole message to be rejected
+// with "record has no value or sum field". Symptom before the fix: on_write
+// never fired for a ColoredLight while it worked for a scalar variable.
+func TestDecode_ColoredLightWithBaseRecords(t *testing.T) {
+	want := []string{"clight:swi", "clight:hue", "clight:sat", "clight:bri"}
+
+	// Layout A: a value-less BaseTime record, then full-name attribute records.
+	varsA := decodeRecords(t, []senml.Record{
+		{BaseTime: 1_700_000_000},
+		{Name: "clight:swi", BoolValue: boolPtr(true)},
+		{Name: "clight:hue", Value: senml.Float64Number(30).Ptr()},
+		{Name: "clight:sat", Value: senml.Float64Number(50).Ptr()},
+		{Name: "clight:bri", Value: senml.Float64Number(70).Ptr()},
+	})
+	require.Equal(t, want, varNames(varsA))
+
+	// Layout B: a value-less BaseName+BaseTime record, then suffix-name records
+	// resolved against the base name (clight: + swi = clight:swi).
+	varsB := decodeRecords(t, []senml.Record{
+		{BaseName: "clight:", BaseTime: 1_700_000_000},
+		{Name: "swi", BoolValue: boolPtr(false)},
+		{Name: "hue", Value: senml.Float64Number(30).Ptr()},
+		{Name: "sat", Value: senml.Float64Number(50).Ptr()},
+		{Name: "bri", Value: senml.Float64Number(70).Ptr()},
+	})
+	require.Equal(t, want, varNames(varsB))
+}
+
+// TestDecode_BaseOnlyRecordsProduceNoVariables: a message consisting only of
+// base/context records is valid and simply yields no variables (not an error).
+func TestDecode_BaseOnlyRecordsProduceNoVariables(t *testing.T) {
+	vars := decodeRecords(t, []senml.Record{
+		{BaseTime: 1_700_000_000},
+		{BaseName: "clight:"},
+	})
+	require.Empty(t, vars)
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+func boolPtr(v bool) *bool { return &v }
+
+// decodeRecords marshals hand-built SenML records to CBOR (using the same
+// keyasint tags the cloud uses on the wire) and decodes them via senml.Decode.
+func decodeRecords(t *testing.T, recs []senml.Record) []senml.Variable {
+	t.Helper()
+	payload, err := cbor.Marshal(recs)
+	require.NoError(t, err)
+	vars, err := senml.Decode(payload)
+	require.NoError(t, err)
+	return vars
+}
+
+func varNames(vars []senml.Variable) []string {
+	names := make([]string, len(vars))
+	for i, v := range vars {
+		names[i] = v.Name
+	}
+	return names
+}
 
 // roundTrip encodes vars and decodes them back, asserting no errors and that
 // the name, type and value survive unchanged. Returns decoded vars for further
