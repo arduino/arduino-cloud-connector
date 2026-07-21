@@ -21,6 +21,8 @@ package variables
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -193,6 +195,26 @@ func (r *Registry) Get(name string) (Variable, error) {
 		return Variable{}, fmt.Errorf("variable %q not found", name)
 	}
 	return *v, nil
+}
+
+// WithPrefix returns a copy of every variable whose name starts with prefix and
+// that has been set at least once (non-zero timestamp), sorted by name. It is
+// used to assemble the full attribute set of a multi-value cloud property
+// (e.g. prefix "clight:" → clight:swi, clight:hue, clight:sat, clight:bri) so
+// that a partial device update can be published as the complete property.
+// Never-set placeholder entries created by Subscribe are excluded (they have no
+// value to send).
+func (r *Registry) WithPrefix(prefix string) []Variable {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Variable
+	for name, v := range r.vars {
+		if strings.HasPrefix(name, prefix) && !v.Timestamp.IsZero() {
+			out = append(out, *v)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // SetValue updates the value (and last-value timestamp) of a variable and

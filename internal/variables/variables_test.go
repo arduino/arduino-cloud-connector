@@ -6,6 +6,7 @@
 package variables
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -275,5 +276,29 @@ func TestNotifyResyncEmitsLastValueMissing(t *testing.T) {
 	}
 	if evt.Value != nil {
 		t.Errorf("evt.Value = %v, want nil for a missing last value", evt.Value)
+	}
+}
+
+func TestWithPrefix(t *testing.T) {
+	r := NewRegistry()
+	ts := time.Now().UTC()
+	r.SetValue("clight:swi", true, ts)
+	r.SetValue("clight:hue", 30.0, ts)
+	r.SetValue("clight:bri", 70.0, ts)
+	r.SetValue("led", false, ts) // unrelated scalar, must not match
+
+	// A subscribed-but-never-set placeholder (nil value, zero ts) must be
+	// excluded — it has no value to send in a property packet.
+	_, _, sub := r.Subscribe("clight:sat")
+	defer r.Unsubscribe("clight:sat", sub)
+
+	got := r.WithPrefix("clight:")
+	names := make([]string, len(got))
+	for i, v := range got {
+		names[i] = v.Name
+	}
+	want := []string{"clight:bri", "clight:hue", "clight:swi"} // sorted; sat excluded
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("WithPrefix(\"clight:\") names = %v, want %v", names, want)
 	}
 }

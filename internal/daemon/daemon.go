@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -359,12 +360,23 @@ func (h *outboundHeap) Pop() any {
 	return item
 }
 
-// publishVariable encodes value as SenML+CBOR and publishes it on the outbound
-// property topic for the currently-assigned thing. Returns ErrNotSteady if the
-// daemon is not in Run state or no thing_id is known yet.
+// publishVariable encodes the given locally-set variable as SenML+CBOR and
+// publishes it on the outbound property topic for the currently-assigned thing.
+// Returns ErrNotSteady if the daemon is not in Run state or no thing_id is known
+// yet.
 //
-// Ordering is guaranteed by runOutbound publishing in sequence, not by any
-// wire timestamp: the payload carries only name+value, exactly as before.
+// For a multi-value property attribute (name "property:attribute") the WHOLE
+// property is published — all sibling attributes at their current registry
+// values — in a single message, mirroring the C++ ArduinoIoTCloud library
+// (appendAttributesToCloud always encodes every attribute). Arduino Cloud
+// rebuilds a structured property (e.g. a ColoredLight) from each inbound
+// message and resets any attribute absent from it to its default, so a partial
+// update (only "clight:hue") would silently switch "clight:swi" back to false.
+// Sending the full packet keeps the unmodified attributes (their last value)
+// intact.
+//
+// Ordering is guaranteed by runOutbound publishing in sequence, not by any wire
+// timestamp: the payload carries only name+value.
 func (d *Daemon) publishVariable(name string, value any) error {
 	snap := d.Snapshot()
 	if snap.State != StateRun || snap.Cloud == nil || snap.Cloud.ThingID == "" {
@@ -381,11 +393,38 @@ func (d *Daemon) publishVariable(name string, value any) error {
 			"name", name, "daemon_state", snap.State, "cloud_state", cloudState, "thing_id", thingID)
 		return ErrNotSteady
 	}
-	payload, err := senml.Encode([]senml.Variable{{Name: name, Value: value}})
+	payload, err := senml.Encode(d.propertyPacket(name, value))
 	if err != nil {
 		return fmt.Errorf("daemon: encode variable %q: %w", name, err)
 	}
 	return d.client.PublishProperty(snap.Cloud.ThingID, payload)
+}
+
+// propertyPacket returns the SenML variables to publish for the locally-set
+// variable (name, value). A plain scalar publishes just itself. A multi-value
+// property attribute ("property:attribute") publishes the complete property:
+// every sibling attribute currently in the registry, with the just-set value
+// substituted for name (the registry is updated right before publish, but this
+// guards against a concurrent overwrite). See publishVariable for why the whole
+// property must travel in one message.
+func (d *Daemon) propertyPacket(name string, value any) []senml.Variable {
+	prop, _, isAttribute := strings.Cut(name, ":")
+	if !isAttribute {
+		return []senml.Variable{{Name: name, Value: value}}
+	}
+	siblings := d.reg.WithPrefix(prop + ":")
+	if len(siblings) == 0 {
+		return []senml.Variable{{Name: name, Value: value}}
+	}
+	vars := make([]senml.Variable, 0, len(siblings))
+	for _, v := range siblings {
+		val := v.Value
+		if v.Name == name {
+			val = value
+		}
+		vars = append(vars, senml.Variable{Name: v.Name, Value: val})
+	}
+	return vars
 }
 
 // Run drives the daemon FSM. Blocks until ctx is cancelled.

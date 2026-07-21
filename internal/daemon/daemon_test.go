@@ -7,8 +7,11 @@ package daemon
 
 import (
 	"container/heap"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/arduino/arduino-cloud-connector/internal/variables"
 )
 
 // The outbound heap must always surface the earliest-timestamped value first,
@@ -48,5 +51,41 @@ func TestOutboundHeapTiebreakBySeq(t *testing.T) {
 	}
 	if got := heap.Pop(h).(outboundValue); got.name != "second" {
 		t.Fatalf("got %q, want second", got.name)
+	}
+}
+
+// A multi-value property attribute must be published as the WHOLE property
+// (every sibling attribute at its current registry value, with the just-set
+// value substituted), so Arduino Cloud does not reset the unmodified attributes
+// to their defaults — e.g. a ColoredLight's swi must not flip to false when only
+// the colour changes. A plain scalar publishes just itself.
+func TestPropertyPacket(t *testing.T) {
+	d := &Daemon{reg: variables.NewRegistry()}
+	ts := time.Now().UTC()
+	d.reg.SetValue("clight:swi", true, ts)
+	d.reg.SetValue("clight:hue", 30.0, ts)
+	d.reg.SetValue("clight:sat", 50.0, ts)
+	d.reg.SetValue("clight:bri", 70.0, ts)
+
+	// Scalar: only itself.
+	scalar := d.propertyPacket("led", false)
+	if len(scalar) != 1 || scalar[0].Name != "led" || scalar[0].Value != false {
+		t.Fatalf("scalar packet = %+v, want single {led,false}", scalar)
+	}
+
+	// Attribute: the full property, with the just-set hue (123.0) overriding the
+	// stale registry value (30.0), and swi preserved at its last value (true).
+	got := map[string]any{}
+	for _, v := range d.propertyPacket("clight:hue", 123.0) {
+		got[v.Name] = v.Value
+	}
+	want := map[string]any{
+		"clight:swi": true,
+		"clight:hue": 123.0,
+		"clight:sat": 50.0,
+		"clight:bri": 70.0,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("property packet = %v, want %v", got, want)
 	}
 }
