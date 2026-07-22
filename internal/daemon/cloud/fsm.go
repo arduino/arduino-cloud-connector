@@ -596,7 +596,7 @@ func (f *FSM) shutdown() {
 // applyProperties decodes a SenML+CBOR payload and writes each variable into
 // the registry (creating entries on demand, so values pushed by the cloud
 // before any app subscribes are still stored as the last value). When logEach
-// is true (last-values sync) each decoded variable's name and value is logged.
+// is true (last-values sync) each decoded variable's name is logged.
 func (f *FSM) applyProperties(payload []byte, logEach bool) error {
 	if len(payload) == 0 {
 		return nil
@@ -607,7 +607,7 @@ func (f *FSM) applyProperties(payload []byte, logEach bool) error {
 	}
 	for _, v := range vars {
 		if logEach {
-			slog.Info("cloud: last value received", "name", v.Name, "value", v.Value)
+			slog.Info("cloud: last value received", "name", v.Name)
 		}
 		f.reg.SetValue(v.Name, v.Value, v.Timestamp)
 	}
