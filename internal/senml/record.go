@@ -22,11 +22,11 @@
 //
 // # Subset implemented
 //
-// - Single-value records: numeric (int64/float64), string, bool.
-// - BaseName, BaseTime, BaseValue.
-// - Multi-value properties (name "prop:field" colon semantics) are decoded
-//   but flattened into separate Record entries — the registry layer handles
-//   reassembly.
+//   - Single-value records: numeric (int64/float64), string, bool.
+//   - BaseName, BaseTime, BaseValue.
+//   - Multi-value properties (name "prop:field" colon semantics) are decoded
+//     but flattened into separate Record entries — the registry layer handles
+//     reassembly.
 //
 // OTA, RPC magic strings, timezone, and other protocol extensions are out of
 // scope for this package.
@@ -127,30 +127,39 @@ func (n Number) MarshalCBOR() ([]byte, error) {
 // Integer CBOR keys (keyasint) are used in the CBOR encoding to minimise
 // wire size; the key numbers match the RFC §6 label definitions.
 type Record struct {
-	BaseName    string   `cbor:"-2,keyasint,omitempty"`
-	BaseTime    float64  `cbor:"-3,keyasint,omitempty"`
-	BaseUnit    string   `cbor:"-4,keyasint,omitempty"`
-	BaseVersion uint     `cbor:"-1,keyasint,omitempty"`
-	BaseValue   *Number  `cbor:"-5,keyasint,omitempty"`
-	BaseSum     *Number  `cbor:"-6,keyasint,omitempty"`
-	Name        string   `cbor:"0,keyasint,omitempty"`
-	Unit        string   `cbor:"1,keyasint,omitempty"`
-	Time        float64  `cbor:"6,keyasint,omitempty"`
-	UpdateTime  float64  `cbor:"7,keyasint,omitempty"`
-	Value       *Number  `cbor:"2,keyasint,omitempty"`
-	StringValue *string  `cbor:"3,keyasint,omitempty"`
-	DataValue   *string  `cbor:"8,keyasint,omitempty"`
-	BoolValue   *bool    `cbor:"4,keyasint,omitempty"`
-	Sum         *Number  `cbor:"5,keyasint,omitempty"`
+	BaseName    string  `cbor:"-2,keyasint,omitempty"`
+	BaseTime    float64 `cbor:"-3,keyasint,omitempty"`
+	BaseUnit    string  `cbor:"-4,keyasint,omitempty"`
+	BaseVersion uint    `cbor:"-1,keyasint,omitempty"`
+	BaseValue   *Number `cbor:"-5,keyasint,omitempty"`
+	BaseSum     *Number `cbor:"-6,keyasint,omitempty"`
+	Name        string  `cbor:"0,keyasint,omitempty"`
+	Unit        string  `cbor:"1,keyasint,omitempty"`
+	Time        float64 `cbor:"6,keyasint,omitempty"`
+	UpdateTime  float64 `cbor:"7,keyasint,omitempty"`
+	Value       *Number `cbor:"2,keyasint,omitempty"`
+	StringValue *string `cbor:"3,keyasint,omitempty"`
+	DataValue   *string `cbor:"8,keyasint,omitempty"`
+	BoolValue   *bool   `cbor:"4,keyasint,omitempty"`
+	Sum         *Number `cbor:"5,keyasint,omitempty"`
 }
 
 // validate checks invariants on a slice of records:
-//   - every resolved name (BaseName + Name) is non-empty
 //   - at most one value field is set per record
+//   - every value-bearing record has a non-empty resolved name (BaseName+Name)
+//
+// A record with no value field is a *base/context* record: per RFC 8428 it may
+// carry BaseName/BaseTime/BaseValue/BaseSum/BaseVersion that apply to the
+// records that follow, contributing no measurement of its own. Arduino Cloud
+// emits such records in multi-value property messages (e.g. a ColoredLight
+// change sends the swi/hue/sat/bri attributes preceded by base records), so
+// they MUST be accepted — toVariables simply skips them. Rejecting them made
+// the whole message fail to decode, dropping every attribute of the property.
+// Only a value-bearing record needs a name (a value with no name is
+// unaddressable and is still rejected).
 var (
-	errEmptyName     = errors.New("senml: record has empty resolved name")
+	errEmptyName     = errors.New("senml: value record has empty resolved name")
 	errTooManyValues = errors.New("senml: more than one value field in record")
-	errNoValue       = errors.New("senml: record has no value or sum field")
 )
 
 func validate(records []Record) error {
@@ -160,9 +169,6 @@ func validate(records []Record) error {
 	for _, r := range records {
 		if r.BaseName != "" {
 			baseName = r.BaseName
-		}
-		if baseName+r.Name == "" {
-			outErr = errors.Join(outErr, errEmptyName)
 		}
 
 		var n int
@@ -181,8 +187,10 @@ func validate(records []Record) error {
 		if n > 1 {
 			outErr = errors.Join(outErr, errTooManyValues)
 		}
-		if n == 0 && r.Sum == nil && (r.BaseSum == nil || r.BaseSum.IsZero()) {
-			outErr = errors.Join(outErr, errNoValue)
+
+		hasValue := n > 0 || r.Sum != nil || (r.BaseSum != nil && !r.BaseSum.IsZero())
+		if hasValue && baseName+r.Name == "" {
+			outErr = errors.Join(outErr, errEmptyName)
 		}
 	}
 	return outErr
