@@ -9,7 +9,9 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/arduino/arduino-cloud-connector/internal/daemon"
@@ -225,13 +227,25 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 		flusher.Flush() // open the stream now, before the first frame
 
 		// First frame: the sync state the app resolves against.
+		var (
+			kind variables.EventKind
+			err  error
+		)
 		switch {
 		case !cloud.CloudSteady():
-			writeSSE(w, variables.EventThingUnavailable, map[string]string{"name": name})
+			kind = variables.EventThingUnavailable
+			err = writeSSE(w, kind, map[string]string{"name": name})
 		case hasValue:
-			writeSSE(w, variables.EventLastValue, snapshot)
+			kind = variables.EventLastValue
+			err = writeSSE(w, kind, snapshot)
 		default:
-			writeSSE(w, variables.EventLastValueMissing, map[string]string{"name": name})
+			kind = variables.EventLastValueMissing
+			err = writeSSE(w, kind, map[string]string{"name": name})
+		}
+		if err != nil {
+			// Client gone before the seed, or the payload could not be sent.
+			slog.Error("sse: failed to write first frame", "name", name, "event", string(kind), "error", err)
+			return
 		}
 		flusher.Flush()
 
@@ -243,7 +257,10 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 				if !open {
 					return
 				}
-				writeSSE(w, evt.Kind, evt)
+				if err := writeSSE(w, evt.Kind, evt); err != nil {
+					slog.Error("sse: failed to write event", "name", name, "event", string(evt.Kind), "error", err)
+					return
+				}
 				flusher.Flush()
 			}
 		}
@@ -258,20 +275,45 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// maxSSEPayload bounds the JSON payload of a single SSE frame. Variable values
+// are small scalars or compact structured objects, orders of magnitude below
+// this, so a larger payload is anomalous and is rejected rather than sent. The
+// bound is also what keeps writeSSE's frame-size computation provably within
+// int: len(data) comes from an arbitrary (cloud-controlled) value, and an
+// unbounded length summed into the make() capacity could overflow and panic on
+// a 32-bit build.
+const maxSSEPayload = 1 * 1024 * 1024 // 1 MiB
+
 // writeSSE writes a single named Server-Sent Event with a JSON data payload.
 //
 // It takes a plain io.Writer (not the http.ResponseWriter): the payload is an
 // SSE stream carrying JSON, not an HTML page, so html/template escaping does
-// not apply. The frame is assembled into a byte slice and written as-is.
-func writeSSE(w io.Writer, event variables.EventKind, v any) {
-	data, _ := json.Marshal(v)
+// not apply. The whole frame is assembled into one byte slice and written in a
+// single Write.
+//
+// It returns an error when the value cannot be marshalled, when the payload
+// exceeds maxSSEPayload, or when the write fails; the caller ends the stream on
+// error.
+func writeSSE(w io.Writer, event variables.EventKind, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("sse: marshal payload: %w", err)
+	}
+	if len(data) > maxSSEPayload {
+		return fmt.Errorf("sse: payload too large: %d bytes (max %d)", len(data), maxSSEPayload)
+	}
+	// len(data) is now bounded by maxSSEPayload and event is a short internal
+	// constant, so this capacity computation cannot overflow int.
 	frame := make([]byte, 0, len("event: \ndata: \n\n")+len(event)+len(data))
 	frame = append(frame, "event: "...)
 	frame = append(frame, event...)
 	frame = append(frame, "\ndata: "...)
 	frame = append(frame, data...)
 	frame = append(frame, "\n\n"...)
-	_, _ = w.Write(frame)
+	if _, err := w.Write(frame); err != nil {
+		return fmt.Errorf("sse: write frame: %w", err)
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, status int, msg string, err error) {

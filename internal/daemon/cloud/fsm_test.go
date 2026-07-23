@@ -9,8 +9,10 @@
 package cloud
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"runtime"
 	"sync"
 	"testing"
@@ -22,6 +24,7 @@ import (
 	"github.com/arduino/arduino-cloud-connector/internal/keystore"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt/command"
+	"github.com/arduino/arduino-cloud-connector/internal/senml"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
 )
 
@@ -227,6 +230,35 @@ const testThingID command.ThingID = "00000000-0000-0000-0000-000000000001"
 // TestFSM_HappyPath_FullHandshake verifies the complete Device.begin →
 // Thing.begin → LastValues.begin handshake that runs on every broker connect.
 // It checks both state transitions and the commands published at each step.
+// Security regression: variable values exchanged with the cloud must never be
+// written to the logs (possible user PII). On the last-values sync path
+// (logEach=true) applyProperties may log the property NAME, but never its value.
+func TestApplyProperties_NeverLogsVariableValue(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	const sentinel = "PII-SENTINEL-VALUE"
+	payload, err := senml.Encode([]senml.Variable{{Name: "temp", Value: sentinel}})
+	require.NoError(t, err)
+
+	reg := variables.NewRegistry()
+	f := newFSM(config.Config{}, "dev-id", reg, &fakeClient{})
+
+	// logEach=true is the last-values sync path that historically logged v.Value.
+	require.NoError(t, f.applyProperties(payload, true))
+
+	out := logBuf.String()
+	require.NotContains(t, out, sentinel, "variable value must never appear in the logs")
+	require.Contains(t, out, "temp", "the property name may still be logged")
+
+	// The value is still stored in the registry — only the logging changed.
+	got, err := reg.Get("temp")
+	require.NoError(t, err)
+	require.Equal(t, sentinel, got.Value)
+}
+
 func TestFSM_HappyPath_FullHandshake(t *testing.T) {
 	client, fsm := newTestFSM(t)
 	runFSM(t, fsm)

@@ -7,6 +7,8 @@ package api
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/arduino/arduino-cloud-connector/internal/api/handlers"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
@@ -46,7 +48,9 @@ func NewRouter(
 	return corsMiddleware(cfg, mux)
 }
 
-// corsMiddleware adds CORS headers to allow wails://, http://wails.localhost:*, http://localhost:* and https://localhost:*.
+// corsMiddleware adds CORS headers for the exact allow-list in allowedOrigins
+// (wails://wails, wails://wails.localhost:*, http://wails.localhost:*,
+// http://localhost:* and https://localhost:*).
 func corsMiddleware(_ config.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -64,23 +68,56 @@ func corsMiddleware(_ config.Config, next http.Handler) http.Handler {
 	})
 }
 
+// allowedOrigin is one CORS origin rule. scheme and host must match the request
+// origin exactly — host is compared in full, never as a prefix. (The previous
+// prefix check, origin[:16] == "http://localhost", also matched hostile origins
+// such as http://localhost.attacker.com.) When anyPort is true the origin may
+// carry any port or none; when false it must carry no port.
+type allowedOrigin struct {
+	scheme  string
+	host    string
+	anyPort bool
+}
+
+// allowedOrigins is the exact CORS allow-list (mirrors arduino-app-cli):
+//
+//	wails://wails
+//	wails://wails.localhost:*
+//	http://wails.localhost:*
+//	http://localhost:*
+//	https://localhost:*
+var allowedOrigins = []allowedOrigin{
+	{scheme: "wails", host: "wails", anyPort: false},
+	{scheme: "wails", host: "wails.localhost", anyPort: true},
+	{scheme: "http", host: "wails.localhost", anyPort: true},
+	{scheme: "http", host: "localhost", anyPort: true},
+	{scheme: "https", host: "localhost", anyPort: true},
+}
+
+// isAllowedOrigin reports whether origin is in the CORS allow-list. It parses
+// the origin and matches scheme + host (+ port policy) exactly, so a host that
+// merely starts with an allowed name (e.g. localhost.attacker.com) is rejected.
 func isAllowedOrigin(origin string) bool {
 	if origin == "" {
 		return false
 	}
-	// Allow Wails desktop apps and local development servers.
-	// Matches wails://wails and wails://wails.localhost:*
-	if len(origin) >= 13 && origin[:13] == "wails://wails" {
-		return true
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
 	}
-	if len(origin) >= 16 && origin[:16] == "http://localhost" {
-		return true
+	// A well-formed Origin is exactly scheme://host[:port]; reject anything
+	// carrying a path, query, fragment, userinfo or opaque part.
+	if u.Opaque != "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
 	}
-	if len(origin) >= 17 && origin[:17] == "https://localhost" {
-		return true
-	}
-	if len(origin) >= 22 && origin[:22] == "http://wails.localhost" {
-		return true
+	host, port := u.Hostname(), u.Port()
+	for _, a := range allowedOrigins {
+		if u.Scheme != a.scheme || !strings.EqualFold(host, a.host) {
+			continue
+		}
+		if a.anyPort || port == "" {
+			return true
+		}
 	}
 	return false
 }

@@ -7,6 +7,7 @@ package handlers_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,7 +15,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -260,6 +263,51 @@ func TestVariableEventsFirstFrameLastValue(t *testing.T) {
 	}
 	if payload["last_value"] != true {
 		t.Errorf("payload last_value = %v, want true", payload["last_value"])
+	}
+}
+
+// failingResponseWriter is an http.ResponseWriter + http.Flusher whose Write
+// always fails, used to drive the SSE handler's write-error path.
+type failingResponseWriter struct {
+	header   http.Header
+	writeErr error
+}
+
+func (f *failingResponseWriter) Header() http.Header       { return f.header }
+func (f *failingResponseWriter) Write([]byte) (int, error) { return 0, f.writeErr }
+func (f *failingResponseWriter) WriteHeader(int)           {}
+func (f *failingResponseWriter) Flush()                    {}
+
+// When writing an SSE frame fails (e.g. the client disconnected), the handler
+// logs the failure at ERROR level and ends the stream instead of failing
+// silently.
+func TestVariableEventsLogsWriteError(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError})))
+	defer slog.SetDefault(prev)
+
+	reg := variables.NewRegistry()
+	h := handlers.HandleVariableEvents(reg, fakeSteady{false})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/variables/temp/events", nil)
+	req.SetPathValue("name", "temp")
+	w := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("broken pipe")}
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after a write error")
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "sse:") || !strings.Contains(out, "name=temp") {
+		t.Errorf("expected an ERROR log about the sse write failure, got %q", out)
 	}
 }
 
