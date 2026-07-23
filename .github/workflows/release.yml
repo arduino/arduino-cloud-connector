@@ -9,6 +9,9 @@ env:
   GITHUB_TOKEN: ${{ secrets.ARDUINOBOT_TOKEN }}
   GITHUB_USERNAME: ArduinoBot
 
+permissions:
+  contents: write
+
 jobs:
   build-deb:
     name: Build .deb (${{ matrix.arch }})
