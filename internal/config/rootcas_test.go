@@ -3,7 +3,7 @@
 // SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-package mqtt
+package config
 
 import (
 	"crypto/ecdsa"
@@ -19,10 +19,15 @@ import (
 	"time"
 )
 
-// TestBrokerRootCAs covers the broker server-cert trust selection: an empty
-// path means "use system roots" (nil pool), a valid PEM is pinned, and bad
-// inputs surface as errors rather than silently falling back.
-func TestBrokerRootCAs(t *testing.T) {
+// TestCloudRootCAs covers the server-cert trust selection shared by the MQTT
+// broker client and the storage client: an empty path means "use system roots"
+// (nil pool), a valid PEM is pinned, and bad inputs surface as errors rather than
+// silently falling back to the system store — a silent fallback would turn a
+// pinning misconfiguration into a weaker trust decision than the operator asked
+// for.
+//
+// Moved here from internal/mqtt when the rule stopped being broker-specific.
+func TestCloudRootCAs(t *testing.T) {
 	dir := t.TempDir()
 
 	validCA := filepath.Join(dir, "ca.pem")
@@ -36,7 +41,7 @@ func TestBrokerRootCAs(t *testing.T) {
 	}
 
 	t.Run("empty path falls back to system roots", func(t *testing.T) {
-		pool, err := brokerRootCAs("")
+		pool, err := Config{}.CloudRootCAs()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -46,7 +51,7 @@ func TestBrokerRootCAs(t *testing.T) {
 	})
 
 	t.Run("valid CA is pinned", func(t *testing.T) {
-		pool, err := brokerRootCAs(validCA)
+		pool, err := Config{MQTTCAFile: validCA}.CloudRootCAs()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -56,13 +61,14 @@ func TestBrokerRootCAs(t *testing.T) {
 	})
 
 	t.Run("missing file errors", func(t *testing.T) {
-		if _, err := brokerRootCAs(filepath.Join(dir, "nope.pem")); err == nil {
+		cfg := Config{MQTTCAFile: filepath.Join(dir, "nope.pem")}
+		if _, err := cfg.CloudRootCAs(); err == nil {
 			t.Fatal("expected error for missing CA file")
 		}
 	})
 
 	t.Run("non-PEM file errors", func(t *testing.T) {
-		if _, err := brokerRootCAs(junk); err == nil {
+		if _, err := (Config{MQTTCAFile: junk}).CloudRootCAs(); err == nil {
 			t.Fatal("expected error for file with no certificates")
 		}
 	})
