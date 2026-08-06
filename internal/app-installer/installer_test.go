@@ -1,0 +1,82 @@
+// This file is part of arduino-cloud-connector.
+//
+// SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package appinstaller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+)
+
+func TestRequestWireShape(t *testing.T) {
+	// The handover body is this package's contract with arduino-app-cli: exactly two
+	// fields, with exactly these names. A field silently reappearing — cloud_app_id
+	// and name were both in an RFC draft — or being renamed fails here rather than at
+	// app-cli, which would only notice at deploy time on a real board.
+	blob, err := json.Marshal(Request{BundlePath: "/var/lib/x/job.zip", SHA256: "deadbeef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal(blob, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 2 {
+		t.Errorf("handover body has %d fields, want 2: %s", len(fields), blob)
+	}
+	for _, key := range []string{"bundle_path", "sha256"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("handover body is missing %q: %s", key, blob)
+		}
+	}
+}
+
+func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
+	// The placeholder must fail in a way the caller can classify, because that is what
+	// turns into the wire code the operator sees. An untyped error would be reported as
+	// an internal fault instead of "no installer".
+	err := Unavailable().Install(context.Background(), Request{BundlePath: "/x.zip"}, nil)
+	if err == nil {
+		t.Fatal("Unavailable installer reported success")
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("error does not match ErrUnavailable: %v", err)
+	}
+	// It must NOT masquerade as an install that started and then failed — the bundle
+	// is untouched and the two map to different Cloud error codes.
+	if errors.Is(err, ErrFailed) {
+		t.Errorf("an installer that was never reached reported ErrFailed: %v", err)
+	}
+}
+
+func TestFuncAdaptsToInstaller(t *testing.T) {
+	// Func is what every test double in internal/ota is built from, so its plumbing
+	// (request through, progress callback through) is worth one direct test.
+	var got Request
+	var progress []int32
+
+	var inst Installer = Func(func(_ context.Context, req Request, onProgress ProgressFunc) error {
+		got = req
+		onProgress(10)
+		onProgress(100)
+		return nil
+	})
+
+	want := Request{BundlePath: "/var/lib/x/job.zip", SHA256: "abc"}
+	if err := inst.Install(context.Background(), want, func(p int32) {
+		progress = append(progress, p)
+	}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if got != want {
+		t.Errorf("request: got %+v want %+v", got, want)
+	}
+	if len(progress) != 2 || progress[0] != 10 || progress[1] != 100 {
+		t.Errorf("progress forwarded: got %v want [10 100]", progress)
+	}
+}
