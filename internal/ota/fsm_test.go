@@ -8,6 +8,7 @@ package ota
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -94,6 +95,26 @@ func (f *fakePublisher) hasFailCode(code Error) bool {
 	return false
 }
 
+// failReport is one published failure, with the job it was keyed by. Which job a
+// failure names matters as much as the code when two of them are in play: refusing a
+// second deploy must close that deploy and not the one still running.
+type failReport struct {
+	jobID string
+	code  Error
+}
+
+func (f *fakePublisher) failReports() []failReport {
+	var out []failReport
+	for _, c := range f.all() {
+		pc, ok := c.Inner().(command.OTAProgressCmd)
+		if !ok || State(pc.State) != StateFail {
+			continue
+		}
+		out = append(out, failReport{jobID: hex.EncodeToString(pc.ID[:]), code: Error(pc.StateData)})
+	}
+	return out
+}
+
 // hasDigest reports whether any published OTABeginCmd carried digest.
 func (f *fakePublisher) hasDigest(digest [32]byte) bool {
 	for _, d := range f.begins() {
@@ -137,7 +158,11 @@ func newTestFSM(t *testing.T, storage downloader.Downloader, inst appinstaller.I
 const testBundleURL = "https://api2.arduino.cc/apps/owner/app-uuid/bundle.zip"
 
 func updateCmd(final [32]byte) command.OTAUpdateCmd {
-	return command.OTAUpdateCmd{ID: [16]byte{9, 9, 9}, URL: testBundleURL, FinalSHA: final}
+	return updateCmdWithID([16]byte{9, 9, 9}, final)
+}
+
+func updateCmdWithID(id [16]byte, final [32]byte) command.OTAUpdateCmd {
+	return command.OTAUpdateCmd{ID: id, URL: testBundleURL, FinalSHA: final}
 }
 
 // waitForIdle waits until the process is parked waiting for a job.
@@ -282,8 +307,8 @@ func TestOTAFSMHappyPathReportsPhasesAndAnnouncesNewDigest(t *testing.T) {
 		t.Errorf("bundle was not removed after a successful install: %v", err)
 	}
 	// …and the job record is gone, so the next start does not re-run the job.
-	if job := f.loadJob(); job != nil {
-		t.Errorf("job record survived a completed deploy: %+v", job)
+	if job, lost := f.loadJob(); job != nil || lost != nil {
+		t.Errorf("job record survived a completed deploy: %+v / %+v", job, lost)
 	}
 }
 
@@ -416,8 +441,8 @@ func TestOTAFSMNeverConfirmsAFailedDeploy(t *testing.T) {
 	}
 	// A reported failure closes the Cloud job, so nothing must be left for Resume
 	// to pick back up.
-	if job := f.loadJob(); job != nil {
-		t.Errorf("job record survived a failed deploy: %+v", job)
+	if job, lost := f.loadJob(); job != nil || lost != nil {
+		t.Errorf("job record survived a failed deploy: %+v / %+v", job, lost)
 	}
 }
 
@@ -451,10 +476,14 @@ func TestOTAFSMMapsStorageFailuresToWireCodes(t *testing.T) {
 		"unreachable":     {storageapi.ErrConnect, ErrServerConnect},
 		"digest mismatch": {downloader.ErrDigestMismatch, ErrDigestMismatch},
 		"too large":       {downloader.ErrTooLarge, ErrBundleTooLarge},
-		"no space":        {downloader.ErrNoSpace, ErrNoOtaStorage},
+		"no space":        {downloader.ErrNoSpace, ErrNoDiskSpace},
 		"transfer failed": {downloader.ErrTransfer, ErrDownload},
 		"timeout":         {downloader.ErrTimeout, ErrDownloadTimeout},
-		"bad size":        {downloader.ErrBadSize, ErrHTTPHeader},
+		"bad size":        {downloader.ErrBadSize, ErrSizeMismatch},
+		"dir unusable":    {downloader.ErrOpenFile, ErrNoOtaStorage},
+		// Unclassified in the download phase collapses to that phase's generic code,
+		// never to a made-up "internal" one.
+		"unclassified": {errors.New("no sentinel at all"), ErrDownload},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -468,6 +497,301 @@ func TestOTAFSMMapsStorageFailuresToWireCodes(t *testing.T) {
 			f.Deliver(updateCmd([32]byte{1}))
 			waitFor(t, "the mapped Fail report", func() bool { return pub.hasFailCode(tc.want) })
 		})
+	}
+}
+
+// TestOTAFSMRefusesASecondJobWhileOneIsDeploying covers RFC-14 §5.10 -50.
+//
+// The refusal has to name the REFUSED job. Keying it by the running one would use the
+// Cloud's own success channel to fail the deploy that is at that moment downloading
+// correctly — the failure mode this test exists to prevent.
+func TestOTAFSMRefusesASecondJobWhileOneIsDeploying(t *testing.T) {
+	content := []byte("the bundle being deployed")
+	final := sha256.Sum256(content)
+
+	started, finish := make(chan struct{}), make(chan struct{})
+	f, pub, _ := newTestFSM(t,
+		&downloadertest.FakeDownloader{Content: content}, blockingInstaller(started, finish))
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	f.Deliver(updateCmd(final))
+	<-started // the first deploy is genuinely in flight, not merely queued
+
+	second := updateCmdWithID([16]byte{4, 2}, sha256.Sum256([]byte("a different bundle")))
+	f.Deliver(second)
+
+	waitFor(t, "the refusal", func() bool { return len(pub.failReports()) == 1 })
+	got := pub.failReports()[0]
+	if got.code != ErrDeployInProgress {
+		t.Errorf("refusal code: got %s want %s", got.code, ErrDeployInProgress)
+	}
+	if want := hex.EncodeToString(second.ID[:]); got.jobID != want {
+		t.Errorf("the refusal was keyed by job %s, want the refused job %s", got.jobID, want)
+	}
+
+	// The running deploy is untouched by the refusal: it finishes and confirms.
+	close(finish)
+	waitFor(t, "the first deploy to confirm", func() bool { return pub.hasDigest(final) })
+	if n := len(pub.failReports()); n != 1 {
+		t.Errorf("the running deploy was affected: %d failure reports, want 1: %+v", n, pub.failReports())
+	}
+}
+
+// The deploy slot must be given back when a job ends, whichever way it ended.
+//
+// This is the failure mode the -50 refusal introduces: hold the slot one job too long
+// and the board refuses every deploy for the rest of its uptime, telling the Cloud each
+// time that a deploy is already running when none is. Both outcomes are exercised —
+// success and failure release through different paths.
+func TestOTAFSMAcceptsAJobAfterThePreviousOneEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		firstErr error
+	}{
+		{"after a successful deploy", nil},
+		{"after a failed deploy", fmt.Errorf("%w: unpack", appinstaller.ErrFailed)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := []byte("bundle for " + tc.name)
+			final := sha256.Sum256(content)
+
+			var installs int
+			inst := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error {
+				installs++
+				if installs == 1 {
+					return tc.firstErr
+				}
+				return nil
+			})
+			f, pub, _ := newTestFSM(t, &downloadertest.FakeDownloader{Content: content}, inst)
+			stop := runFSM(t, f)
+			defer stop()
+			f.SetConnected(true)
+			waitForIdle(t, f)
+
+			f.Deliver(updateCmdWithID([16]byte{1}, final))
+			waitFor(t, "the first job to finish", func() bool {
+				return installs == 1 && f.Snapshot().State == StateIdle
+			})
+
+			second := updateCmdWithID([16]byte{2}, final)
+			f.Deliver(second)
+			waitFor(t, "the second job to install", func() bool { return installs == 2 })
+
+			for _, r := range pub.failReports() {
+				if r.code == ErrDeployInProgress {
+					t.Fatalf("a job delivered with nothing in flight was refused as a duplicate: %+v", r)
+				}
+			}
+		})
+	}
+}
+
+// A redelivery of the job already running is not a second job. MQTT can redeliver, and
+// the Cloud can repeat itself; answering that with -50 would fail the running deploy
+// using its own id.
+func TestOTAFSMIgnoresARedeliveryOfTheRunningJob(t *testing.T) {
+	content := []byte("bundle delivered twice")
+	final := sha256.Sum256(content)
+
+	started, finish := make(chan struct{}), make(chan struct{})
+	f, pub, _ := newTestFSM(t,
+		&downloadertest.FakeDownloader{Content: content}, blockingInstaller(started, finish))
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	cmd := updateCmd(final)
+	f.Deliver(cmd)
+	<-started
+	f.Deliver(cmd) // the very same job id
+
+	time.Sleep(100 * time.Millisecond)
+	if reports := pub.failReports(); len(reports) != 0 {
+		t.Errorf("a redelivery of the running job was answered with %+v", reports)
+	}
+
+	close(finish)
+	waitFor(t, "the deploy to confirm", func() bool { return pub.hasDigest(final) })
+}
+
+// TestOTAFSMReportsAnUnresumableDeploy covers RFC-14 §5.10 -49.
+//
+// The Cloud does not resend OTAUpdateCmd after a crash, so a record that lost the URL
+// describes a deploy that can never be continued. The Cloud is still holding that job
+// open: a reason it can render beats waiting out its own timeout with nothing to show.
+func TestOTAFSMReportsAnUnresumableDeploy(t *testing.T) {
+	interrupted := Job{ID: [16]byte{3, 1, 4}, SHA256: sha256.Sum256([]byte("z"))}
+
+	fake := &downloadertest.FakeDownloader{}
+	f, pub, cfg := newTestFSM(t, fake, appinstaller.Unavailable())
+	seedRawJob(t, cfg.AppDownloadDir, persistedJob{
+		JobID:  interrupted.IDHex(),
+		URL:    "", // what a crash mid-write, or an older format, can leave behind
+		SHA256: hexOf(interrupted.SHA256),
+	})
+
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+
+	waitFor(t, "the interrupted-deploy report", func() bool { return len(pub.failReports()) == 1 })
+	got := pub.failReports()[0]
+	if got.code != ErrDeployInterrupted {
+		t.Errorf("code: got %s want %s", got.code, ErrDeployInterrupted)
+	}
+	if got.jobID != interrupted.IDHex() {
+		t.Errorf("keyed by job %s, want the interrupted job %s", got.jobID, interrupted.IDHex())
+	}
+
+	// Nothing was fetched — there was no URL to fetch from — and the process is
+	// available for the next deploy rather than stuck on a record it cannot use.
+	if n := len(fake.Requests()); n != 0 {
+		t.Errorf("attempted %d download(s) for a job with no URL", n)
+	}
+	waitForIdle(t, f)
+	if _, err := os.Stat(f.jobPath()); !os.IsNotExist(err) {
+		t.Errorf("the unusable record survived and will be re-read on the next start (%v)", err)
+	}
+}
+
+// The terminal Fail report is the only message this process cannot afford to drop: it
+// is sent once and it is what closes the Cloud job with a reason. A progress report
+// lost to a disconnected broker is superseded by the next one; this one is not.
+func TestOTAFSMHoldsTheFailureUntilTheBrokerIsUp(t *testing.T) {
+	fake := &downloadertest.FakeDownloader{Err: downloader.ErrTransfer}
+	f, pub, _ := newTestFSM(t, fake, appinstaller.Unavailable())
+	stop := runFSM(t, f)
+	defer stop()
+	waitForIdle(t, f) // deliberately NOT connected
+
+	f.Deliver(updateCmd([32]byte{1}))
+
+	// Wait on the download, not on Idle: the process is ALREADY in Idle when the job is
+	// delivered, so waiting for Idle alone would return at once and let the reconnect
+	// below race the failure — which is the difference between testing the outbox and
+	// testing nothing.
+	waitFor(t, "the download to be attempted", func() bool { return len(fake.Requests()) == 1 })
+	// From here Idle means "back in Idle", and it means the process did not park on the
+	// failure waiting for a broker that is not coming.
+	waitFor(t, "a return to Idle with the report held", func() bool {
+		return f.Snapshot().State == StateIdle && f.Snapshot().JobID == ""
+	})
+	if n := len(pub.all()); n != 0 {
+		t.Fatalf("published %d messages with the broker down: %v", n, pub.all())
+	}
+
+	f.SetConnected(true)
+	waitFor(t, "the held failure report", func() bool { return pub.hasFailCode(ErrDownload) })
+}
+
+// Holding rather than waiting is what keeps the process usable during an outage. The
+// version that waited for the broker inside Fail kept the deploy slot claimed, so a job
+// arriving meanwhile was refused with -50 — a refusal that could not be published
+// either, leaving that job neither run nor answered.
+func TestOTAFSMAcceptsAJobWhileAFailureIsStillHeld(t *testing.T) {
+	content := []byte("the bundle of the second job")
+	final := sha256.Sum256(content)
+
+	// The first job fails, the second succeeds.
+	fake := &downloadertest.FakeDownloader{Content: content, Err: downloader.ErrTransfer}
+
+	installed := make(chan struct{}, 1)
+	inst := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error {
+		installed <- struct{}{}
+		return nil
+	})
+
+	f, pub, _ := newTestFSM(t, fake, inst)
+	stop := runFSM(t, f)
+	defer stop()
+	waitForIdle(t, f) // broker down
+
+	f.Deliver(updateCmdWithID([16]byte{1}, [32]byte{9}))
+	waitFor(t, "the first job to fail", func() bool { return len(fake.Requests()) == 1 })
+	waitFor(t, "a return to Idle", func() bool { return f.Snapshot().State == StateIdle })
+	fake.SetErr(nil)
+
+	// A second job during the same outage is taken on, not refused.
+	f.Deliver(updateCmdWithID([16]byte{2}, final))
+	select {
+	case <-installed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the second job never ran; published: %+v", pub.failReports())
+	}
+
+	f.SetConnected(true)
+	waitFor(t, "the held failure", func() bool { return pub.hasFailCode(ErrDownload) })
+	for _, r := range pub.failReports() {
+		if r.code == ErrDeployInProgress {
+			t.Errorf("a job delivered with nothing in flight was refused: %+v", r)
+		}
+	}
+}
+
+// A held failure must leave before anything composed after it. Otherwise the Cloud
+// sees job A fail after job B has already started reporting progress, and the two jobs
+// appear to have run in the wrong order.
+func TestOTAFSMHeldFailureIsNotOvertakenByANewerJob(t *testing.T) {
+	content := []byte("second job bundle")
+	final := sha256.Sum256(content)
+
+	// The second job's download is held open, so the broker can come back while the
+	// process is somewhere other than Idle — the case where the flush has to happen on
+	// the reporting path rather than in Idle's select.
+	release := make(chan struct{})
+	fake := &downloadertest.FakeDownloader{Content: content, Err: downloader.ErrTransfer}
+
+	f, pub, _ := newTestFSM(t, fake, appinstaller.Func(
+		func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error { return nil }))
+	stop := runFSM(t, f)
+	defer stop()
+	waitForIdle(t, f) // broker down
+
+	failed := updateCmdWithID([16]byte{0xAA}, [32]byte{9})
+	f.Deliver(failed)
+	waitFor(t, "the first job to fail", func() bool { return len(fake.Requests()) == 1 })
+	waitFor(t, "a return to Idle", func() bool { return f.Snapshot().State == StateIdle })
+
+	fake.SetErr(nil)
+	fake.Block = release
+	f.Deliver(updateCmdWithID([16]byte{0xBB}, final))
+	waitFor(t, "the second job to start downloading", func() bool { return len(fake.Requests()) == 2 })
+
+	// Broker back while the second job is mid-transfer, then let it finish.
+	f.SetConnected(true)
+	close(release)
+
+	waitFor(t, "the held failure", func() bool { return pub.hasFailCode(ErrDownload) })
+	first := pub.progressStates()[0]
+	if first[0] != int64(StateFail) || first[1] != int64(ErrDownload) {
+		t.Errorf("first message published was (state %d, data %d), want the held failure (%d, %d)",
+			first[0], first[1], StateFail, ErrDownload)
+	}
+	if got := pub.failReports()[0].jobID; got != hex.EncodeToString(failed.ID[:]) {
+		t.Errorf("the held failure names job %s, want %s", got, hex.EncodeToString(failed.ID[:]))
+	}
+}
+
+// The outbox is bounded, and drops the oldest: a newer failure describes a more recent
+// state of the board, so it is the one worth keeping when something has to go.
+func TestOutboxDropsTheOldestWhenFull(t *testing.T) {
+	f := &OTAFSM{now: time.Now}
+	for i := range outboxLimit + 2 {
+		f.hold(command.OTAProgressCmd{ID: [16]byte{byte(i)}, State: uint8(StateFail)})
+	}
+	if len(f.outbox) != outboxLimit {
+		t.Fatalf("outbox holds %d, want the cap of %d", len(f.outbox), outboxLimit)
+	}
+	// Two were dropped, so the survivors start at 2 and are still in order.
+	for i, cmd := range f.outbox {
+		if want := byte(i + 2); cmd.ID[0] != want {
+			t.Errorf("outbox[%d] is job %d, want %d", i, cmd.ID[0], want)
+		}
 	}
 }
 

@@ -92,11 +92,23 @@ func (s State) reportable() bool { return s >= StateOtaAvailable }
 // Error is the negative code published in OTAProgressCmd.StateData when the
 // process enters StateFail. The Cloud renders a failure reason from it.
 //
-// Codes -1…-25 are the firmware-OTA codes from the C++ library
-// (src/ota/OTATypes.h, ota::OTAError) and keep their exact meaning, so the
-// existing Cloud-side mapping applies unchanged. Codes from -100 down are new
-// and specific to an App deploy — the Cloud has no text for them yet (see the
-// open point in the session notes).
+// The set is RFC-14 §5.10 in full, and it has two halves.
+//
+// Codes -2…-20 are firmware-OTA codes borrowed from the C++ library
+// (src/ota/OTATypes.h, ota::OTAError) and keep their exact numeric value, so the
+// Cloud's existing mapping applies unchanged. What they are *called* there is often
+// misleading, and RFC-14 reuses them for what they actually mean at their emission
+// site rather than for their name: -6 OtaHeaderCrc is the integrity check, -13
+// OtaHeaderTimeout is the download timeout, -11 HttpHeaderError is specifically a
+// missing Content-Length. The names below are the C++ ones, kept so a daemon log line
+// and the Cloud UI say the same word about the same failure; the doc comment says what
+// it means here. The Cloud renders these ten with App-deploy wording chosen per job
+// type — a non-writable download dir must not reach the operator as "No OTA storage".
+//
+// Codes -40…-50 are new and specific to an App deploy. -26…-39 are deliberately left
+// free: ota::OTAError already reaches -25, the same team owns both enums and both grow
+// at the tail, so the App range starts far enough away that neither can walk into the
+// other.
 type Error int32
 
 const (
@@ -104,60 +116,89 @@ const (
 
 	// ── Reused firmware-OTA codes (C++ ota::OTAError) ────────────────────────
 
-	// ErrNoOtaStorage: not enough free space in the download directory.
+	// ErrNoOtaStorage: the download directory is unusable — missing, not a
+	// directory, or not writable. This is what a failure to create or open the
+	// bundle file means in practice: on a healthy board there is no other reason
+	// for it, and "out of space" has its own code (ErrNoDiskSpace).
 	ErrNoOtaStorage Error = -2
-	// ErrDigestMismatch: the downloaded bytes do not hash to the expected
-	// digest. Reuses the C++ CRC-mismatch code, whose Cloud-side meaning
-	// ("corrupted download") is exactly right; the algorithm differs (SHA-256
-	// here, CRC-32 on MCUs) but the operator-visible cause does not.
+	// ErrSizeMismatch: the bytes received do not add up to the advertised
+	// Content-Length — checked per ranged chunk and over the whole transfer.
+	ErrSizeMismatch Error = -5
+	// ErrDigestMismatch: the downloaded bytes do not hash to the digest carried in
+	// OTAUpdateCmd. The C++ name says CRC and the algorithm differs (SHA-256 here),
+	// but the code IS the integrity check and the operator-visible cause — a
+	// corrupted download — is the same.
 	ErrDigestMismatch Error = -6
 	// ErrURLParse: the URL in OTAUpdateCmd is malformed or not https.
 	ErrURLParse Error = -9
-	// ErrServerConnect: could not establish the TLS connection to storage.
+	// ErrServerConnect: could not establish the connection to the storage service,
+	// including a failed mTLS handshake.
 	ErrServerConnect Error = -10
-	// ErrHTTPHeader: the response is missing or contradicts the headers the
-	// download needs (no Content-Length, bad Content-Range).
+	// ErrHTTPHeader: the response does not reveal the artefact size (no
+	// Content-Length), so neither the free-space check nor the byte accounting can
+	// proceed.
 	ErrHTTPHeader Error = -11
-	// ErrDownload: the transfer failed or was truncated after all retries.
+	// ErrDownload: generic/terminal failure of the bundle download, and the
+	// fallback for anything unclassified in that phase.
 	ErrDownload Error = -12
-	// ErrHTTPResponse: unexpected HTTP status.
+	// ErrDownloadTimeout: DownloadTimeout elapsed before the transfer finished.
+	ErrDownloadTimeout Error = -13
+	// ErrHTTPResponse: unexpected HTTP status (≠ 200/206).
 	ErrHTTPResponse Error = -14
-	// ErrOpenFile: could not create/open the bundle file or its journal.
-	ErrOpenFile Error = -19
-	// ErrWriteFile: a write to the bundle file failed.
+	// ErrWriteFile: I/O error writing the bundle to disk. Out of space is reported
+	// as ErrNoDiskSpace, not here.
 	ErrWriteFile Error = -20
 
 	// ── App-deploy specific codes ────────────────────────────────────────────
 
+	// ErrNoDiskSpace: not enough free disk space for the bundle.
+	ErrNoDiskSpace Error = -40
+	// ErrInstallerUnavailable: arduino-app-cli cannot be reached, or its stream
+	// closed without emitting a terminal event.
+	ErrInstallerUnavailable Error = -41
+	// ErrArchiveRejected: arduino-app-cli rejected the archive as invalid. The
+	// digest already matched, so the bundle is malformed at origin rather than
+	// corrupted in transit.
+	ErrArchiveRejected Error = -42
+	// ErrInvalidAppYaml: arduino-app-cli found app.yaml missing, unparsable or
+	// failing validation.
+	ErrInvalidAppYaml Error = -43
+	// ErrAppNotCompatible: the App does not fit this board — the installed bricks
+	// version, the hardware, or an arduino-app-cli too old to deploy it.
+	ErrAppNotCompatible Error = -44
 	// ErrBundleTooLarge: the advertised bundle size exceeds MaxBundleSize.
-	ErrBundleTooLarge Error = -100
-	// -101 is retired. It was ErrHostNotAllowed, raised when the download URL's
-	// host did not match a configured storage host. That check is gone: the cloud
-	// picks the URL and the C++ reference consumes it verbatim, so pinning a host
-	// only ever broke deploys the MCUs completed fine. The number is left unused
-	// rather than reassigned, in case the cloud already maps it.
-	//
-	// ErrDownloadTimeout: DownloadTimeout elapsed before the transfer finished.
-	ErrDownloadTimeout Error = -102
-	// ErrInstallerUnavailable: arduino-app-cli could not be reached.
-	ErrInstallerUnavailable Error = -103
-	// ErrInstallFailed: arduino-app-cli reported the install as failed.
-	ErrInstallFailed Error = -104
-	// ErrInstallTimeout: the install SSE stream went silent for longer than
-	// InstallTimeout.
-	ErrInstallTimeout Error = -105
-	// ErrInternal: an unclassified local failure.
-	ErrInternal Error = -106
+	ErrBundleTooLarge Error = -45
+	// ErrInstallFailed: arduino-app-cli reported a terminal install failure, and
+	// the fallback for anything unclassified in the install phase.
+	ErrInstallFailed Error = -46
+	// ErrInstallTimeout: no event from arduino-app-cli for InstallTimeout. The
+	// watchdog spans the install and the wait for the running verdict, and every
+	// event received resets it.
+	ErrInstallTimeout Error = -47
+	// ErrAppRunFailed: arduino-app-cli reports the App does not stay up. A deploy
+	// succeeds only if the App ends up running, so this fails the job whatever the
+	// board does next.
+	ErrAppRunFailed Error = -48
+	// ErrDeployInterrupted: a daemon restart (crash, upgrade or reboot) interrupted
+	// the deploy and it could not be resumed automatically.
+	ErrDeployInterrupted Error = -49
+	// ErrDeployInProgress: a second job arrived while one was already in flight.
+	ErrDeployInProgress Error = -50
 )
 
+// String returns the RFC-14 §5.10 name of the code, which is also the C++
+// ota::OTAError name for the reused half. Logs and the Cloud UI then name a failure
+// the same way, which is the point of reusing the numbers at all.
 func (e Error) String() string {
 	switch e {
 	case ErrNone:
 		return "None"
 	case ErrNoOtaStorage:
 		return "NoOtaStorage"
+	case ErrSizeMismatch:
+		return "OtaHeaderLength"
 	case ErrDigestMismatch:
-		return "DigestMismatch"
+		return "OtaHeaderCrc"
 	case ErrURLParse:
 		return "UrlParseError"
 	case ErrServerConnect:
@@ -166,24 +207,34 @@ func (e Error) String() string {
 		return "HttpHeaderError"
 	case ErrDownload:
 		return "OtaDownload"
+	case ErrDownloadTimeout:
+		return "OtaHeaderTimeout"
 	case ErrHTTPResponse:
 		return "HttpResponse"
-	case ErrOpenFile:
-		return "ErrorOpenUpdateFile"
 	case ErrWriteFile:
 		return "ErrorWriteUpdateFile"
-	case ErrBundleTooLarge:
-		return "BundleTooLarge"
-	case ErrDownloadTimeout:
-		return "DownloadTimeout"
+	case ErrNoDiskSpace:
+		return "NoDiskSpace"
 	case ErrInstallerUnavailable:
-		return "InstallerUnavailable"
+		return "AppCLIUnreachable"
+	case ErrArchiveRejected:
+		return "AppArchiveRejected"
+	case ErrInvalidAppYaml:
+		return "AppInvalidYaml"
+	case ErrAppNotCompatible:
+		return "AppNotCompatible"
+	case ErrBundleTooLarge:
+		return "AppBundleTooLarge"
 	case ErrInstallFailed:
-		return "InstallFailed"
+		return "AppInstallationFailed"
 	case ErrInstallTimeout:
-		return "InstallTimeout"
-	case ErrInternal:
-		return "Internal"
+		return "AppInstallationTimeout"
+	case ErrAppRunFailed:
+		return "AppRunFailed"
+	case ErrDeployInterrupted:
+		return "DeployInterrupted"
+	case ErrDeployInProgress:
+		return "DeployAlreadyInProgress"
 	default:
 		return "Unknown"
 	}
@@ -203,16 +254,22 @@ var errInstallStalled = errors.New("ota: install produced no progress")
 // Arduino IoT Cloud error code.
 //
 // The split is deliberate: each layer below describes what went wrong in its own
-// terms and knows nothing about the OTA protocol, while the wire values — copied from
-// the C++ ota::OTAError so the existing Cloud-side mapping applies unchanged — live
-// here, with the rest of the protocol. Anything unrecognised becomes ErrInternal
-// rather than silently reporting success.
+// terms and knows nothing about the OTA protocol, while the wire values — RFC-14
+// §5.10, half of them copied from the C++ ota::OTAError so the existing Cloud-side
+// mapping applies unchanged — live here, with the rest of the protocol.
 //
 // Three packages are matched because three layers can fail, and which one did is
 // informative: storage-api reports what the network and the storage service said,
 // downloader reports what happened to the bytes on this disk, and app-installer
 // reports whether the handover to arduino-app-cli started at all and how it ended.
-func decodeError(err error) Error {
+//
+// fallback is what an unrecognised error becomes, and it is the caller's to choose
+// because the honest answer depends on where the deploy was when it failed: RFC-14
+// §5.10 collapses an unmapped download failure to ErrDownload and an unmapped install
+// failure to ErrInstallFailed. There is deliberately no catch-all "internal error"
+// code — which phase died is something the operator can act on, "something went wrong"
+// is not.
+func decodeError(err error, fallback Error) Error {
 	switch {
 	// Network / storage service.
 	case errors.Is(err, storageapi.ErrURLInvalid):
@@ -228,12 +285,9 @@ func decodeError(err error) Error {
 	case errors.Is(err, downloader.ErrTooLarge):
 		return ErrBundleTooLarge
 	case errors.Is(err, downloader.ErrNoSpace):
-		return ErrNoOtaStorage
+		return ErrNoDiskSpace
 	case errors.Is(err, downloader.ErrBadSize):
-		// A size the transfer cannot reconcile is the same class of problem as a
-		// contradictory header, so it reuses that code rather than introducing one the
-		// Cloud has never been told about.
-		return ErrHTTPHeader
+		return ErrSizeMismatch
 	case errors.Is(err, downloader.ErrTransfer):
 		return ErrDownload
 	case errors.Is(err, downloader.ErrDigestMismatch):
@@ -241,13 +295,27 @@ func decodeError(err error) Error {
 	case errors.Is(err, downloader.ErrTimeout):
 		return ErrDownloadTimeout
 	case errors.Is(err, downloader.ErrOpenFile):
-		return ErrOpenFile
+		// Not its own code: RFC-14 §5.10 has no slot for "could not open the
+		// destination", and it does not need one. The destination and its sidecars
+		// live in the download dir, so failing to create or open them means that
+		// directory is missing or not writable — which is exactly ErrNoOtaStorage.
+		return ErrNoOtaStorage
 	case errors.Is(err, downloader.ErrWriteFile):
 		return ErrWriteFile
 
-	// Handover to the installing service.
+	// Handover to the installing service. The last four are verdicts only
+	// arduino-app-cli can give, and they exist so that "app-cli said no" reaches the
+	// operator as a reason rather than as a generic install failure.
 	case errors.Is(err, appinstaller.ErrUnavailable):
 		return ErrInstallerUnavailable
+	case errors.Is(err, appinstaller.ErrArchiveRejected):
+		return ErrArchiveRejected
+	case errors.Is(err, appinstaller.ErrInvalidAppYaml):
+		return ErrInvalidAppYaml
+	case errors.Is(err, appinstaller.ErrNotCompatible):
+		return ErrAppNotCompatible
+	case errors.Is(err, appinstaller.ErrRunFailed):
+		return ErrAppRunFailed
 	case errors.Is(err, appinstaller.ErrFailed):
 		return ErrInstallFailed
 
@@ -256,6 +324,6 @@ func decodeError(err error) Error {
 		return ErrInstallTimeout
 
 	default:
-		return ErrInternal
+		return fallback
 	}
 }

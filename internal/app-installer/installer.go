@@ -66,9 +66,11 @@ type Installer interface {
 	// the state machine has moved on — is a data race, and one that would surface
 	// only under a real install.
 	//
-	// Errors must match ErrFailed or ErrUnavailable through errors.Is, so the caller
-	// can classify the outcome without knowing anything about the transport. A
-	// context cancellation is returned as-is.
+	// Errors must match one of the sentinels below through errors.Is, so the caller
+	// can classify the outcome without knowing anything about the transport — and
+	// must be as specific as the service allows, because each sentinel reaches the
+	// operator as a different Cloud error code. A context cancellation is returned
+	// as-is.
 	Install(ctx context.Context, req Request, onProgress ProgressFunc) error
 }
 
@@ -97,17 +99,48 @@ type Request struct {
 // ProgressFunc reports install progress as a percentage (0–100). It must not block.
 type ProgressFunc func(percent int32)
 
-// Failure sentinels. Every failure this package reports is one of these two: either
-// no installer could be reached at all, or the install itself did not succeed. The
-// distinction is worth keeping because the two reach the operator as different Cloud
-// error codes — see internal/ota.decodeError.
+// Failure sentinels. Every failure this package reports is one of these: either no
+// installer could be reached at all, or the install did not end with the App running.
+//
+// # Why the failure is typed rather than just "it failed"
+//
+// Each of these reaches the operator as a different Arduino IoT Cloud error code
+// (RFC-14 §5.10 -41…-48, mapped in internal/ota.decodeError), and that is the whole
+// reason the distinctions exist: "the archive is malformed", "app.yaml does not
+// validate", "this App does not fit this board" and "it installed but does not stay
+// up" are four different things for the person looking at a failed deploy, and only
+// arduino-app-cli is in a position to tell them apart.
+//
+// That makes them a requirement on the deploy stream, not just a Go detail: every
+// stream must end in exactly one terminal outcome — running (success), or one of the
+// specific failures below. If the handover degrades to "non-zero exit", four codes
+// collapse back into ErrFailed and the operator is told nothing useful.
+//
+// The four specific verdicts wrap ErrFailed, so a caller that only wants to know
+// whether the install succeeded still matches with errors.Is(err, ErrFailed) — which
+// also makes ErrFailed the right fallback for an install failure nobody classified.
 var (
 	// ErrUnavailable: the installing service could not be reached, so the install
-	// never started. The bundle on disk is untouched and still valid.
+	// never started — or its stream closed without a terminal event, which is the
+	// same thing seen from the other end. The bundle on disk is untouched and still
+	// valid.
 	ErrUnavailable = errors.New("appinstaller: no app installer available")
-	// ErrFailed: the install started and did not complete — the service reported a
-	// failure, or its stream broke and could not be re-established.
+	// ErrFailed: the install did not succeed and the reason is not one of the four
+	// below.
 	ErrFailed = errors.New("appinstaller: install failed")
+
+	// ErrArchiveRejected: the archive is not a valid bundle. The digest matched
+	// before the handover, so it is malformed at origin, not corrupted in transit.
+	ErrArchiveRejected = fmt.Errorf("%w: archive rejected", ErrFailed)
+	// ErrInvalidAppYaml: app.yaml is missing, unparsable, or fails validation.
+	ErrInvalidAppYaml = fmt.Errorf("%w: invalid app.yaml", ErrFailed)
+	// ErrNotCompatible: the App does not fit this board — the installed bricks
+	// version, the hardware, or a runtime too old to deploy it.
+	ErrNotCompatible = fmt.Errorf("%w: app not compatible with this board", ErrFailed)
+	// ErrRunFailed: the App was installed but does not stay up. A deploy succeeds
+	// only if the App ends up running, so this is a failure however the board
+	// recovers afterwards.
+	ErrRunFailed = fmt.Errorf("%w: app does not stay running", ErrFailed)
 )
 
 // Func adapts a function to Installer, for tests and for wiring a trivial
