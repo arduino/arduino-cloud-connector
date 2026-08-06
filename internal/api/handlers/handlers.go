@@ -14,8 +14,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/arduino/arduino-cloud-connector/internal/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/daemon"
-	"github.com/arduino/arduino-cloud-connector/internal/daemon/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/identity"
 	"github.com/arduino/arduino-cloud-connector/internal/provisioning"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
@@ -207,7 +207,7 @@ type steadyReporter interface {
 // The connection is established immediately even for an unknown/never-set
 // variable: the response headers are flushed up front, before the first frame,
 // otherwise the client's EventSource would not open until a write occurs.
-func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Handler {
+func HandleVariableEvents(reg *variables.Registry, steady steadyReporter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 
@@ -232,7 +232,7 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 			err  error
 		)
 		switch {
-		case !cloud.CloudSteady():
+		case !steady.CloudSteady():
 			kind = variables.EventThingUnavailable
 			err = writeSSE(w, kind, map[string]string{"name": name})
 		case hasValue:

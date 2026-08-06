@@ -16,7 +16,7 @@
 //	  sub  /a/t/<thing_id>/e/i      — inbound property values
 //
 // The cloud lifecycle (Device.begin → Thing.begin → LastValues → Steady →
-// Detach/Reattach → Reconnect) lives in package internal/daemon/cloud, not
+// Detach/Reattach → Reconnect) lives in package internal/cloud, not
 // here. This package is stateless with respect to thing_id and handshake
 // phase: it only knows how to dial the broker and ferry bytes.
 //
