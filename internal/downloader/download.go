@@ -321,7 +321,7 @@ func backoffDelay(failures int) time.Duration {
 	if delay > retryBackoffMax {
 		delay = retryBackoffMax
 	}
-	// crypto/rand mirrors the jitter helper in internal/daemon/cloud.
+	// crypto/rand mirrors the jitter helper in internal/cloud.
 	n, err := rand.Int(rand.Reader, big.NewInt(1000))
 	if err != nil {
 		return delay

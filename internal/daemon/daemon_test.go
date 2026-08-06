@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arduino/arduino-cloud-connector/internal/daemon/cloud"
+	"github.com/arduino/arduino-cloud-connector/internal/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
 )
 
