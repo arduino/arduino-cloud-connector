@@ -54,6 +54,47 @@ func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
 	}
 }
 
+// The four specific verdicts refine ErrFailed rather than replacing it, so both
+// questions a caller can ask keep working: "did the install succeed?" and "what
+// exactly did arduino-app-cli object to?".
+//
+// Which matters because internal/ota classifies specific-first: if one of these ever
+// stopped matching ErrFailed, an unhandled verdict would fall through to the deploy
+// phase's fallback instead of being reported as an install failure at all.
+func TestSpecificVerdictsRefineErrFailed(t *testing.T) {
+	verdicts := map[string]error{
+		"archive rejected": ErrArchiveRejected,
+		"invalid app.yaml": ErrInvalidAppYaml,
+		"not compatible":   ErrNotCompatible,
+		"does not run":     ErrRunFailed,
+	}
+	for name, verdict := range verdicts {
+		t.Run(name, func(t *testing.T) {
+			if !errors.Is(verdict, ErrFailed) {
+				t.Errorf("%v does not match ErrFailed", verdict)
+			}
+			// The install did start, so it is not the "no installer" case.
+			if errors.Is(verdict, ErrUnavailable) {
+				t.Errorf("%v matches ErrUnavailable", verdict)
+			}
+			// And they stay distinguishable from one another, which is the whole
+			// reason they exist: each is a different code on the operator's screen.
+			for otherName, other := range verdicts {
+				if otherName != name && errors.Is(verdict, other) {
+					t.Errorf("%s is indistinguishable from %s", name, otherName)
+				}
+			}
+		})
+	}
+	// The generic sentinel must NOT match the specific ones, or every unqualified
+	// install failure would be reported as whichever one happened to be checked first.
+	for name, verdict := range verdicts {
+		if errors.Is(ErrFailed, verdict) {
+			t.Errorf("a plain ErrFailed matches %s", name)
+		}
+	}
+}
+
 func TestFuncAdaptsToInstaller(t *testing.T) {
 	// Func is what every test double in internal/ota is built from, so its plumbing
 	// (request through, progress callback through) is worth one direct test.

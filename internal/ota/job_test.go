@@ -32,11 +32,28 @@ func seedJob(t *testing.T, dir string, job Job) {
 	}
 }
 
+// seedRawJob writes a record verbatim, including one saveJob would never produce.
+// That is the point: the records worth testing against are the damaged ones a crash
+// mid-write or an older format can leave behind.
+func seedRawJob(t *testing.T, dir string, rec persistedJob) {
+	t.Helper()
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobKeeper(dir).jobPath(), data, fileMode); err != nil {
+		t.Fatalf("seed a raw job record: %v", err)
+	}
+}
+
 func TestJobRecordRoundTrip(t *testing.T) {
 	f := jobKeeper(t.TempDir())
 
-	if got := f.loadJob(); got != nil {
-		t.Fatalf("expected no record in an empty dir, got %+v", got)
+	if got, lost := f.loadJob(); got != nil || lost != nil {
+		t.Fatalf("expected no record in an empty dir, got %+v / lost %+v", got, lost)
 	}
 
 	want := Job{ID: [16]byte{1, 2, 3}, URL: testBundleURL, SHA256: sha256.Sum256([]byte("bundle"))}
@@ -45,17 +62,20 @@ func TestJobRecordRoundTrip(t *testing.T) {
 		t.Fatalf("saveJob: %v", err)
 	}
 
-	got := f.loadJob()
+	got, lost := f.loadJob()
 	if got == nil {
 		t.Fatal("expected a record after saveJob")
+	}
+	if lost != nil {
+		t.Errorf("a usable record was reported as lost: %+v", lost)
 	}
 	if *got != want {
 		t.Errorf("round trip: got %+v want %+v", *got, want)
 	}
 
 	f.forgetJob()
-	if got := f.loadJob(); got != nil {
-		t.Errorf("expected no record after forgetJob, got %+v", got)
+	if got, lost := f.loadJob(); got != nil || lost != nil {
+		t.Errorf("expected no record after forgetJob, got %+v / lost %+v", got, lost)
 	}
 }
 
@@ -82,27 +102,37 @@ func TestSaveJobCreatesItsDirectory(t *testing.T) {
 	if err := f.saveJob(); err != nil {
 		t.Fatalf("saveJob into a missing directory: %v", err)
 	}
-	if got := f.loadJob(); got == nil || *got != job {
+	if got, _ := f.loadJob(); got == nil || *got != job {
 		t.Errorf("round trip through a created directory failed: %+v", got)
 	}
 }
 
-// A record that cannot be acted on must never block future deploys: loadJob reports
-// "nothing to resume" and removes it, rather than returning an error the FSM would
-// have to interpret on every start.
+// A record that cannot be acted on must never block future deploys: loadJob resumes
+// nothing and removes it, rather than returning an error the FSM would have to
+// interpret on every start.
+//
+// What it does report is whether the record at least named a job. That is the whole
+// difference between closing the Cloud job with ErrDeployInterrupted and leaving it to
+// time out in silence, because every OTA message is keyed by the job id: with one there
+// is something to send, without one there is not.
 func TestLoadJobDiscardsUnusableRecords(t *testing.T) {
 	valid := Job{ID: [16]byte{5}, URL: testBundleURL, SHA256: sha256.Sum256([]byte("y"))}
 
-	cases := map[string]persistedJob{
-		"unparsable job id": {JobID: "not-hex", URL: testBundleURL, SHA256: hexOf(valid.SHA256)},
-		"short job id":      {JobID: "abcd", URL: testBundleURL, SHA256: hexOf(valid.SHA256)},
-		"unparsable digest": {JobID: valid.IDHex(), URL: testBundleURL, SHA256: "zz"},
-		"missing url":       {JobID: valid.IDHex(), URL: "", SHA256: hexOf(valid.SHA256)},
+	cases := map[string]struct {
+		rec persistedJob
+		// wantLost is the id the caller can report the failure against, empty when the
+		// record does not yield one.
+		wantLost string
+	}{
+		"unparsable job id": {persistedJob{JobID: "not-hex", URL: testBundleURL, SHA256: hexOf(valid.SHA256)}, ""},
+		"short job id":      {persistedJob{JobID: "abcd", URL: testBundleURL, SHA256: hexOf(valid.SHA256)}, ""},
+		"unparsable digest": {persistedJob{JobID: valid.IDHex(), URL: testBundleURL, SHA256: "zz"}, valid.IDHex()},
+		"missing url":       {persistedJob{JobID: valid.IDHex(), URL: "", SHA256: hexOf(valid.SHA256)}, valid.IDHex()},
 	}
-	for name, rec := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := jobKeeper(t.TempDir())
-			data, err := json.Marshal(rec)
+			data, err := json.Marshal(tc.rec)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -110,8 +140,17 @@ func TestLoadJobDiscardsUnusableRecords(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if got := f.loadJob(); got != nil {
-				t.Fatalf("expected nil for %s, got %+v", name, got)
+			got, lost := f.loadJob()
+			if got != nil {
+				t.Fatalf("expected nothing to resume for %s, got %+v", name, got)
+			}
+			switch {
+			case tc.wantLost == "" && lost != nil:
+				t.Errorf("reported a lost job with no usable id: %+v", lost)
+			case tc.wantLost != "" && lost == nil:
+				t.Errorf("the record named job %s but no failure can be reported against it", tc.wantLost)
+			case tc.wantLost != "" && lost.IDHex() != tc.wantLost:
+				t.Errorf("lost job id: got %s want %s", lost.IDHex(), tc.wantLost)
 			}
 			if _, err := os.Stat(f.jobPath()); !os.IsNotExist(err) {
 				t.Errorf("the unusable record was not removed (%v)", err)
@@ -125,8 +164,10 @@ func TestLoadJobDiscardsGarbledRecord(t *testing.T) {
 	if err := os.WriteFile(f.jobPath(), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.loadJob(); got != nil {
-		t.Fatalf("expected nil for a garbled record, got %+v", got)
+	// Nothing parsed, so there is no job id and nothing that could be reported.
+	got, lost := f.loadJob()
+	if got != nil || lost != nil {
+		t.Fatalf("expected nothing for a garbled record, got %+v / lost %+v", got, lost)
 	}
 	if _, err := os.Stat(f.jobPath()); !os.IsNotExist(err) {
 		t.Error("the garbled record was not removed")

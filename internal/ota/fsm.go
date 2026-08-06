@@ -25,14 +25,24 @@
 //	            │  └───────────────────────── Fail ◀────┘           │
 //	            └──── (success: publish OTABeginCmd once) ◀──────────┘
 //
-// Two messages carry the whole contract with the Cloud:
+// Three messages carry the whole contract with the Cloud:
 //
 //   - Fail publishes OTAProgressCmd(8, <negative code>) — the failure the Cloud
-//     renders in the UI.
+//     renders in the UI. The codes are RFC-14 §5.10 and live in state.go.
 //   - A successful install publishes OTABeginCmd(<installed digest>) exactly once,
 //     which is what closes the job: the Cloud matches the digest against the one it
 //     asked for (RFC-14 §5.1). An App deploy never reboots the board, so unlike the
 //     MCU flow there is no Reboot state in the path.
+//   - A job arriving while another is in flight is refused on the spot with
+//     OTAProgressCmd(8, -50), keyed by the refused job. That one is published by
+//     Deliver rather than by the state machine — see there for why.
+//
+// Of the three, only the failure is held when the broker is down (see the outbox
+// field); the other two are published or dropped.
+//
+// Every one of them is keyed by a job id, which is also why a job that cannot be
+// named produces no message at all: there would be nothing for the Cloud to attach it
+// to. The C++ reference returns early on a null context for the same reason.
 //
 // # Why the digest is announced once, and never at startup
 //
@@ -155,9 +165,26 @@ type OTAFSM struct {
 	// connected gates publishing: false means nothing published now would reach
 	// the Cloud. It tracks the BROKER connection, not the thing handshake.
 	connected atomic.Bool
+	// connUp carries a signal each time the broker connection comes up, so a waiting
+	// Idle can flush the outbox without polling. Buffered, so SetConnected never
+	// blocks and a signal is not lost when nobody is listening yet.
+	connUp chan struct{}
+
+	// busy claims the single deploy slot. Deliver takes it before queueing a job and
+	// only the end of that job releases it, so a second OTAUpdateCmd arriving in
+	// between is answered with ErrDeployInProgress rather than queued behind a deploy
+	// the Cloud stopped waiting for minutes ago. Resume takes it too, for the job it
+	// recovers from disk.
+	busy atomic.Bool
 
 	mu       sync.RWMutex
 	snapshot Snapshot
+	// reportLastSec/reportCounter make progress timestamps strictly increasing
+	// even within the same second, mirroring OTACloudProcessInterface::reportStatus.
+	// Under mu, not run-goroutine-private: Deliver publishes the -50 rejection from
+	// the caller's goroutine and needs a timestamp too.
+	reportLastSec uint64
+	reportCounter uint64
 
 	// run-goroutine-private state — no locking, only Run's goroutine touches it.
 	state       State
@@ -167,10 +194,23 @@ type OTAFSM struct {
 	failCause   error
 	clampWarned bool
 
-	// reportLastSec/reportCounter make progress timestamps strictly increasing
-	// even within the same second, mirroring OTACloudProcessInterface::reportStatus.
-	reportLastSec uint64
-	reportCounter uint64
+	// outbox holds terminal reports composed while the broker was down, to be sent
+	// when it comes back.
+	//
+	// Only terminal ones. A progress report lost in a disconnected gap costs nothing —
+	// the next one carries the same cumulative byte count — but the Fail report is sent
+	// once and is what closes the Cloud job with a reason, so dropping it leaves the
+	// job open until the Cloud's own timeout, with nothing to show the operator. The
+	// case that makes this necessary rather than nice is ErrDeployInterrupted: it is
+	// decided in Resume, milliseconds after start-up, when the broker is essentially
+	// never connected yet.
+	//
+	// Holding rather than waiting for the broker is the point. The state machine
+	// returns to Idle at once, so a job arriving during the outage is accepted like any
+	// other — whereas parking in Fail until the broker returned would keep the deploy
+	// slot claimed and answer that job with ErrDeployInProgress, a refusal that could
+	// not be published either.
+	outbox []command.OTAProgressCmd
 
 	now func() time.Time
 }
@@ -188,6 +228,7 @@ func New(cfg config.Config, deviceID string, pub Publisher, storage downloader.D
 		installTimeout: cfg.InstallTimeout,
 		events:         make(chan event, eventQueueSize),
 		done:           make(chan struct{}),
+		connUp:         make(chan struct{}, 1),
 		snapshot:       Snapshot{State: StateResume},
 		now:            time.Now,
 	}
@@ -206,12 +247,73 @@ func (f *OTAFSM) Snapshot() Snapshot {
 
 // Deliver hands an OTAUpdateCmd to the process. Non-blocking: called from the
 // Cloud FSM's event loop, which must never stall behind a download.
+//
+// A job that arrives while another deploy is in flight is refused here rather than
+// queued, and answered on the spot with ErrDeployInProgress (RFC-14 §5.10 -50).
+// Queueing it would be worse than useless: it would start minutes or hours later, for
+// a job the Cloud has long since timed out, while the Cloud heard nothing at all in
+// the meantime. The C++ reference simply ignores the command outside Idle, which has
+// the same silence problem.
 func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
+	jobID := hex.EncodeToString(cmd.ID[:])
+
+	if !f.busy.CompareAndSwap(false, true) {
+		// The slot is taken, and two very different things look like this.
+		if jobID == f.Snapshot().JobID {
+			// The same job again — an MQTT redelivery, or the Cloud repeating itself.
+			// Rejecting it would fail the deploy that is running right now, using the
+			// id of the very job it is running.
+			slog.Info("ota: OTAUpdateCmd repeats the deploy already in flight, ignoring",
+				"job_id", jobID)
+			return
+		}
+		slog.Warn("ota: a deploy is already in flight, refusing the new job",
+			"job_id", jobID, "in_flight", f.Snapshot().JobID)
+		f.rejectBusy(cmd.ID)
+		return
+	}
+
 	select {
 	case f.events <- evUpdate{cmd: cmd}:
 	default:
+		// Unreachable while the slot admits one job at a time. Releasing it matters
+		// anyway: a slot claimed for a command that was never queued would refuse
+		// every future deploy.
+		f.busy.Store(false)
 		slog.Warn("ota: event queue full, dropping OTAUpdateCmd",
-			"job_id", hex.EncodeToString(cmd.ID[:]), "state", f.Snapshot().State)
+			"job_id", jobID, "state", f.Snapshot().State)
+	}
+}
+
+// releaseSlot lets the next job in. Called when a deploy is over — successfully or
+// not — and never before its cleanup, so a job accepted right afterwards cannot find
+// the previous one's bundle or record still on disk.
+func (f *OTAFSM) releaseSlot() { f.busy.Store(false) }
+
+// rejectBusy answers a refused job with OTAProgressCmd(Fail, ErrDeployInProgress),
+// keyed by the REFUSED job's id so the Cloud closes that job and leaves the running
+// one alone.
+//
+// This is the only report published from outside the run goroutine, and deliberately:
+// the answer is worth having only if it is prompt, and the run goroutine is blocked
+// inside a download or an install for as long as those take. It touches nothing that
+// goroutine owns — the id comes from the command, and the timestamp counter sits
+// behind mu for exactly this reason.
+func (f *OTAFSM) rejectBusy(id [16]byte) {
+	if !f.isConnected() {
+		slog.Debug("ota: broker not connected, the refusal could not be sent",
+			"job_id", hex.EncodeToString(id[:]))
+		return
+	}
+	cmd := command.OTAProgressCmd{
+		ID:        id,
+		State:     uint8(StateFail),
+		StateData: int32(ErrDeployInProgress),
+		Timestamp: f.reportTimestamp(),
+	}
+	if err := f.publish(cmd); err != nil {
+		slog.Warn("ota: publishing the refusal failed",
+			"job_id", hex.EncodeToString(id[:]), "error", err)
 	}
 }
 
@@ -231,12 +333,69 @@ func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 // independently from the mqttClient". Progress messages that fall in the gap are
 // dropped; the next one carries the current cumulative byte count anyway.
 func (f *OTAFSM) SetConnected(v bool) {
-	if f.connected.Swap(v) != v {
-		slog.Debug("ota: broker connectivity changed", "connected", v)
+	if f.connected.Swap(v) == v {
+		return
+	}
+	slog.Debug("ota: broker connectivity changed", "connected", v)
+	if v {
+		select {
+		case f.connUp <- struct{}{}:
+		default: // a signal is already pending; one is enough to wake the waiter
+		}
 	}
 }
 
 func (f *OTAFSM) isConnected() bool { return f.connected.Load() }
+
+// ── The outbox ───────────────────────────────────────────────────────────────
+
+// outboxLimit caps the number of held reports.
+//
+// One failed job produces one report and only one job runs at a time, so in practice
+// the outbox holds one. The cap is there so that a pathological sequence — a long
+// outage with the Cloud timing jobs out and reissuing them — cannot grow it without
+// bound; the oldest goes first, since a newer failure describes a more recent state of
+// the board.
+const outboxLimit = 4
+
+// hold puts a report that could not be published where the next connection will find
+// it. See the outbox field for why only terminal reports get this treatment.
+func (f *OTAFSM) hold(cmd command.OTAProgressCmd) {
+	if len(f.outbox) >= outboxLimit {
+		slog.Warn("ota: outbox full, dropping the oldest held report",
+			"job_id", hex.EncodeToString(f.outbox[0].ID[:]), "limit", outboxLimit)
+		f.outbox = f.outbox[1:]
+	}
+	f.outbox = append(f.outbox, cmd)
+	slog.Info("ota: broker down, holding the failure report until it reconnects",
+		"job_id", hex.EncodeToString(cmd.ID[:]), "code", Error(cmd.StateData), "held", len(f.outbox))
+}
+
+// flushOutbox sends everything held, oldest first.
+//
+// It runs before every publish, which is what keeps the order right: a held report
+// always leaves before any message composed after it, so the Cloud never sees a
+// failure for one job arrive after progress for the next. Held reports are lost if the
+// daemon stops first — the outbox is memory, not a journal, and a deploy interrupted
+// that way is what ErrDeployInterrupted reports on the following start.
+func (f *OTAFSM) flushOutbox() {
+	if len(f.outbox) == 0 || !f.isConnected() {
+		return
+	}
+	held := f.outbox
+	f.outbox = nil
+	for _, cmd := range held {
+		if err := f.publish(cmd); err != nil {
+			// Not re-held: failing to publish while connected is a different problem
+			// from having nowhere to publish, and one this loop cannot fix by repeating.
+			slog.Warn("ota: a held failure report could not be delivered, dropping it",
+				"job_id", hex.EncodeToString(cmd.ID[:]), "error", err)
+			continue
+		}
+		slog.Info("ota: held failure report delivered",
+			"job_id", hex.EncodeToString(cmd.ID[:]), "code", Error(cmd.StateData))
+	}
+}
 
 // Run drives the FSM until ctx is cancelled. Call exactly once per OTAFSM.
 func (f *OTAFSM) Run(ctx context.Context) {
@@ -261,11 +420,23 @@ type stateFn func(ctx context.Context) stateFn
 // record and re-entered at StartOTA, so the Cloud sees the deploy continue rather than
 // restart. How much of the bundle is already on disk is not this layer's concern:
 // internal/downloader resumes the transfer from its own state.
+//
+// When the record names a job but cannot be continued, the deploy is closed with
+// ErrDeployInterrupted (RFC-14 §5.10 -49) instead: the Cloud is still holding that job
+// open, and a reason it can render beats a silent timeout. A record too damaged to
+// yield even a job id gets no message at all — there is nothing to key one to.
 func (f *OTAFSM) runResume(ctx context.Context) stateFn {
 	f.transition(StateResume)
 
-	job := f.loadJob()
-	if job == nil {
+	job, lost := f.loadJob()
+	switch {
+	case lost != nil:
+		slog.Warn("ota: an interrupted deploy cannot be resumed", "job_id", lost.IDHex())
+		f.job = lost
+		return f.fail(ErrDeployInterrupted,
+			errors.New("ota: the deploy job record does not describe a job that can be continued"))
+
+	case job == nil:
 		slog.Debug("ota: no interrupted deploy to resume")
 		// Nothing is in flight, so any bundle still on disk belongs to a job whose
 		// install never completed. Nobody is waiting for it and at multiple GB it is
@@ -275,6 +446,9 @@ func (f *OTAFSM) runResume(ctx context.Context) stateFn {
 	}
 
 	slog.Info("ota: interrupted deploy found, resuming", "job_id", job.IDHex())
+	// The recovered job holds the deploy slot exactly like a freshly delivered one
+	// would, so a job arriving now is refused with -50 instead of queueing up behind it.
+	f.busy.Store(true)
 	f.job = job
 	return f.runStartOTA
 }
@@ -398,6 +572,10 @@ func (f *OTAFSM) runIdle(ctx context.Context) stateFn {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-f.connUp:
+			// A held failure goes out as soon as there is somewhere to send it, rather
+			// than waiting for the next job to carry it out on its coat-tails.
+			f.flushOutbox()
 		case ev := <-f.events:
 			switch e := ev.(type) {
 			case evUpdate:
@@ -479,7 +657,9 @@ func (f *OTAFSM) runFetch(ctx context.Context) stateFn {
 				"job_id", job.IDHex())
 			return nil
 		}
-		return f.fail(decodeError(err), err)
+		// ErrDownload is the download phase's generic code, and so the honest answer
+		// for a failure no layer classified (RFC-14 §5.10).
+		return f.fail(decodeError(err, ErrDownload), err)
 	}
 
 	f.bundle = dest
@@ -502,7 +682,9 @@ func (f *OTAFSM) runFlashOTA(ctx context.Context) stateFn {
 			slog.Info("ota: install interrupted by shutdown", "job_id", job.IDHex())
 			return nil
 		}
-		return f.fail(decodeError(err), err)
+		// ErrInstallFailed doubles as the install phase's generic code, so an install
+		// failure arduino-app-cli did not qualify still lands in the right phase.
+		return f.fail(decodeError(err, ErrInstallFailed), err)
 	}
 
 	// Forget the job BEFORE confirming it, and in this order for a reason. The
@@ -522,6 +704,7 @@ func (f *OTAFSM) runFlashOTA(ctx context.Context) stateFn {
 
 	f.job = nil
 	f.bundle = ""
+	f.releaseSlot()
 	return f.runIdle
 }
 
@@ -596,6 +779,10 @@ func (f *OTAFSM) install(ctx context.Context, req appinstaller.Request) error {
 }
 
 // runFail reports the failure and returns to Idle.
+//
+// It never blocks on connectivity: with the broker down the report is held (see the
+// outbox field) and the process carries on, so the next job is accepted normally
+// instead of colliding with a deploy that is over in all but name.
 func (f *OTAFSM) runFail(ctx context.Context) stateFn {
 	// transition publishes OTAProgressCmd(8, failCode) — do it before clearing
 	// the job, which the message is keyed by.
@@ -611,6 +798,7 @@ func (f *OTAFSM) runFail(ctx context.Context) stateFn {
 	}
 	f.job, f.bundle = nil, ""
 	f.failCode, f.failCause = ErrNone, nil
+	f.releaseSlot()
 	return f.runIdle
 }
 
@@ -654,18 +842,15 @@ func (f *OTAFSM) transition(s State) {
 
 // report publishes one OTAProgressCmd.
 //
-// Two conditions silently skip it, both deliberate: no job in flight (there is
-// nothing for the Cloud to correlate the message with — the C++ reportStatus
-// returns early on a null context for the same reason), and the broker not being
-// connected (the message would go nowhere, and the next report carries the
-// cumulative byte count anyway, so nothing is lost by dropping this one).
+// With no job in flight there is nothing for the Cloud to correlate the message with,
+// so nothing is sent — the C++ reportStatus returns early on a null context for the
+// same reason.
+//
+// With no broker the two kinds of report part ways: a progress report is dropped,
+// because the next one carries the same cumulative byte count, while a Fail report
+// goes to the outbox, because nothing will ever repeat it.
 func (f *OTAFSM) report(state State, stateData int32) {
 	if f.job == nil {
-		return
-	}
-	if !f.isConnected() {
-		slog.Debug("ota: skipping progress report, broker not connected",
-			"state", state, "state_data", stateData)
 		return
 	}
 	cmd := command.OTAProgressCmd{
@@ -674,6 +859,21 @@ func (f *OTAFSM) report(state State, stateData int32) {
 		StateData: stateData,
 		Timestamp: f.reportTimestamp(),
 	}
+
+	if !f.isConnected() {
+		if state == StateFail {
+			f.hold(cmd)
+			return
+		}
+		slog.Debug("ota: skipping progress report, broker not connected",
+			"state", state, "state_data", stateData)
+		return
+	}
+
+	// Anything held goes first, so a failure can never arrive after a message composed
+	// later than it.
+	f.flushOutbox()
+
 	if err := f.publish(cmd); err != nil {
 		slog.Warn("ota: progress publish failed",
 			"job_id", f.job.IDHex(), "state", state, "state_data", stateData, "error", err)
@@ -697,8 +897,14 @@ func (f *OTAFSM) publish(cmd any) error {
 // reportTimestamp returns a microsecond timestamp that never repeats, so several
 // reports inside the same second stay strictly ordered for the Cloud. Same
 // scheme as OTACloudProcessInterface::reportStatus.
+//
+// Locked because Deliver publishes the -50 refusal from the caller's goroutine while
+// the run goroutine may be reporting progress: two goroutines, one counter.
 func (f *OTAFSM) reportTimestamp() uint64 {
 	sec := uint64(f.now().Unix())
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if sec == f.reportLastSec {
 		f.reportCounter++
 	} else {

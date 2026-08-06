@@ -123,51 +123,60 @@ func (f *OTAFSM) saveJob() error {
 	return atomicWrite(f.jobPath(), data, fileMode)
 }
 
-// loadJob returns the interrupted job, or nil when there is nothing to resume.
+// loadJob reports what a previous run left behind. At most one return is non-nil:
 //
-// Every unusable record — absent, unreadable, garbled, or carrying values that do not
-// parse — yields nil, because in all of those cases the right action is the same:
-// forget it. A record that cannot be acted on must never block future deploys, so it
-// is removed on the way out.
-func (f *OTAFSM) loadJob() *Job {
+//   - job — the interrupted deploy, complete enough to carry on with.
+//   - lost — a deploy that cannot be carried on with, carrying only the job id that
+//     was recovered from the record. The Cloud is still holding that job open, so the
+//     caller closes it with ErrDeployInterrupted rather than letting it time out.
+//   - neither — there is nothing to resume, or the record was too damaged to even name
+//     a job. Without an id there is no message to send: every OTA report is keyed by
+//     one, which is also why the C++ reference returns early with no context.
+//
+// Every unusable record is removed on the way out, whichever of the two it turns out
+// to be: a record that cannot be acted on must never block future deploys.
+func (f *OTAFSM) loadJob() (job, lost *Job) {
 	path := f.jobPath()
 
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
 		slog.Warn("ota: cannot read the deploy job record, ignoring it", "file", path, "error", err)
 		f.forgetJob()
-		return nil
+		return nil, nil
 	}
 
 	var rec persistedJob
 	if err := json.Unmarshal(data, &rec); err != nil {
 		slog.Warn("ota: unusable deploy job record, discarding", "file", path, "error", err)
 		f.forgetJob()
-		return nil
+		return nil, nil
 	}
 
 	id, err := parseJobID(rec.JobID)
 	if err != nil {
 		slog.Warn("ota: deploy job record has an unparsable job id, discarding", "job_id", rec.JobID)
 		f.forgetJob()
-		return nil
+		return nil, nil
 	}
+
+	// From here the job has a name, so a record that fails the remaining checks can be
+	// reported rather than only dropped.
 	digest, err := parseDigest(rec.SHA256)
 	if err != nil {
 		slog.Warn("ota: deploy job record has an unparsable digest, discarding", "job_id", rec.JobID)
 		f.forgetJob()
-		return nil
+		return nil, &Job{ID: id}
 	}
 	if rec.URL == "" {
 		slog.Warn("ota: deploy job record has no URL, discarding", "job_id", rec.JobID)
 		f.forgetJob()
-		return nil
+		return nil, &Job{ID: id}
 	}
 
-	return &Job{ID: id, URL: rec.URL, SHA256: digest}
+	return &Job{ID: id, URL: rec.URL, SHA256: digest}, nil
 }
 
 // forgetJob drops the record. Called when a job finishes, whether it succeeded or
