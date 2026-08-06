@@ -22,6 +22,22 @@
 // daemon FSM only starts this FSM and cancels its context for graceful
 // shutdown; it never drives transitions directly.
 //
+// # App deploy runs alongside the handshake, not after it
+//
+// This FSM also hosts the App-deploy process (package internal/ota). That process
+// is NOT part of the handshake above and is deliberately not gated on it: a deploy
+// job travels on the device-keyed command topics, so it needs a broker connection
+// and nothing else. It goes live at AnnouncingDevice — the moment the command
+// channel is subscribed and Device.begin is out — and stays live through
+// AwaitingThingID, SyncingLastValues and Steady alike, so a board that is never
+// assigned a thing remains deployable. Every state that reads a downlink command
+// therefore routes OTA commands first, via deliverOTA.
+//
+// The process runs on its own goroutine, and deliverOTA is a non-blocking
+// hand-off, so a multi-gigabyte download never stalls this FSM's event loop:
+// Cloud Variables keep flowing throughout a deploy. Conversely, a broker
+// disconnect mutes OTA reporting but does not abandon a download in flight.
+//
 // # DNS invariant on reconnect
 //
 // Every transition from Reconnecting → Connecting calls mqtt.Client.Connect,
@@ -38,14 +54,19 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"sync"
 	"time"
 
+	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
+	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	"github.com/arduino/arduino-cloud-connector/internal/keystore"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt/command"
+	"github.com/arduino/arduino-cloud-connector/internal/ota"
 	"github.com/arduino/arduino-cloud-connector/internal/senml"
+	storageapi "github.com/arduino/arduino-cloud-connector/internal/storage-api"
 	"github.com/arduino/arduino-cloud-connector/internal/system"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
 )
@@ -145,6 +166,12 @@ type FSM struct {
 	// Defaults to system.NetConfig.
 	netConfig func() (command.DeviceNetConfigCmd, bool)
 
+	// ota is the App-deploy process (RFC-14 §5.1), owned by this FSM: it is
+	// started alongside Run and fed the OTA commands that arrive on the device
+	// downlink channel. Nil when the FSM was built without a keystore (tests
+	// using newFSM), in which case OTA commands are logged and ignored.
+	ota *ota.OTAFSM
+
 	// run-goroutine-private state (no external access)
 	state       State
 	thingID     command.ThingID
@@ -179,6 +206,14 @@ func New(cfg config.Config, ks *keystore.Keystore, reg *variables.Registry, clie
 	}
 	f := newFSM(cfg, deviceID, reg, client)
 	f.ks = ks
+	// The App-deploy process fetches bundles with the same device certificate this
+	// FSM uses for the broker, so the storage client needs the keystore — hence it
+	// is wired here and not in newFSM, which tests use without one. The downloader
+	// owns the transfer (resume, verification); the storage client owns the HTTP.
+	// Until arduino-app-cli exposes its deploy endpoint the installer stub fails the
+	// job explicitly rather than claiming a success it cannot deliver (RFC-14 §5.4).
+	dl := downloader.New(cfg, storageapi.NewClient(cfg, ks))
+	f.ota = ota.New(cfg, deviceID, client, dl, appinstaller.Unavailable())
 	return f, nil
 }
 
@@ -229,6 +264,23 @@ func (f *FSM) Run(ctx context.Context) {
 	defer close(f.done)
 	defer f.shutdown()
 
+	// The App-deploy process runs for the whole FSM lifetime: a bundle download can
+	// run for tens of minutes and must survive a broker reconnect (see package
+	// ota). Only its publishing is gated, via setOTAConnected from
+	// runAnnouncingDevice and runReconnecting.
+	//
+	// Deferred here — so it runs BEFORE shutdown() disconnects the broker — the
+	// process is cancelled and waited for, giving an in-flight download the chance
+	// to journal its progress for the next run to resume.
+	if f.ota != nil {
+		otaCtx, cancelOTA := context.WithCancel(ctx)
+		go f.ota.Run(otaCtx)
+		defer func() {
+			cancelOTA()
+			<-f.ota.Done()
+		}()
+	}
+
 	next := f.runReconnecting
 	for next != nil {
 		next = next(ctx)
@@ -241,6 +293,9 @@ type stateFn func(ctx context.Context) stateFn
 
 func (f *FSM) runReconnecting(ctx context.Context) stateFn {
 	f.transition(StateReconnecting, "")
+	// Nothing published from here on would reach the Cloud. This mutes OTA
+	// reporting but deliberately does NOT stop a download in flight.
+	f.setOTAConnected(false)
 	slog.Debug("cloud: (re)connecting — draining stale events from previous connection")
 	f.drainEvents()
 
@@ -302,6 +357,14 @@ func (f *FSM) runAnnouncingDevice(ctx context.Context) stateFn {
 	// handleSendCapabilities order). Best-effort: UI-only metadata, so a failure
 	// here must not abort the handshake.
 	f.publishNetConfig()
+
+	// The App-deploy process becomes live HERE, not in Steady. The command channel
+	// is subscribed and the device announced, which is everything an App deploy
+	// needs: the job and its progress travel on the device-keyed topics, so no
+	// thing is involved. A board that never gets a thing assigned must still be
+	// deployable — same gating as the C++ library, which drives its OTA FSM off the
+	// MQTT connection alone.
+	f.setOTAConnected(true)
 
 	return f.runAwaitingThingID
 }
@@ -367,6 +430,12 @@ func (f *FSM) runAwaitingThingID(ctx context.Context) stateFn {
 				slog.Info("cloud: broker connection lost", "error", e.err)
 				return f.runReconnecting
 			case evCommandMessage:
+				// An App deploy needs no thing, so a job may well arrive while we are
+				// still waiting for one — potentially for as long as the board exists,
+				// if none is ever assigned. Dispatch it instead of dropping it.
+				if f.deliverOTA(e.msg.Cmd) {
+					continue
+				}
 				msg, ok := e.msg.Cmd.Inner().(command.ThingUpdateCmd)
 				if !ok {
 					slog.Debug("cloud: ignoring non-ThingUpdate command while awaiting thing_id", "cmd", e.msg.Cmd)
@@ -444,6 +513,9 @@ func (f *FSM) runSyncingLastValues(ctx context.Context) stateFn {
 				slog.Info("cloud: broker connection lost during LastValues sync", "error", e.err)
 				return f.runReconnecting
 			case evCommandMessage:
+				if f.deliverOTA(e.msg.Cmd) {
+					continue
+				}
 				switch msg := e.msg.Cmd.Inner().(type) {
 				case command.LastValuesUpdateCmd:
 					slog.Info("cloud: received LastValues", "thing_id", f.thingID)
@@ -498,6 +570,9 @@ func (f *FSM) runSteady(ctx context.Context) stateFn {
 // a non-nil stateFn if the message forces a state transition; nil if the
 // command was handled in-place and the FSM stays in Steady.
 func (f *FSM) handleSteadyCommand(cmd command.Cmd) stateFn {
+	if f.deliverOTA(cmd) {
+		return nil
+	}
 	switch msg := cmd.Inner().(type) {
 	case command.ThingDetachCmd:
 		slog.Info("cloud: ThingDetach received", "thing_id", f.thingID)
@@ -585,6 +660,7 @@ func (f *FSM) drainEvents() {
 // shutdown performs the graceful exit sequence. Called via defer from Run.
 func (f *FSM) shutdown() {
 	slog.Info("cloud: shutting down", "state", f.state, "thing_id", f.thingID)
+	f.setOTAConnected(false)
 	if f.thingID != "" {
 		_ = f.client.UnsubscribePropertyTopic(f.thingID.String())
 	}
@@ -612,6 +688,51 @@ func (f *FSM) applyProperties(payload []byte, logEach bool) error {
 		f.reg.SetValue(v.Name, v.Value, v.Timestamp)
 	}
 	return nil
+}
+
+// deliverOTA hands an App-deploy job to the OTA process. It returns true when cmd
+// was an OTA command, so the caller stops dispatching it.
+//
+// Every state that can receive a downlink command calls this FIRST, because a
+// deploy job is valid from the moment the command channel is subscribed and does
+// not depend on the thing handshake: AwaitingThingID (a board that has never been
+// given a thing must still be deployable), SyncingLastValues, and Steady.
+//
+// The job is executed on the OTA process's own goroutine. That is what keeps
+// Cloud Variables flowing during a deploy: this dispatcher returns immediately
+// and stays free to service inbound property updates and connection events while
+// a multi-gigabyte bundle downloads, and the FSM never leaves its current state.
+func (f *FSM) deliverOTA(cmd command.Cmd) bool {
+	msg, ok := cmd.Inner().(command.OTAUpdateCmd)
+	if !ok {
+		return false
+	}
+	if f.ota == nil {
+		slog.Warn("cloud: OTAUpdate received but the app-deploy process is not available")
+		return true
+	}
+	slog.Info("cloud: OTAUpdate received, dispatching to the app-deploy process",
+		"state", f.state, "url_host", commandURLHost(msg.URL))
+	f.ota.Deliver(msg)
+	return true
+}
+
+// setOTAConnected tells the OTA process whether the broker link is usable.
+func (f *FSM) setOTAConnected(v bool) {
+	if f.ota != nil {
+		f.ota.SetConnected(v)
+	}
+}
+
+// commandURLHost reduces a download URL to its host for logging. A storage URL
+// can carry a presigned signature in its query string — a bearer credential for
+// the bundle — so the full URL never reaches the logs.
+func commandURLHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<unparsable>"
+	}
+	return u.Host
 }
 
 func nextConnBackoff(current time.Duration) time.Duration {

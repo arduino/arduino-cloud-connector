@@ -80,16 +80,22 @@ type LastValuesUpdateCmd struct {
 	Values []byte
 }
 
-// OTABeginCmd (tag 0x10000, Up) initiates an OTA update. Not implemented
-// in this daemon; included so the TagSet covers all protocol tags and unknown
-// commands can be decoded and logged by name rather than failing hard.
+// OTABeginCmd (tag 0x10000, Up) carries the digest of an installed artefact. On an
+// MCU it is published on every connection to announce the running firmware; on this
+// daemon it is published exactly once, right after an App bundle has been installed,
+// as the success signal that closes a deploy job (RFC-14 §5.1). It is deliberately
+// NOT sent at startup: a Linux board can hold and run several Apps, some installed
+// by hand from App Lab, so there is no single installed digest to announce. See
+// internal/ota, which implements it.
 type OTABeginCmd struct {
 	_      struct{} `cbor:",toarray"`
 	SHA256 [32]byte
 }
 
-// OTAUpdateCmd (tag 0x10100, Down) is sent by the cloud to push OTA package
-// metadata to the device. Not implemented.
+// OTAUpdateCmd (tag 0x10100, Down) is sent by the cloud to start a deploy. ID is
+// the job id, URL the storage location of the App bundle, InitialSHA the digest
+// the cloud believes is deployed and FinalSHA the digest the download must hash
+// to. Handled by internal/ota.OTAFSM (RFC-14 §5.2).
 type OTAUpdateCmd struct {
 	_          struct{} `cbor:",toarray"`
 	ID         [16]byte
@@ -98,8 +104,14 @@ type OTAUpdateCmd struct {
 	FinalSHA   [32]byte
 }
 
-// OTAProgressCmd (tag 0x10200, Up) reports OTA progress device→cloud.
-// Not implemented.
+// OTAProgressCmd (tag 0x10200, Up) reports deploy progress device→cloud. State
+// is the phase (see internal/ota.State) and StateData its payload: downloaded
+// bytes during Fetch, a percentage during install, or a negative error code on
+// failure.
+//
+// NOTE StateData is int32 to match the C++ library's wire format, so a byte count
+// saturates just under 2 GiB. App bundles are expected to exceed that; see
+// internal/ota.OTAFSM.progressData.
 type OTAProgressCmd struct {
 	_         struct{} `cbor:",toarray"`
 	ID        [16]byte
