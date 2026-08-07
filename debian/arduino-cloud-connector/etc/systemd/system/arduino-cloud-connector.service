@@ -19,6 +19,7 @@ Environment=ARDUINO_CLOUD_CONNECTOR__PORT=5683
 Environment=ARDUINO_CLOUD_CONNECTOR__MQTT_BROKER=mqtts://iot.arduino.cc:8885
 Environment=ARDUINO_CLOUD_CONNECTOR__PROVISIONING_API=https://api2.arduino.cc/provisioning
 Environment=ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL=info
+Environment=ARDUINO_CLOUD_CONNECTOR__APP_DOWNLOAD_DIR=/home/arduino/.local/share/arduino-cloud-connector/app-download
 
 # Harden the service: restrict access to the rest of the filesystem.
 ProtectSystem=strict
