@@ -35,6 +35,8 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 	}
 	digestHex := hexDigest(req.ExpectedSHA256)
 
+	started := d.now()
+
 	// One deadline for the whole transfer, retries and back-off included.
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.DownloadTimeout)
 	defer cancel()
@@ -64,8 +66,10 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 	if err := t.finish(); err != nil {
 		return err
 	}
+
 	slog.Info("downloader: download complete and verified",
-		"dest", req.DestPath, "bytes", t.written)
+		"dest", req.DestPath, "bytes", t.written,
+		"duration", d.now().Sub(started).Round(time.Millisecond))
 	return nil
 }
 
