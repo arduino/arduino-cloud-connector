@@ -6,6 +6,7 @@
 package downloader
 
 import (
+	"crypto/sha256"
 	"hash"
 	"io"
 	"log/slog"
@@ -168,12 +169,51 @@ func (t *transfer) reset(now time.Time) error {
 	return nil
 }
 
-// digest returns the SHA-256 of everything appended so far. Sum does not consume
-// the hasher, so the transfer stays usable afterwards.
+// digest returns the SHA-256 of everything appended so far, as folded in by append.
+// Sum does not consume the hasher, so the transfer stays usable afterwards.
+//
+// This is the digest of the byte STREAM, not of the file. Its job is resume — it is
+// what gets marshalled into the resume record so a restart does not have to rehash
+// gigabytes — and diagnosis. The artefact is verified by fileDigest.
 func (t *transfer) digest() [32]byte {
 	var out [32]byte
 	copy(out[:], t.h.Sum(nil))
 	return out
+}
+
+// fileDigest hashes the partial file as it actually is on disk — the bytes that the
+// rename in finish will publish, and that the installer will read.
+//
+// Opened fresh for reading rather than seeking the write handle, so the transfer's own
+// file offset is left exactly where the last append put it and no later write can land
+// in the wrong place because verification moved it.
+func (t *transfer) fileDigest() ([32]byte, error) {
+	var out [32]byte
+
+	// Everything written has to be on disk before it is read back, or the hash could be
+	// taken over a file the last appends have not reached yet.
+	if err := t.f.Sync(); err != nil {
+		return out, storageapi.Terminal(ErrWriteFile, "fsync before verification").Wrap(err)
+	}
+
+	part := partPath(t.dest)
+	f, err := os.Open(part)
+	if err != nil {
+		return out, storageapi.Terminal(ErrOpenFile, "open %s for verification", part).Wrap(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	// Same granularity as the download itself. io.Copy's default 32 KiB would multiply
+	// the syscall count on a multi-gigabyte artefact for no reason.
+	if _, err := io.CopyBuffer(h, f, make([]byte, readBufSize)); err != nil {
+		// ErrOpenFile rather than a sentinel of its own: RFC-14 §5.10 has no code for
+		// "could not read back what we just wrote", and the operator-visible cause is the
+		// same as failing to open it — the download directory is not usable.
+		return out, storageapi.Terminal(ErrOpenFile, "read %s for verification", part).Wrap(err)
+	}
+	copy(out[:], h.Sum(nil))
+	return out, nil
 }
 
 // finish promotes the verified partial file to the destination and drops the resume

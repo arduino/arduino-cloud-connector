@@ -56,11 +56,9 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 		return d.abandon(t, req.DestPath, err)
 	}
 
-	// Digest check over the bytes actually written — the gate between "downloaded"
-	// and "usable".
-	if got := t.digest(); got != req.ExpectedSHA256 {
-		return d.abandon(t, req.DestPath,
-			storageapi.Terminal(ErrDigestMismatch, "got %x, want %x", got, req.ExpectedSHA256))
+	// The gate between "downloaded" and "usable" — see verify.
+	if err := d.verify(ctx, t, req.ExpectedSHA256); err != nil {
+		return d.abandon(t, req.DestPath, err)
 	}
 
 	if err := t.finish(); err != nil {
@@ -71,6 +69,61 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 		"dest", req.DestPath, "bytes", t.written,
 		"duration", d.now().Sub(started).Round(time.Millisecond))
 	return nil
+}
+
+// verify is the gate between "downloaded" and "usable": it re-reads the artefact from
+// disk and checks THAT against the expected digest.
+//
+// Hashing the file rather than the byte stream is the whole point. The streaming
+// hasher that transfer.append folds bytes into describes what came off the network,
+// and it necessarily agrees with itself — so it cannot see a byte that reached the
+// wrong offset, a resume that restored a hasher state inconsistent with the partial
+// file, or a filesystem that did not keep what it was given. What gets installed is
+// the file, so the file is what has to be verified.
+//
+// The streaming digest is still computed and still indispensable: marshalled into the
+// resume record, it is what lets a restart continue a multi-gigabyte transfer instead
+// of rehashing it (see resume.go). Here it serves only to attribute a failure, which
+// is worth doing because the two causes need opposite investigations — an artefact
+// whose digest never matched is someone else's bug, bytes that arrived intact and did
+// not survive the round trip to disk is ours.
+//
+// The cost is one extra full read of the artefact, paid once per download. The
+// alternative is handing the installer a file nothing ever checked.
+func (d *downloader) verify(ctx context.Context, t *transfer, want [32]byte) error {
+	// A full pass over a multi-gigabyte file is not instant, and there is no point
+	// starting it under a context that is already done.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	started := d.now()
+
+	got, err := t.fileDigest()
+	if err != nil {
+		return err
+	}
+	if got == want {
+		slog.Debug("downloader: artefact verified on disk", "dest", t.dest,
+			"bytes", t.written, "duration", d.now().Sub(started).Round(time.Millisecond))
+		return nil
+	}
+
+	// Which side lost the bytes is the first thing anyone debugging this needs, and it
+	// costs nothing to answer: the stream digest is already in hand.
+	// bytes/total say how much was hashed. They should be equal — the chunk loop stops
+	// at total and append refuses to pass it — so a pair that differs is itself the
+	// finding, which is why both are logged rather than just the count.
+	if streamed := t.digest(); streamed == want {
+		slog.Error("downloader: the artefact on disk does not match what was downloaded — the transfer was correct, the stored file is not",
+			"dest", t.dest, "bytes", t.written, "total", t.total,
+			"file_sha256", hexDigest(got), "downloaded_sha256", hexDigest(streamed))
+	} else {
+		slog.Error("downloader: the downloaded artefact does not match the expected digest",
+			"dest", t.dest, "bytes", t.written, "total", t.total,
+			"file_sha256", hexDigest(got),
+			"downloaded_sha256", hexDigest(streamed), "want_sha256", hexDigest(want))
+	}
+	return storageapi.Terminal(ErrDigestMismatch, "got %x, want %x", got, want)
 }
 
 // abandon decides the fate of the partial file after a failed download, and is the
@@ -204,7 +257,34 @@ func (d *downloader) fetchChunk(ctx context.Context, t *transfer, req Request, o
 	if err := d.checkCapacity(t); err != nil {
 		return err
 	}
-	return d.stream(t, resp.Body, onProgress)
+
+	streamErr := d.stream(t, resp.Body, onProgress)
+
+	// One line per ranged request. The digest check can say an artefact arrived
+	// complete-but-wrong; only this can say which request delivered the wrong bytes.
+	//
+	// received is the number to read first: on every chunk but the last it should equal
+	// the requested span exactly, and a chunk that received MORE than it asked for is a
+	// server sending outside the range it acknowledged in Content-Range — the one
+	// corruption this package cannot otherwise detect, because the bytes are plausible
+	// and the running total still adds up.
+	//
+	// Info, not Debug: a 64 MiB chunk size makes this a handful of lines per download,
+	// and needing it means the download has already gone wrong once.
+	slog.Info("downloader: chunk complete",
+		"dest", req.DestPath,
+		"requested", fmt.Sprintf("bytes=%d-%d", start, end),
+		"requested_bytes", end-start+1,
+		"received", t.written-start,
+		"resp_start", resp.Start, "resp_total", resp.Total, "ranged", resp.Ranged,
+		"written", t.written, "total", t.total,
+		// The digest of everything received SO FAR. A prefix hash is what localises a
+		// bad chunk without shipping any bytes anywhere: the same number can be computed
+		// from a known-good copy with `head -c <written> file | sha256sum`, so the first
+		// chunk whose cumulative digest disagrees is the one that delivered wrong bytes.
+		"cumulative_sha256", hexDigest(t.digest()))
+
+	return streamErr
 }
 
 // rangeFor is the next chunk to ask for. Before the total is known the first

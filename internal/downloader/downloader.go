@@ -90,6 +90,10 @@ type Downloader interface {
 	// req.ExpectedSHA256. On success DestPath holds the complete, verified
 	// artefact; on failure it does not exist.
 	//
+	// Verification hashes the FILE on disk, not the byte stream that produced it, so
+	// what the caller is handed is what was checked. A stream that arrived intact and
+	// a file that did not keep it are distinguished in the log.
+	//
 	// A transfer interrupted by a crash, a restart or a network failure is resumed
 	// automatically on the next call for the same DestPath and digest — including
 	// across process restarts, so a multi-gigabyte artefact is never re-fetched
@@ -150,7 +154,9 @@ var (
 	// ErrTransfer: the transfer failed or was truncated and the retry budget ran
 	// out.
 	ErrTransfer = errors.New("downloader: transfer failed")
-	// ErrDigestMismatch: the fetched bytes do not hash to ExpectedSHA256.
+	// ErrDigestMismatch: the artefact on disk does not hash to ExpectedSHA256. Raised
+	// from the verification pass that reads the finished file back, so it covers both
+	// an artefact that never matched and one that did not survive being stored.
 	ErrDigestMismatch = errors.New("downloader: digest mismatch")
 	// ErrTimeout: the download did not finish within the configured timeout.
 	ErrTimeout = errors.New("downloader: download exceeded its deadline")
