@@ -45,6 +45,13 @@ type FakeClient struct {
 	// IgnoreRange makes the fake answer like a server with no Range support: the
 	// whole artefact from byte 0, with Ranged false.
 	IgnoreRange bool
+	// ServeToEnd makes the fake honour the range START but ignore its END, running
+	// the body on to the end of the artefact — still a 206, still Ranged, still
+	// reporting the requested start. Real CDNs and object stores do this, and it is
+	// the one shape the plain slice above cannot produce: the caller receives more
+	// bytes than it asked for and has to stop itself at the chunk boundary without
+	// mistaking the surplus for misplaced data.
+	ServeToEnd bool
 	// TruncateAt, when > 0, cuts every served body to this many bytes — a
 	// connection that dies mid-body.
 	TruncateAt int
@@ -143,10 +150,16 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// slice picks the bytes this call serves, honouring IgnoreRange.
+// slice picks the bytes this call serves, honouring IgnoreRange and ServeToEnd.
 func (f *FakeClient) slice(start, end int64) (body []byte, ranged bool) {
 	if f.IgnoreRange {
 		return f.Content, false
+	}
+	if f.ServeToEnd {
+		if start >= int64(len(f.Content)) {
+			return nil, true
+		}
+		return f.Content[start:], true
 	}
 	last := end
 	if last > int64(len(f.Content))-1 {

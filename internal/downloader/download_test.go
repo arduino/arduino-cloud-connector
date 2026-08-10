@@ -6,11 +6,16 @@
 package downloader
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -419,6 +424,207 @@ func TestDownloadDoesNotLoopWhenTheServerIgnoresRange(t *testing.T) {
 	}
 }
 
+// TestDownloadVerifiesWhenTheServerOverrunsTheRange covers the one response shape an
+// exact range slice cannot produce and that a real CDN or object store readily does:
+// a 206 that honours the requested START but ignores its END, streaming on to the end
+// of the object.
+//
+// It matters because stream() does not bound its reads to the requested range — it
+// stops only once the chunk boundary has been *crossed* — so every chunk but the last
+// overshoots by up to one read. This test is what says the overshoot is safe, rather
+// than an argument that it is: the surplus bytes belong at the offsets they land on,
+// and t.written carries the real position into the next range request, so the
+// assembled artefact still verifies. Nothing else in the suite exercises it, since
+// the multi-chunk happy path is served exact slices — and it is exactly the class of
+// bug a bundle over one chunk in size would be blamed for.
+func TestDownloadVerifiesWhenTheServerOverrunsTheRange(t *testing.T) {
+	body := content(5000) // ~5 chunks at chunkSize=1024
+	// ReadSize well under chunkSize is what makes the overshoot happen at all: with
+	// one giant Read the whole object would arrive in a single pass and the boundary
+	// handling would never be reached.
+	fake := &storageapitest.FakeClient{Content: body, ServeToEnd: true, ReadSize: 300}
+	dp := destIn(t.TempDir())
+
+	// Download verifies the digest itself, so returning nil already proves the
+	// assembled bytes hash to ExpectedSHA256.
+	if err := testDownloader(t, fake).Download(context.Background(), testReq(dp, body), noProgress); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	got, err := os.ReadFile(dp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("content mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+
+	// The requested starts must advance strictly. A repeated or rewound start would
+	// mean a span was fetched twice, which is how this could go wrong while still
+	// writing a plausible number of bytes.
+	prev := int64(-1)
+	for _, r := range fake.Ranges() {
+		spec, _ := strings.CutPrefix(r, "bytes=")
+		startSpec, _, _ := strings.Cut(spec, "-")
+		start, err := strconv.ParseInt(startSpec, 10, 64)
+		if err != nil {
+			t.Fatalf("unparsable recorded range %q: %v", r, err)
+		}
+		if start <= prev {
+			t.Errorf("range starts did not advance: %d after %d (%v)", start, prev, fake.Ranges())
+		}
+		prev = start
+	}
+}
+
+// ── reassembly fidelity over chunk boundaries ────────────────────────────────
+
+// This test answers one question the byte-level tests above cannot: is the archive that
+// comes out of a chunked transfer the same FILE that went in?
+//
+// The artefact is shaped like a real deploy bundle, because its shape is what makes the
+// failure mode visible. scripts/make-test-bundle.py builds one block of numbered lines
+// and rewrites that same block until the payload is long enough, so the payload repeats
+// with a fixed period — which means a span reassembled a few bytes out of position is
+// INVISIBLE inside it: the text still reads correctly, only with different line numbers
+// than belong at that offset. What gives it away is the ZIP trailer: it appears exactly
+// once, at the very end, so any misplacement pushes it off the end of the file. That is
+// how a 70 MiB bundle came down with the right byte count, a plausible payload, and no
+// central directory.
+//
+// Everything here is sized in kilobytes. The script's real period is 1 MiB and the
+// production chunk is 64 MiB, but neither number is what is under test: the chunk
+// arithmetic is size-independent (int64 throughout, no width to overflow), so a boundary
+// at 1 kB exercises exactly the code a boundary at 64 MiB does. What has to be
+// reproduced is the *property* — a periodic payload with a unique trailer — not the
+// constants. Keeping it small costs the suite milliseconds and a few kB of temp space.
+const payloadPeriod = 1 << 10
+
+// payloadBlock reproduces the script's text_block: 57-byte numbered lines, cut to
+// exactly n bytes (the cut is why a block ends mid-line, as the real payload does).
+func payloadBlock(n int) []byte {
+	var out []byte
+	for line := 1; len(out) < n; line++ {
+		out = append(out, fmt.Sprintf("arduino-cloud-connector test payload - line %012d\n", line)...)
+	}
+	return out[:n]
+}
+
+// storedZip builds an archive shaped like a deploy bundle: one STORED member whose
+// content is payloadBlock repeated to payloadSize, then the central directory and EOCD.
+// Stored, not deflated, for the same reason the script defaults to it — deflate would
+// crush repetitive text and leave nothing to chunk.
+func storedZip(t *testing.T, payloadSize int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: "payload.txt", Method: zip.Store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := payloadBlock(min(payloadSize, payloadPeriod))
+	for written := 0; written < payloadSize; {
+		n := min(len(block), payloadSize-written)
+		if _, err := w.Write(block[:n]); err != nil {
+			t.Fatal(err)
+		}
+		written += n
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// firstDiff reports the offset of the first differing byte, or -1 when equal. It is
+// what `cmp` prints, and it is the number that localises a reassembly fault: an offset
+// that lands exactly on a multiple of the chunk size names the boundary that lost the
+// bytes.
+func firstDiff(got, want []byte) int {
+	for i := 0; i < len(got) && i < len(want); i++ {
+		if got[i] != want[i] {
+			return i
+		}
+	}
+	if len(got) != len(want) {
+		return min(len(got), len(want))
+	}
+	return -1
+}
+
+// reassembles downloads body through a fake serving exact ranges, and asserts the file on
+// disk is byte-identical to what went in.
+func reassembles(t *testing.T, body []byte, chunk int64, wantRequests int) {
+	t.Helper()
+	// ReadSize caps each Read well under both the chunk size and the downloader's own
+	// read buffer, so a chunk boundary is actually reached mid-body instead of the whole
+	// chunk arriving in one Read — without it a boundary bug can hide.
+	fake := &storageapitest.FakeClient{Content: body, ReadSize: 100}
+	dp := destIn(t.TempDir())
+
+	d := testDownloader(t, fake)
+	d.chunkSize = chunk
+
+	if err := d.Download(context.Background(), testReq(dp, body), noProgress); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	got, err := os.ReadFile(dp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at := firstDiff(got, body); at >= 0 {
+		t.Errorf("reassembled archive differs at byte %d (got %d bytes, want %d); "+
+			"chunk size %d, so the boundaries are at multiples of it",
+			at, len(got), len(body), chunk)
+	}
+	// Without this the table would quietly degenerate: a case whose chunk size turns out
+	// to cover the whole archive proves nothing about boundaries, and would still pass.
+	if n := fake.Calls(); n != wantRequests {
+		t.Errorf("expected %d ranged requests at chunk size %d, got %d (%v) — the case "+
+			"did not exercise the boundary it was written for",
+			wantRequests, chunk, n, fake.Ranges())
+	}
+}
+
+func TestDownloadReassemblesAnArchiveAcrossChunkBoundaries(t *testing.T) {
+	// Four full periods, so the payload repeats and a misplaced span cannot be spotted by
+	// reading it — only the trailer can betray one.
+	body := storedZip(t, 4*payloadPeriod)
+	total := int64(len(body))
+
+	cases := []struct {
+		name         string
+		chunk        int64
+		wantRequests int
+	}{
+		// The control: no boundary at all. If this one ever fails, the fault is not in
+		// the chunking.
+		{"one request for the whole archive", total + 1, 1},
+		// An exact divisor: the boundary falls between two chunks with nothing left
+		// over, so an off-by-one at the seam has nowhere to hide.
+		{"two equal chunks", total / 2, 2},
+		// A partial last chunk, the ordinary case in production. The +1 is what makes it
+		// one: total/3 happens to divide exactly, which would have made this a second
+		// copy of the case above.
+		{"three chunks, last one partial", total/3 + 1, 3},
+		// The boundary lands on the payload's own repetition period — the alignment at
+		// which a misplaced chunk is least visible in the payload text.
+		{"boundary aligned to the payload period", payloadPeriod, 5},
+		// The trailer, alone, in its own chunk. This is the shape of the real failure:
+		// everything up to the last few bytes arrives, and the central directory is
+		// whatever the final short request returns.
+		{"trailer alone in the last chunk", total - 128, 2},
+		// The extreme of the same idea.
+		{"final chunk of one byte", total - 1, 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reassembles(t, body, tc.chunk, tc.wantRequests)
+		})
+	}
+}
+
 // ── capacity ─────────────────────────────────────────────────────────────────
 
 func TestDownloadRejectsAnOversizedArtefact(t *testing.T) {
@@ -476,6 +682,48 @@ func TestDownloadRejectsADigestMismatch(t *testing.T) {
 	for _, p := range []string{dp, partPath(dp), resumePath(dp)} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%s survived a digest mismatch", filepath.Base(p))
+		}
+	}
+}
+
+// TestDownloadVerifiesTheFileOnDiskNotTheByteStream pins the verification onto the
+// file. The streaming hasher describes the bytes that came off the network and
+// necessarily agrees with itself, so on its own it can never notice that the artefact
+// as stored is wrong — and the artefact as stored is what gets installed.
+//
+// The corruption is applied through a second file handle, to a region the transfer has
+// already written and moved past, so the stream digest still matches the request
+// perfectly and only a check that reads the file back can fail. Before verify() hashed
+// the file, this download succeeded and published a corrupted bundle.
+func TestDownloadVerifiesTheFileOnDiskNotTheByteStream(t *testing.T) {
+	body := content(5000) // several chunks, so there is a written region to go back and spoil
+	dp := destIn(t.TempDir())
+	fake := &storageapitest.FakeClient{Content: body}
+
+	// By the second chunk request, byte 10 is long since written and fsynced.
+	fake.Hook = func(call int) {
+		if call != 2 {
+			return
+		}
+		f, err := os.OpenFile(partPath(dp), os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open partial to corrupt it: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		if _, err := f.WriteAt([]byte{^body[10]}, 10); err != nil {
+			t.Fatalf("corrupt partial: %v", err)
+		}
+	}
+
+	err := testDownloader(t, fake).Download(context.Background(), testReq(dp, body), noProgress)
+	if !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("expected ErrDigestMismatch for a corrupted file, got %v", err)
+	}
+	// Same disposal as any other poisoned partial: nothing published, nothing left to
+	// resume from.
+	for _, p := range []string{dp, partPath(dp), resumePath(dp)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s survived a corrupted download", filepath.Base(p))
 		}
 	}
 }
