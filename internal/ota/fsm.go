@@ -787,9 +787,14 @@ func (f *OTAFSM) runFail(ctx context.Context) stateFn {
 	// transition publishes OTAProgressCmd(8, failCode) — do it before clearing
 	// the job, which the message is keyed by.
 	f.transition(StateFail)
+	// The byte counters survive the transition into Fail (publishSnapshot only clears
+	// them on entry to Idle), so they still describe the transfer that just failed.
+	// Worth having on every failure, not just a download one: on an install failure
+	// they say how big the bundle handed over was.
+	snap := f.Snapshot()
 	slog.Error("ota: app deploy failed",
 		"job_id", f.jobIDForLog(), "code", f.failCode, "code_value", int32(f.failCode),
-		"error", f.failCause)
+		"downloaded", snap.Downloaded, "total", snap.Total, "error", f.failCause)
 
 	// The Cloud has been told; it closes the job. Keeping the partial download would
 	// only make the next Resume re-fetch a bundle nobody is waiting for.
