@@ -6,6 +6,8 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -46,8 +48,16 @@ func run(cmd *cobra.Command, cfg config.Config, version string) error {
 		return fmt.Errorf("keystore: %w", err)
 	}
 
-	idSvc, err := identity.New(cfg, ks)
+	// The UHWID can take several seconds to become readable at boot (the WiFi
+	// PHY probe), and a stop signal can land in that window. That is an orderly
+	// stop, not a startup failure: returning the error here would exit non-zero
+	// and have systemd mark the unit failed for what the operator asked for.
+	idSvc, err := identity.New(ctx, cfg, ks)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("stop requested before the hardware identity was available; exiting")
+			return nil
+		}
 		return fmt.Errorf("identity: %w", err)
 	}
 
