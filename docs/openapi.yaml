@@ -360,10 +360,18 @@ components:
       description: |
         Provisioning service state, derived from disk (no dedicated state file):
         the in-flight marker takes precedence over the credential files.
-        `provisioning` = an attempt is in flight within its retry window;
-        `error` = an in-flight attempt exceeded the retry window and is awaiting a
-        new /v1/provisioning/start; `provisioned` = credentials present, no marker;
-        `unprovisioned` = no credentials and no attempt in flight.
+        `provisioning` = an attempt is in flight within its retry window — either
+        awaiting the certificate, or holding a certificate that has not been
+        activated yet; `error` = the attempt ran out of its retry window and is
+        awaiting a new /v1/provisioning/start; `provisioned` = credentials present,
+        no marker, and the certificate has been activated, so the broker will accept
+        it; `unprovisioned` = no credentials and no attempt in flight.
+
+        Note on `error`: when the failure was the final activation step
+        (provision/complete), the issued certificate is discarded — it is valid but
+        inactive, so it could never connect — and the state is remembered in memory
+        only. A daemon restart therefore reports `unprovisioned` instead of `error`;
+        both require a new /v1/provisioning/start and the daemon behaves identically.
       enum: [unprovisioned, provisioning, provisioned, error]
 
     DaemonState:

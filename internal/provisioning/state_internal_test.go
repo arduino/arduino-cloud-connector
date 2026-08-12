@@ -6,6 +6,7 @@
 package provisioning
 
 import (
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -62,10 +63,21 @@ func TestStateDerivation(t *testing.T) {
 		t.Error("expired marker: InFlight() = false, want true (marker still present)")
 	}
 
-	// Marker cleared, still no credentials → back to Unprovisioned.
+	// A remembered provision/complete failure outranks everything, because that
+	// outcome deliberately leaves nothing on disk to derive a state from.
 	if err := svc.clearMarker(); err != nil {
 		t.Fatalf("clearMarker: %v", err)
 	}
+	svc.setCompleteFailure(errors.New("complete refused"))
+	if got := svc.State(); got != StateError {
+		t.Errorf("remembered complete failure: got %q want %q", got, StateError)
+	}
+	if svc.InFlight() {
+		t.Error("remembered complete failure: InFlight() = true, want false (the marker is cleared)")
+	}
+	svc.setCompleteFailure(nil)
+
+	// Marker cleared, still no credentials → back to Unprovisioned.
 	if got := svc.State(); got != StateUnprovisioned {
 		t.Errorf("cleared marker: got %q want %q", got, StateUnprovisioned)
 	}
