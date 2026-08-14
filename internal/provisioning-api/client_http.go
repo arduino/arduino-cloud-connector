@@ -24,9 +24,9 @@ import (
 // attempt (provisioning.provisioningWindow), spent across unconditional retries. With
 // no per-call limit one connection that hangs — a silent middlebox, a half-open
 // socket — consumes the entire budget in a single attempt, and the attempt then fails
-// having tried exactly once. The value is generous: signing a CSR is real work on the
-// far side, so this is a stall detector, not a latency target.
-const requestTimeout = 30 * time.Second
+// having tried exactly once. This is a stall detector, not a latency target: past this
+// point the connection is stuck, and the budget is better spent on a retry.
+const requestTimeout = 10 * time.Second
 
 // NewClient returns the production HTTP-backed provisioning client. The
 // mock variant of this function is defined in client_mock.go and selected
