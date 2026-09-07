@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/arduino/arduino-cloud-connector/internal/config"
@@ -44,6 +45,16 @@ type Option func(*mockClient)
 // provisioning state. The default is 0 (calls return immediately).
 func WithLatency(d time.Duration) Option {
 	return func(m *mockClient) { m.Latency = d }
+}
+
+// WithCompleteFailures makes the first n calls to Complete fail before it starts
+// succeeding. Pass a negative n to fail every call.
+//
+// It exists because provision/complete failing is no longer a footnote: it fails the
+// whole attempt and discards the certificate, and the default mock — which always
+// succeeds — cannot reach any of that.
+func WithCompleteFailures(n int) Option {
+	return func(m *mockClient) { m.completeFailures = n }
 }
 
 // NewMockClient returns a provisioningapi.Client backed by a per-instance
@@ -93,9 +104,44 @@ type mockClient struct {
 
 	// Latency is the simulated per-call delay. Tests can set it to 0 for speed.
 	Latency time.Duration
+
+	// mu guards the fields below: a test may read the counters from its own
+	// goroutine while an attempt runs on another.
+	mu sync.Mutex
+	// completeFailures is how many further Complete calls must fail; negative means
+	// all of them. Decremented on each failure.
+	completeFailures int
+	csrCalls         int
+	completeCalls    int
+}
+
+// CSRCalls reports how many times SubmitCSR was called. A resumed attempt must not
+// spend a second CSR on a certificate it already holds, and this is what proves it.
+func (m *mockClient) CSRCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.csrCalls
+}
+
+// CompleteCalls reports how many times Complete was called.
+func (m *mockClient) CompleteCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.completeCalls
+}
+
+// Counters is the subset of the mock a test needs to inspect. NewMockClient returns
+// the Client interface, so a test that wants the counters type-asserts to this.
+type Counters interface {
+	CSRCalls() int
+	CompleteCalls() int
 }
 
 func (m *mockClient) SubmitCSR(ctx context.Context, boardToken, csrPEM string) (deviceID, certPEM string, err error) {
+	m.mu.Lock()
+	m.csrCalls++
+	m.mu.Unlock()
+
 	if err := m.simulateLatency(ctx); err != nil {
 		return "", "", err
 	}
@@ -152,8 +198,19 @@ func (m *mockClient) SubmitCSR(ctx context.Context, boardToken, csrPEM string) (
 }
 
 func (m *mockClient) Complete(ctx context.Context, boardToken string) error {
+	m.mu.Lock()
+	m.completeCalls++
+	fail := m.completeFailures != 0
+	if m.completeFailures > 0 {
+		m.completeFailures--
+	}
+	m.mu.Unlock()
+
 	if err := m.simulateLatency(ctx); err != nil {
 		return err
+	}
+	if fail {
+		return fmt.Errorf("mock provisioning: complete refused (scripted failure)")
 	}
 	slog.Info("provisioning (mock): complete acknowledged",
 		"board_token_present", boardToken != "")

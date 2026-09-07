@@ -472,8 +472,13 @@ func (d *Daemon) runCheckInternet(ctx context.Context) daemonStateFn {
 // the credential files:
 //
 //   - StateProvisioning (in-flight marker, within window) → resume the attempt
-//     (the prelude already ran before the crash/restart).
-//   - StateProvisioned (credentials present, no marker)   → Run.
+//     (the prelude already ran before the crash/restart). The provisioning Service
+//     decides which half to resume from: with a certificate already on disk it
+//     continues from provision/complete instead of spending a second CSR.
+//   - StateProvisioned (credentials present, no marker)   → Run. The marker now
+//     survives until provision/complete has succeeded, so this state means the
+//     certificate is activated and the broker will accept it — not merely that a
+//     certificate exists.
 //   - StateUnprovisioned / StateError                     → Provisioning, idle,
 //     waiting for /v1/provisioning/start.
 func (d *Daemon) pickPostInternetState() daemonStateFn {

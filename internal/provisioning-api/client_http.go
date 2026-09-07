@@ -13,9 +13,20 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/arduino/arduino-cloud-connector/internal/config"
 )
+
+// requestTimeout bounds a single call to the Provisioning API.
+//
+// It matters because the caller's bound is a wall-clock budget shared by the whole
+// attempt (provisioning.provisioningWindow), spent across unconditional retries. With
+// no per-call limit one connection that hangs — a silent middlebox, a half-open
+// socket — consumes the entire budget in a single attempt, and the attempt then fails
+// having tried exactly once. This is a stall detector, not a latency target: past this
+// point the connection is stuck, and the budget is better spent on a retry.
+const requestTimeout = 10 * time.Second
 
 // NewClient returns the production HTTP-backed provisioning client. The
 // mock variant of this function is defined in client_mock.go and selected
@@ -24,7 +35,7 @@ func NewClient(cfg config.Config) Client {
 	slog.Info("provisioning: using HTTP client", "endpoint", cfg.ProvisioningAPI)
 	return &httpClient{
 		cfg:  cfg,
-		http: &http.Client{},
+		http: &http.Client{Timeout: requestTimeout},
 	}
 }
 
