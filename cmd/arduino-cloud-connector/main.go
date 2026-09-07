@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"go.bug.st/cleanup"
@@ -52,7 +54,19 @@ func main() {
 	)
 
 	ctx := context.Background()
+
+	// SIGINT (Ctrl-C) — interactive runs.
 	ctx, _ = cleanup.InterruptableContext(ctx)
+
+	// SIGTERM — what systemd sends on `systemctl stop`/`restart`, and the only
+	// way the daemon is ever stopped on a board. The helper above registers
+	// os.Interrupt only, so without this the root context is never cancelled:
+	// the process is killed outright and every graceful-shutdown path hanging
+	// off ctx (daemon FSM handlers, Cloud FSM teardown, srv.Shutdown) is dead
+	// code in production. stop() restores the default disposition on return.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM)
+	defer stop()
+
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 		os.Exit(1)

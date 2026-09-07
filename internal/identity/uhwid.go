@@ -53,11 +53,12 @@ var (
 // yet readable (see the package doc above) and returns an error if the set is
 // still incomplete after the last attempt.
 //
+// Cancelling ctx aborts the wait between attempts and returns an error wrapping
+// ctx.Err(), so a stop signal is honoured during the boot-time probe window.
+//
 // The mock build (uhwid_mock.go) replaces this with a random + persisted
 // implementation.
-func computeUHWID(_ config.Config) (string, error) {
-	ctx := context.Background()
-
+func computeUHWID(ctx context.Context, _ config.Config) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= uhwidMaxAttempts; attempt++ {
 		uhwid, err := buildUHWID(ctx)
@@ -70,7 +71,16 @@ func computeUHWID(_ config.Config) (string, error) {
 			"attempt", attempt, "max_attempts", uhwidMaxAttempts,
 			"retry_in", uhwidRetryInterval, "error", err)
 		if attempt < uhwidMaxAttempts {
-			time.Sleep(uhwidRetryInterval)
+			// The back-off is the entire cost of this loop — an attempt is two
+			// sysfs reads — so it is the only thing worth interrupting. Left as
+			// a bare sleep, a stop signal arriving in this window is absorbed
+			// for up to (uhwidMaxAttempts-1) * uhwidRetryInterval before the
+			// daemon can react to it.
+			select {
+			case <-time.After(uhwidRetryInterval):
+			case <-ctx.Done():
+				return "", fmt.Errorf("UHWID: interrupted while waiting for hardware identifiers: %w", ctx.Err())
+			}
 		}
 	}
 

@@ -8,6 +8,7 @@
 package identity
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,7 +33,10 @@ const mockUHWIDFile = "mock_uhwid"
 // front-end sees a stable board identity across daemon restarts.
 //
 // To rotate the identity (simulate a different board): delete the file.
-func computeUHWID(cfg config.Config) (string, error) {
+//
+// ctx is unused here — there is no hardware to wait for, so nothing to
+// interrupt; it is present to match the default build's signature.
+func computeUHWID(_ context.Context, cfg config.Config) (string, error) {
 	if cfg.DataDir == "" {
 		return "", errors.New("mock UHWID: DataDir is empty; cannot persist mock identity")
 	}

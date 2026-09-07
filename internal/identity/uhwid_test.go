@@ -44,7 +44,7 @@ func TestComputeUHWIDBothPresent(t *testing.T) {
 		func() (string, error) { return serial, nil },
 	)
 
-	got, err := computeUHWID(config.Config{})
+	got, err := computeUHWID(context.Background(), config.Config{})
 	if err != nil {
 		t.Fatalf("computeUHWID: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestComputeUHWIDRetriesUntilMACReady(t *testing.T) {
 		func() (string, error) { return serial, nil },
 	)
 
-	got, err := computeUHWID(config.Config{})
+	got, err := computeUHWID(context.Background(), config.Config{})
 	if err != nil {
 		t.Fatalf("computeUHWID: %v", err)
 	}
@@ -93,11 +93,37 @@ func TestComputeUHWIDFailsWhenMACNeverReady(t *testing.T) {
 		func() (string, error) { return "0123456789abcdef", nil },
 	)
 
-	if _, err := computeUHWID(config.Config{}); err == nil {
+	if _, err := computeUHWID(context.Background(), config.Config{}); err == nil {
 		t.Fatal("expected an error when the WiFi MAC is never available")
 	}
 	if calls != uhwidMaxAttempts {
 		t.Errorf("WiFi MAC read attempts: got %d want %d", calls, uhwidMaxAttempts)
+	}
+}
+
+// A stop signal arriving during the boot-time probe window must abort the wait
+// between attempts instead of running the retry budget out. Asserted on the
+// attempt count rather than on elapsed time, so the test is deterministic: an
+// uninterruptible back-off would spend all uhwidMaxAttempts here.
+func TestComputeUHWIDStopsOnCancelledContext(t *testing.T) {
+	calls := 0
+	withStubReaders(t,
+		func(context.Context) (string, error) {
+			calls++
+			return "", errors.New("failed to read WiFi MAC address from any known path")
+		},
+		func() (string, error) { return "0123456789abcdef", nil },
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := computeUHWID(ctx, config.Config{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error: got %v, want one wrapping context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Errorf("WiFi MAC read attempts: got %d want 1 (the back-off must not be entered once cancelled)", calls)
 	}
 }
 
@@ -108,7 +134,7 @@ func TestComputeUHWIDFailsWhenSerialMissing(t *testing.T) {
 		func() (string, error) { return "", nil },
 	)
 
-	if _, err := computeUHWID(config.Config{}); err == nil {
+	if _, err := computeUHWID(context.Background(), config.Config{}); err == nil {
 		t.Fatal("expected an error when the SoC serial is empty")
 	}
 }

@@ -8,6 +8,7 @@
 package identity
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"log/slog"
@@ -33,13 +34,14 @@ type keystoreIface interface {
 }
 
 // New computes and validates the UHWID at startup. Returns an error if no
-// stable hardware identifier could be found.
+// stable hardware identifier could be found, or one wrapping ctx.Err() if ctx
+// is cancelled while waiting for the hardware identifiers to appear.
 //
 // The computeUHWID implementation is selected at compile time via build tag:
 //   - Default build           → uhwid.go        (hashes MAC + CPU serial)
 //   - `go build -tags mock`   → uhwid_mock.go   (random + persisted to disk)
-func New(cfg config.Config, ks keystoreIface) (*Service, error) {
-	uhwid, err := computeUHWID(cfg)
+func New(ctx context.Context, cfg config.Config, ks keystoreIface) (*Service, error) {
+	uhwid, err := computeUHWID(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
