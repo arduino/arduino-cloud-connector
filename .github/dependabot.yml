@@ -41,8 +41,6 @@ updates:
   # Maintain dependencies for github-actions
   - package-ecosystem: "github-actions"
     directory: "/"
-    registries:
-      - bcmi-labs-github-actions
     schedule:
       interval: "weekly" # or "daily", "monthly"
     open-pull-requests-limit: 10
