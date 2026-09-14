@@ -123,6 +123,15 @@ tasks:
     cmds:
       - go test -v -race ./internal/mqtt/command/... ./internal/senml/... {{.CLI_ARGS}}
 
+  build-e2e:
+    desc: |
+      Build the E2E test tool (test/e2e is a separate Go module).
+      Produces ./build/<BINARY>-e2e. The tool needs a daemon binary to drive:
+      build it with `task build:mock` and pass it via -daemon or E2E_DAEMON_BIN.
+    dir: test/e2e
+    cmds:
+      - go build -v -ldflags="-X main.Version={{.VERSION}}" -o ../../build/{{.BINARY}}-e2e .
+
   test:e2e:unit:
     desc: |
       Run the E2E harness's own unit tests (test/e2e is a separate Go module).
