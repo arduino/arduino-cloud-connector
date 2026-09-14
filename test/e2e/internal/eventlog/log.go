@@ -40,6 +40,10 @@ type Log struct {
 	// a channel wakes every waiter at once, and a fresh one is installed for
 	// the next round.
 	changed chan struct{}
+
+	// aborted latches a terminal condition: the system under test is gone, so
+	// no expectation can ever be satisfied again. See Abort.
+	aborted *AbortedError
 }
 
 // New returns an empty log whose timeline starts now.
@@ -105,19 +109,90 @@ func (l *Log) Await(ctx context.Context, from Cursor, p Predicate, timeout time.
 				return ev, Cursor(i + 1), nil
 			}
 		}
+		// The abort latch is checked AFTER scanning, so an event that arrived
+		// in the same breath as the crash — the last publish before a panic,
+		// say — still satisfies a step that wanted it.
+		if l.aborted != nil {
+			err := l.aborted.withPending(p)
+			l.mu.Unlock()
+			return Event{}, from, err
+		}
 		scanFrom = Cursor(len(l.events))
 		changed := l.changed
 		l.mu.Unlock()
 
 		select {
 		case <-changed:
-			// something arrived; loop and rescan from where we stopped
+			// an append, or an abort; loop and re-examine both
 		case <-deadline.C:
 			return Event{}, from, l.timeoutError(p, from, timeout)
 		case <-ctx.Done():
 			return Event{}, from, ctx.Err()
 		}
 	}
+}
+
+// Abort latches a terminal condition and wakes every waiter.
+//
+// It exists because a dead daemon must not be reported as twenty consecutive
+// timeouts. Without it, a crash at step 3 of 20 makes each remaining step wait
+// out its full budget — minutes of pointless waiting — and the report blames
+// the first missing message instead of naming the crash. With it, the pending
+// Await returns at once and every later one fails immediately, so the scenario
+// stops within milliseconds of the process dying and says why.
+//
+// The caller should Append a describing event first (exit code, signal,
+// stderr tail) so the timeline carries the detail; Abort only handles control
+// flow. It is idempotent: a crash often produces several signals and the first
+// reason is the true one.
+func (l *Log) Abort(reason string, cause error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.aborted != nil {
+		return
+	}
+	l.aborted = &AbortedError{Reason: reason, Cause: cause, AtSeq: len(l.events)}
+
+	close(l.changed)
+	l.changed = make(chan struct{})
+}
+
+// Aborted returns the latched terminal condition, or nil.
+func (l *Log) Aborted() *AbortedError {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.aborted
+}
+
+// AbortedError is returned by Await once the system under test is gone. It is
+// deliberately distinct from TimeoutError: "nothing happened in time" and "the
+// thing we were testing died" call for different reactions from the reader,
+// and collapsing them together is what makes a crash look like a slow test.
+type AbortedError struct {
+	Reason  string
+	Cause   error
+	AtSeq   int       // events recorded before the abort, for the timeline
+	Pending Predicate // what was being awaited when it hit, when there was one
+}
+
+func (e *AbortedError) Error() string {
+	s := "aborted: " + e.Reason
+	if e.Cause != nil {
+		s += " (" + e.Cause.Error() + ")"
+	}
+	return s
+}
+
+func (e *AbortedError) Unwrap() error { return e.Cause }
+
+// withPending copies the latch, tagging it with the expectation that was in
+// flight. The latch itself stays shared and un-mutated, so concurrent waiters
+// do not overwrite each other's context.
+func (e *AbortedError) withPending(p Predicate) *AbortedError {
+	c := *e
+	c.Pending = p
+	return &c
 }
 
 // timeoutError builds the rich failure, scanning from the ORIGINAL cursor (not

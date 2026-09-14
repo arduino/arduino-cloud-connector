@@ -44,6 +44,12 @@ type Result struct {
 	Unconsumed []Event        `json:"unconsumed,omitempty"`
 	Events     []Event        `json:"events"`
 	ConsumedBy map[int]string `json:"consumed_by,omitempty"`
+
+	// Aborted is set when the system under test died mid-scenario. It outranks
+	// everything else in the report: the step that happened to be waiting when
+	// the daemon crashed is not the interesting fact.
+	Aborted   *AbortedError `json:"-"`
+	AbortText string        `json:"aborted,omitempty"`
 }
 
 // Result assembles the run outcome, including the final unconsumed-event
@@ -64,18 +70,26 @@ func (l *Log) Result(scenario string, steps []StepResult, tolerate []Predicate) 
 		}
 	}
 
-	return Result{
+	r := Result{
 		Scenario:   scenario,
 		Steps:      steps,
 		Unconsumed: unconsumed,
 		Events:     l.Events(),
 		ConsumedBy: consumed,
+		Aborted:    l.Aborted(),
 	}
+	if r.Aborted != nil {
+		r.AbortText = r.Aborted.Error()
+	}
+	return r
 }
 
 // Failed reports whether the scenario should be considered failed: any step
 // that did not pass, or any significant event nobody claimed.
 func (r Result) Failed() bool {
+	if r.Aborted != nil {
+		return true
+	}
 	if len(r.Unconsumed) > 0 {
 		return true
 	}
@@ -99,10 +113,13 @@ func (r Result) Format() string {
 	var b strings.Builder
 
 	failed := r.firstFailed()
-	if failed == nil {
+	switch {
+	case r.Aborted != nil:
+		fmt.Fprintf(&b, "scenario %s — ABORTED: %s\n", r.Scenario, r.Aborted.Reason)
+	case failed == nil:
 		fmt.Fprintf(&b, "scenario %s — PASS (%d steps, %d events)\n",
 			r.Scenario, len(r.Steps), len(r.Events))
-	} else {
+	default:
 		fmt.Fprintf(&b, "scenario %s — FAIL at step %d/%d (%s)\n",
 			r.Scenario, failed.Index, len(r.Steps), failed.Name)
 	}
@@ -110,7 +127,10 @@ func (r Result) Format() string {
 	b.WriteString("\n")
 	r.writeSteps(&b)
 
-	if failed != nil {
+	switch {
+	case r.Aborted != nil:
+		r.writeAbort(&b, failed)
+	case failed != nil:
 		r.writeExpectation(&b, *failed)
 	}
 	if len(r.Unconsumed) > 0 {
@@ -190,6 +210,30 @@ func (r Result) writeExpectation(b *strings.Builder, s StepResult) {
 	b.WriteString("\n")
 }
 
+// writeAbort explains a death, and is careful about one thing: the step that
+// happened to be waiting when the process died did not cause it. Saying so
+// explicitly stops the reader from going to investigate the wrong message.
+func (r Result) writeAbort(b *strings.Builder, failed *StepResult) {
+	fmt.Fprintf(b, "the system under test died — %s\n", r.Aborted.Reason)
+	if r.Aborted.Cause != nil {
+		fmt.Fprintf(b, "  cause: %v\n", r.Aborted.Cause)
+	}
+	fmt.Fprintf(b, "  after %d recorded events\n", r.Aborted.AtSeq)
+
+	// The in-flight expectation is on the error the STEP received, not on the
+	// shared latch: Await tags a copy so concurrent waiters do not overwrite
+	// each other's context. Read it from there.
+	if failed != nil {
+		var ae *AbortedError
+		if errors.As(failed.Err, &ae) && len(ae.Pending.Constraints) > 0 {
+			fmt.Fprintf(b, "  step %d (%s) was waiting for: %s\n",
+				failed.Index, failed.Name, ae.Pending)
+			b.WriteString("  that expectation did not cause the exit — it is just where the scenario stopped\n")
+		}
+	}
+	b.WriteString("\n")
+}
+
 func (r Result) writeUnconsumed(b *strings.Builder) {
 	fmt.Fprintf(b, "unexpected events — significant, claimed by no step, not in tolerate (%d)\n",
 		len(r.Unconsumed))
@@ -232,6 +276,9 @@ func (r Result) writeTimeline(b *strings.Builder, failed *StepResult) {
 
 		if ev.Seq == waitAfter {
 			r.writeWaitMarker(b, failed, te)
+		}
+		if r.Aborted != nil && ev.Seq == r.Aborted.AtSeq {
+			fmt.Fprintf(b, "      ┄┄ ABORTED here: %s ┄┄\n", r.Aborted.Reason)
 		}
 	}
 }
