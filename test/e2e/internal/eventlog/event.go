@@ -38,6 +38,7 @@ const (
 	SourceSSE             Source = "sse"
 	SourceDaemonStatus    Source = "daemon_status"
 	SourceDaemonLog       Source = "daemon_log"
+	SourceDaemonProcess   Source = "daemon_process"
 )
 
 // Kind is what kind of observation it is, within a Source.
@@ -59,6 +60,12 @@ const (
 	KindStatusPoll  Kind = "status_poll"
 	KindDaemonLine  Kind = "daemon_line"
 	KindHarnessNote Kind = "harness_note" // the harness narrating its own actions
+
+	// KindProcessExit is the daemon under test terminating. It is significant:
+	// an exit a scenario did not ask for is a crash, and a scenario that DOES
+	// ask for one (a graceful-shutdown scenario) consumes it like any other
+	// expectation.
+	KindProcessExit Kind = "process_exit"
 )
 
 // Event is one observation. Attrs carries the decoded, queryable view (topic,
@@ -92,6 +99,8 @@ func (e Event) Significant() bool {
 	switch e.Source {
 	case SourceProvisioningAPI, SourceSSE:
 		return true
+	case SourceDaemonProcess:
+		return e.Kind == KindProcessExit
 	case SourceMQTT:
 		switch e.Kind {
 		case KindMQTTConnect, KindMQTTDisconnect,
