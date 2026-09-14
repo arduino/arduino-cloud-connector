@@ -79,11 +79,6 @@ const (
 	// window, not a rate limit — if an app publishes faster, values still go out
 	// as fast as they become ready.
 	outboundReorderWindow = 33 * time.Millisecond
-	// ntpProbeHost is Arduino's NTP server, used as a neutral connectivity
-	// probe. Deliberately decoupled from the MQTT broker so the check works
-	// even when the broker is intentionally unreachable (mock builds) or
-	// behind region failover.
-	ntpProbeHost = "time.arduino.cc:123"
 )
 
 // ErrBusy is returned by Reprovision when the daemon FSM is not currently ready
@@ -456,7 +451,7 @@ func (d *Daemon) runCheckInternet(ctx context.Context) daemonStateFn {
 			return nil
 		case <-time.After(delay):
 		}
-		if isInternetReachable(ctx) {
+		if isInternetReachable(ctx, d.cfg.NTPProbeHost) {
 			slog.Info("daemon: internet reachable, choosing next state",
 				"provisioning_status", d.provSvc.State())
 			return d.pickPostInternetState()
@@ -625,15 +620,20 @@ func (d *Daemon) detachCloud() {
 
 // ── internet check ───────────────────────────────────────────────────────────
 
-// isInternetReachable does a best-effort NTP round-trip against Arduino's time
-// server (time.arduino.cc) as the connectivity probe. It is deliberately
-// decoupled from the MQTT broker: the broker may be intentionally unreachable
-// (mock builds) or behind region failover, while time.arduino.cc is a stable,
-// always-on endpoint that proves DNS resolution plus outbound connectivity.
-// NTP over UDP/123 needs no special privileges (unlike a raw-socket ICMP ping).
-func isInternetReachable(ctx context.Context) bool {
+// isInternetReachable does a best-effort NTP round-trip against host (by
+// default Arduino's time server, time.arduino.cc:123) as the connectivity
+// probe. It is deliberately decoupled from the MQTT broker: the broker may be
+// intentionally unreachable (mock builds) or behind region failover, while the
+// time server is a stable, always-on endpoint that proves DNS resolution plus
+// outbound connectivity. NTP over UDP/123 needs no special privileges (unlike
+// a raw-socket ICMP ping).
+//
+// Only the round-trip is the signal: the reply is not parsed or validated, so
+// any host that answers an NTP request satisfies the check. See
+// config.Config.NTPProbeHost for why the host is configurable.
+func isInternetReachable(ctx context.Context, host string) bool {
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "udp", ntpProbeHost)
+	conn, err := dialer.DialContext(ctx, "udp", host)
 	if err != nil {
 		return false
 	}
