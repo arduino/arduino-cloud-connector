@@ -1,0 +1,35 @@
+version: "2"
+
+# The harness must exercise the daemon through its EXTERNAL boundaries only:
+# it spawns the built binary and talks to it over HTTP, SSE, MQTT and UDP. Wire
+# formats it needs (the device-certificate DER, the CBOR commands, SenML) are
+# reimplemented here on purpose.
+#
+# The reason is not style. If the harness encodes with the daemon's own
+# encoder, the test proves only that the code agrees with itself: an error
+# present on both sides cancels out and the suite stays green while the real
+# peer rejects the bytes. These are contracts with external parties -- the
+# Arduino CA and the C++ firmware library -- not internal details.
+#
+# This rule is default-DENY so a production package added later is caught
+# without anyone remembering to extend a list. Deny the two production roots
+# rather than the module prefix: the module prefix would also match the
+# harness's own .../test/e2e/internal/... packages.
+linters:
+  default: standard
+  enable:
+    - depguard
+  settings:
+    depguard:
+      rules:
+        no-production-code:
+          # The cross-check is the one legitimate exception: it compares our
+          # independent encoder against the daemon's reconstruction, so by
+          # definition it has to see both.
+          files:
+            - "!**/crosscheck_test.go"
+          deny:
+            - pkg: github.com/arduino/arduino-cloud-connector/internal
+              desc: reimplement the format, do not import it -- importing the daemon's own codec makes the test agree with itself
+            - pkg: github.com/arduino/arduino-cloud-connector/cmd
+              desc: the harness spawns the built binary, it does not link it
