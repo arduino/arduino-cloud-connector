@@ -19,6 +19,7 @@ const (
 	defaultDataDir         = "/var/lib/arduino-cloud-connector"
 	defaultMQTTCAFile      = "" // empty means use system roots
 	defaultLogLevel        = "info"
+	defaultNTPProbeHost    = "time.arduino.cc:123"
 )
 
 // Config holds all runtime configuration for the daemon, populated from
@@ -59,6 +60,20 @@ type Config struct {
 	// Env: ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL. Default: info.
 	LogLevel string
 
+	// NTPProbeHost is the host:port the daemon does an NTP round-trip against
+	// to decide whether the internet is reachable (the CheckInternet state).
+	// It is deliberately decoupled from the MQTT broker — see
+	// internal/daemon.isInternetReachable for why.
+	//
+	// Configurable because the probe host is not always reachable and is not
+	// always the right one: an on-premise or air-gapped install has its own
+	// time source, and the E2E test harness points it at a local UDP responder
+	// (the alternative there is an /etc/hosts override plus root to bind
+	// UDP/123, which is worse). Changing it does not change the semantics of
+	// the check: any host that answers an NTP request will do.
+	// Env: ARDUINO_CLOUD_CONNECTOR__NTP_PROBE_HOST. Default: time.arduino.cc:123.
+	NTPProbeHost string
+
 	// Version is set from the binary build version (via -ldflags).
 	// Not read from environment — injected by main after NewFromEnv.
 	Version string
@@ -74,6 +89,7 @@ func NewFromEnv() (Config, error) {
 		MQTTCAFile:      envOr("ARDUINO_CLOUD_CONNECTOR__MQTT_CA_FILE", defaultMQTTCAFile),
 		LogLevel:        envOr("ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL", defaultLogLevel),
 		Socket:          envOr("ARDUINO_CLOUD_CONNECTOR__SOCKET", defaultSocket),
+		NTPProbeHost:    envOr("ARDUINO_CLOUD_CONNECTOR__NTP_PROBE_HOST", defaultNTPProbeHost),
 		Port:            defaultPort,
 	}
 
