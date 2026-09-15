@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -106,6 +107,7 @@ func Default() Registry {
 
 		// ── actions ───────────────────────────────────────────────────────
 		"app_get_identity":       appGetIdentity,
+		"app_get_status":         appGetStatus,
 		"app_start_provisioning": appStartProvisioning,
 		"app_post":               appPost,
 		"app_put":                appPut,
@@ -228,6 +230,100 @@ func appGetIdentity(ctx context.Context, sc *Context, node *yaml.Node) (eventlog
 	}
 	sc.World.Vars.Set("uhwid", id.UHWID)
 	sc.Detail = "identity uhwid=" + id.UHWID
+	return sc.Cursor, nil
+}
+
+// statusFields are the identifiers app_get_status learns from the daemon, in
+// the order the report names them.
+//
+// Identifiers only. The three state words the status also carries (daemon,
+// provisioning, cloud) belong to the timeline and are waited on with
+// await_daemon_state and friends; putting them in the bag too would give the
+// scenario two ways to ask the same question.
+var statusFields = []string{"device_id", "thing_id", "organization_id"}
+
+type appGetStatusParams struct {
+	// Require names the fields that must be present, and is what makes this
+	// step fail where the cause is visible. Without it a missing device id
+	// surfaces fifteen seconds later as an expectation waiting on a topic
+	// built from the harness's seed, and the report blames the expectation.
+	Require []string `yaml:"require"`
+}
+
+// appGetStatus reads the daemon's status and relearns the identifiers from it.
+//
+// The background poller already puts every transition on the timeline, so this
+// step is not about waiting -- await_daemon_state does that. It is about the
+// bag: Setup seeds device_id from the fake Provisioning API's own idea of the
+// id it will hand out, and thing_id from the config. That holds for exactly as
+// long as a scenario provisions once. Provision a second time and the daemon
+// carries a NEW device id while the seed still names the old one, so every
+// topic interpolated from {device_id} afterwards would be built from the
+// harness's view instead of the daemon's. GET /v1/status is the only place the
+// daemon states which id it is actually using.
+//
+// An empty field is never learned. Before provisioning the status carries no
+// device id, and writing that over the seed would make cloud_publish address
+// "/a/d//c/dw" -- a topic that never matches, reported as a failed expectation
+// rather than as the step that blanked the value. Use require to assert
+// presence; the same convention is what appclient.recordStatus applies to the
+// attributes it records.
+func appGetStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p appGetStatusParams
+	if err := decodeInto(node, &p); err != nil {
+		return sc.Cursor, err
+	}
+	// A misspelled field in require would otherwise require nothing, which is
+	// the failure mode strict parameter decoding exists to prevent.
+	for _, field := range p.Require {
+		if !slices.Contains(statusFields, field) {
+			return sc.Cursor, fmt.Errorf("app_get_status: cannot require %q; the status carries %s",
+				field, strings.Join(statusFields, ", "))
+		}
+	}
+
+	status, err := sc.World.App.Status(ctx)
+	if err != nil {
+		return sc.Cursor, fmt.Errorf("app_get_status: %w", err)
+	}
+	reported := map[string]string{
+		"device_id":       status.DeviceID,
+		"organization_id": status.OrganizationID,
+	}
+	if status.Cloud != nil {
+		reported["thing_id"] = status.Cloud.ThingID
+	}
+
+	for _, field := range p.Require {
+		if reported[field] == "" {
+			return sc.Cursor, fmt.Errorf("app_get_status: the daemon reports no %s "+
+				"(daemon=%s provisioning=%s)", field, status.Daemon, status.Provisioning)
+		}
+	}
+
+	detail := fmt.Sprintf("status daemon=%s provisioning=%s", status.Daemon, status.Provisioning)
+	if status.Cloud != nil {
+		detail += " cloud=" + status.Cloud.State
+	}
+	for _, field := range statusFields {
+		value := reported[field]
+		if value == "" {
+			continue
+		}
+		previous, had := sc.World.Vars.Get(field)
+		sc.World.Vars.Set(field, value)
+		// Only a value that is new or different is named: in a scenario that
+		// provisions once every identifier already matches its seed, and
+		// repeating all three would bury the one line that matters when one of
+		// them does change.
+		switch {
+		case !had:
+			detail += fmt.Sprintf(", %s=%s", field, value)
+		case previous != value:
+			detail += fmt.Sprintf(", %s=%s (was %s)", field, value, previous)
+		}
+	}
+	sc.Detail = detail
 	return sc.Cursor, nil
 }
 

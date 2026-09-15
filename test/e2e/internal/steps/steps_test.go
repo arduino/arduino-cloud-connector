@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,7 +25,16 @@ import (
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/wire"
 )
 
-// stubDaemon serves the three endpoints the action primitives touch. It is
+// The identifiers the stub daemon reports. They differ from what newWorld
+// seeds on purpose: that is what makes it visible whether a value in the bag
+// came from the daemon or from the harness.
+const (
+	stubDeviceID = "7c0ffee0-1234-4000-8000-0123456789ab"
+	stubThingID  = "5eaf00d0-1234-4000-8000-0123456789ab"
+	stubOrgID    = "a11ce000-1234-4000-8000-0123456789ab"
+)
+
+// stubDaemon serves the endpoints the action primitives touch. It is
 // deliberately tiny: the real daemon is driven by the scenario suite itself,
 // and what needs testing here is that a step sends the right thing.
 func stubDaemon(t *testing.T) (string, *[]string) {
@@ -35,6 +45,12 @@ func stubDaemon(t *testing.T) (string, *[]string) {
 	mux.HandleFunc("GET /v1/identity", func(w http.ResponseWriter, _ *http.Request) {
 		calls = append(calls, "identity")
 		_, _ = w.Write([]byte(`{"uhwid":"3a7bd3e2360a3d29","board_token":"secret-board-token"}`))
+	})
+	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, _ *http.Request) {
+		calls = append(calls, "status")
+		_, _ = fmt.Fprintf(w, `{"provisioning":"Provisioned","daemon":"Connected",`+
+			`"device_id":%q,"organization_id":%q,"cloud":{"state":"Steady","thing_id":%q}}`,
+			stubDeviceID, stubOrgID, stubThingID)
 	})
 	mux.HandleFunc("POST /v1/provisioning/start", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -378,11 +394,178 @@ func TestAppStartProvisioning(t *testing.T) {
 	}
 }
 
+// app_get_status exists for the bag, not for the timeline: the identifiers it
+// learns must come from the daemon and must beat what Setup seeded from the
+// fake Provisioning API. The stub therefore answers with ids that differ from
+// the seeds, which is the only way to tell the two apart.
+func TestAppGetStatusLearnsTheIdentifiersFromTheDaemon(t *testing.T) {
+	w, calls := newWorld(t)
+
+	seededDevice := w.Vars.MustGet("device_id")
+	seededThing := w.Vars.MustGet("thing_id")
+	if seededDevice == stubDeviceID || seededThing == stubThingID {
+		t.Fatal("a seed already equals the stub's answer, so this test would prove nothing")
+	}
+	if _, ok := w.Vars.Get("organization_id"); ok {
+		t.Fatal("the bag already holds an organization_id")
+	}
+
+	sc, next, err := run(t, w, "app_get_status", "{require: [device_id, thing_id]}", 0)
+	if err != nil {
+		t.Fatalf("app_get_status: %v", err)
+	}
+	if next != 0 {
+		t.Errorf("cursor moved to %d: an action must leave it where it was", next)
+	}
+	for _, tc := range []struct{ key, want string }{
+		{"device_id", stubDeviceID},
+		{"thing_id", stubThingID},
+		{"organization_id", stubOrgID},
+	} {
+		if got := w.Vars.MustGet(tc.key); got != tc.want {
+			t.Errorf("bag[%s] = %q, want the daemon's %q", tc.key, got, tc.want)
+		}
+	}
+	// The report has to name a changed identifier and say what it replaced --
+	// that line is the whole point of the step in a re-provisioning run.
+	if !strings.Contains(sc.Detail, stubDeviceID) || !strings.Contains(sc.Detail, "was "+seededDevice) {
+		t.Errorf("detail = %q, want the new device id and the seed it replaced", sc.Detail)
+	}
+	if !strings.Contains(sc.Detail, "daemon=Connected") {
+		t.Errorf("detail = %q, want the daemon state", sc.Detail)
+	}
+	if got := *calls; len(got) != 1 || got[0] != "status" {
+		t.Errorf("the daemon saw %v, want one status call", got)
+	}
+
+	// And the read lands on the timeline, so a failure report shows the status
+	// the step acted on rather than only its own summary.
+	awaitEventForTest(t, w, 0, eventlog.Predicate{
+		Label: "status poll",
+		Constraints: []eventlog.Constraint{
+			eventlog.Eq("source", string(eventlog.SourceDaemonStatus)),
+			eventlog.Eq("kind", string(eventlog.KindStatusPoll)),
+			eventlog.Eq("attrs.device_id", stubDeviceID),
+		},
+	})
+}
+
+// The re-provisioning sequence, which is the case the step was added for: no
+// device id yet, then one, then a different one.
+func TestAppGetStatusRelearnsTheDeviceID(t *testing.T) {
+	w, _ := newWorld(t)
+	seeded := w.Vars.MustGet("device_id")
+
+	const (
+		unprovisioned = `{"provisioning":"NotProvisioned","daemon":"Idle"}`
+		firstDevice   = `{"provisioning":"Provisioned","daemon":"Connected","device_id":"1111aaaa-0000-4000-8000-000000000001"}`
+		secondDevice  = `{"provisioning":"Provisioned","daemon":"Connected","device_id":"2222bbbb-0000-4000-8000-000000000002"}`
+	)
+	var err error
+	if w.App, err = appclient.New(w.Log, sequencedStatusDaemon(t,
+		unprovisioned, unprovisioned, firstDevice, secondDevice)); err != nil {
+		t.Fatalf("appclient: %v", err)
+	}
+
+	// Before provisioning the status carries no device id, and an empty value
+	// must not be learned: writing "" over the seed would make cloud_publish
+	// address "/a/d//c/dw" -- a topic that never matches, reported as a failed
+	// expectation instead of as the step that blanked the value.
+	if _, _, err := run(t, w, "app_get_status", "{}", 0); err != nil {
+		t.Fatalf("app_get_status on an unprovisioned daemon: %v", err)
+	}
+	if got := w.Vars.MustGet("device_id"); got != seeded {
+		t.Fatalf("bag[device_id] = %q after an unprovisioned status, want the seed %q", got, seeded)
+	}
+
+	// require is what turns that silence into a failure at the step, for a
+	// scenario that has reached the point where the id must exist.
+	if _, _, err := run(t, w, "app_get_status", "{require: [device_id]}", 0); err == nil {
+		t.Error("app_get_status passed with no device id, want an error")
+	}
+
+	if _, _, err := run(t, w, "app_get_status", "{require: [device_id]}", 0); err != nil {
+		t.Fatalf("app_get_status after provisioning: %v", err)
+	}
+	if got := w.Vars.MustGet("device_id"); got != "1111aaaa-0000-4000-8000-000000000001" {
+		t.Fatalf("bag[device_id] = %q, want the first provisioned id", got)
+	}
+
+	sc, _, err := run(t, w, "app_get_status", "{}", 0)
+	if err != nil {
+		t.Fatalf("app_get_status after re-provisioning: %v", err)
+	}
+	if got := w.Vars.MustGet("device_id"); got != "2222bbbb-0000-4000-8000-000000000002" {
+		t.Errorf("bag[device_id] = %q, want the re-provisioned id", got)
+	}
+	if !strings.Contains(sc.Detail, "was 1111aaaa-0000-4000-8000-000000000001") {
+		t.Errorf("detail = %q, want it to name the id that was replaced", sc.Detail)
+	}
+	// A topic built afterwards must follow the daemon, not the harness.
+	topic, err := w.Vars.Interpolate("/a/d/{device_id}/c/dw")
+	if err != nil {
+		t.Fatalf("interpolate: %v", err)
+	}
+	if topic != "/a/d/2222bbbb-0000-4000-8000-000000000002/c/dw" {
+		t.Errorf("interpolated %q", topic)
+	}
+}
+
+// A require naming a field the status does not carry is the scenario's
+// mistake, and the message has to say so: "the daemon reports no uhwid" would
+// send a reader looking at the daemon for a typo in the YAML.
+func TestAppGetStatusRejectsAnUnknownRequireField(t *testing.T) {
+	w, calls := newWorld(t)
+
+	_, _, err := run(t, w, "app_get_status", "{require: [uhwid]}", 0)
+	if err == nil {
+		t.Fatal("the step passed, want an error")
+	}
+	if !strings.Contains(err.Error(), "cannot require") ||
+		!strings.Contains(err.Error(), "device_id") {
+		t.Errorf("error = %v, want it to name the fields the status carries", err)
+	}
+	// And it is caught before the call: finding a scenario typo must not
+	// depend on a reachable daemon.
+	if got := *calls; len(got) != 0 {
+		t.Errorf("the daemon saw %v, want no call at all", got)
+	}
+}
+
+// sequencedStatusDaemon serves one status body per call, repeating the last.
+// A scenario's status changes over time and the assertions here are about
+// exactly that, so the stub has to be able to change its answer.
+func sequencedStatusDaemon(t *testing.T, bodies ...string) string {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		call int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		body := bodies[min(call, len(bodies)-1)]
+		call++
+		mu.Unlock()
+		_, _ = w.Write([]byte(body))
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return "http://" + ln.Addr().String()
+}
+
 func TestActionsValidateTheirParameters(t *testing.T) {
 	w, _ := newWorld(t)
 	tests := []struct{ step, y string }{
 		{"app_post", "{}"},
 		{"app_get_identity", "{uhwid: x}"},
+		{"app_get_status", "{device_id: x}"},
 		{"app_start_provisioning", "{organization: x}"},
 		{"app_put", "{value: 1}"},
 		{"app_sse_subscribe", "{}"},
@@ -470,7 +653,7 @@ func TestDefaultRegistryCoversTheScenarioVocabulary(t *testing.T) {
 		"expect_api_call", "expect_mqtt_connect", "expect_disconnect",
 		"expect_subscribe", "expect_unsubscribe", "expect_publish",
 		"expect_prop_publish", "expect_sse", "expect_tls_error", "expect_daemon_exit",
-		"app_get_identity", "app_start_provisioning",
+		"app_get_identity", "app_get_status", "app_start_provisioning",
 		"app_post", "app_put", "app_sse_subscribe",
 		"cloud_publish", "cloud_publish_prop", "stop_daemon",
 	} {
