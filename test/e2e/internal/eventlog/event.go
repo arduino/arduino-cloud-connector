@@ -56,6 +56,18 @@ const (
 	KindMQTTKeepalive   Kind = "mqtt_keepalive" // PINGREQ/PINGRESP
 	KindMQTTAck         Kind = "mqtt_ack"       // PUBACK/SUBACK
 
+	// KindMQTTTLSError is a client the broker refused during the TLS
+	// handshake, before any MQTT packet existed.
+	//
+	// It is its own kind rather than a failed mqtt_connect for two reasons. A
+	// step waiting for a connection must not match a handshake that never
+	// became one -- that would turn the most interesting failure into a
+	// confusing pass. And it has to be SIGNIFICANT, because a certificate the
+	// broker rejects is exactly what a reconstruction bug looks like from the
+	// outside: without it the scenario would just time out and blame the first
+	// message it was waiting for.
+	KindMQTTTLSError Kind = "mqtt_tls_error"
+
 	KindSSEFrame    Kind = "sse_frame"
 	KindStatusPoll  Kind = "status_poll"
 	KindDaemonLine  Kind = "daemon_line"
@@ -104,7 +116,8 @@ func (e Event) Significant() bool {
 	case SourceMQTT:
 		switch e.Kind {
 		case KindMQTTConnect, KindMQTTDisconnect,
-			KindMQTTSubscribe, KindMQTTUnsubscribe, KindMQTTPublish:
+			KindMQTTSubscribe, KindMQTTUnsubscribe, KindMQTTPublish,
+			KindMQTTTLSError:
 			return true
 		default:
 			return false

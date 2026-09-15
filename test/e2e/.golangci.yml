@@ -23,9 +23,11 @@ linters:
     depguard:
       rules:
         no-production-code:
-          # The cross-check is the one legitimate exception: it compares our
-          # independent encoder against the daemon's reconstruction, so by
-          # definition it has to see both.
+          # The cross-checks are the one legitimate exception: they compare an
+          # independent implementation against the daemon's, so by definition
+          # they have to see both. There is one per reimplemented format --
+          # internal/pki (the device certificate DER) and internal/wire (the
+          # CBOR commands and SenML) -- and the pattern admits no other file.
           files:
             - "!**/crosscheck_test.go"
           deny:
