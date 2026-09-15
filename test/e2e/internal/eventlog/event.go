@@ -36,9 +36,18 @@ const (
 	SourceNTP             Source = "ntp"
 	SourceMQTT            Source = "mqtt"
 	SourceSSE             Source = "sse"
-	SourceDaemonStatus    Source = "daemon_status"
-	SourceDaemonLog       Source = "daemon_log"
-	SourceDaemonProcess   Source = "daemon_process"
+	// SourceApp is the harness acting as an app against the daemon's REST API:
+	// starting provisioning, putting a variable value. It is the write side of
+	// the app role, where SourceSSE is the read side.
+	//
+	// These are harness ACTIONS, not observations, so they are never
+	// significant -- the scenario caused them and knows it. They are on the
+	// timeline because the causality is what a reader needs: whether the app
+	// called before the device published is usually the question.
+	SourceApp           Source = "app"
+	SourceDaemonStatus  Source = "daemon_status"
+	SourceDaemonLog     Source = "daemon_log"
+	SourceDaemonProcess Source = "daemon_process"
 )
 
 // Kind is what kind of observation it is, within a Source.

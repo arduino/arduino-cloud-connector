@@ -1,0 +1,503 @@
+// This file is part of arduino-cloud-connector.
+//
+// SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package steps
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/appclient"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/harness"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/wire"
+)
+
+// stubDaemon serves the three endpoints the action primitives touch. It is
+// deliberately tiny: the real daemon is driven by the scenario suite itself,
+// and what needs testing here is that a step sends the right thing.
+func stubDaemon(t *testing.T) (string, *[]string) {
+	t.Helper()
+	var calls []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/identity", func(w http.ResponseWriter, _ *http.Request) {
+		calls = append(calls, "identity")
+		_, _ = w.Write([]byte(`{"uhwid":"3a7bd3e2360a3d29","board_token":"secret-board-token"}`))
+	})
+	mux.HandleFunc("POST /v1/provisioning/start", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls = append(calls, "start:"+string(body))
+		w.WriteHeader(http.StatusAccepted)
+	})
+	mux.HandleFunc("PUT /v1/variables/{name}", func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, "put:"+r.PathValue("name"))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /v1/variables/{name}/events", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		calls = append(calls, "sse:"+name)
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: {\"name\":%q}\n\n", appclient.EventThingUnavailable, name)
+		flusher.Flush()
+		<-r.Context().Done()
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return "http://" + ln.Addr().String(), &calls
+}
+
+// newWorld brings up the real servers and points the app client at the stub,
+// so every primitive runs against the components it will use for real -- only
+// the daemon is missing.
+func newWorld(t *testing.T) (*harness.World, *[]string) {
+	t.Helper()
+	w, err := harness.SetupServers(harness.Config{
+		DeviceID: "9f1c2d3e-4567-89ab-cdef-0123456789ab",
+		ThingID:  "b2c3d4e5-6789-4abc-8def-0123456789ab",
+	})
+	if err != nil {
+		t.Fatalf("SetupServers: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Teardown(context.Background()) })
+
+	baseURL, calls := stubDaemon(t)
+	if w.App, err = appclient.New(w.Log, baseURL); err != nil {
+		t.Fatalf("appclient: %v", err)
+	}
+	return w, calls
+}
+
+// params parses a step's parameters the way the scenario loader hands them over.
+func params(t *testing.T, y string) *yaml.Node {
+	t.Helper()
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(y), &node); err != nil {
+		t.Fatalf("bad test parameters %q: %v", y, err)
+	}
+	if len(node.Content) == 0 {
+		return &yaml.Node{}
+	}
+	return node.Content[0]
+}
+
+func run(t *testing.T, w *harness.World, name string, y string, cursor eventlog.Cursor) (*Context, eventlog.Cursor, error) {
+	t.Helper()
+	fn, ok := Default()[name]
+	if !ok {
+		t.Fatalf("no such step %q", name)
+	}
+	sc := &Context{World: w, Cursor: cursor, Name: name, Index: 1}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	next, err := fn(ctx, sc, params(t, y))
+	return sc, next, err
+}
+
+// The expectation primitive: every parameter becomes a constraint on the
+// attribute of the same name, which is what lets a scenario say
+// `{cmd: Device.begin, lib_version: 0.0.0-e2e}` with no code per field.
+func TestExpectationMatchesOnAttributes(t *testing.T) {
+	w, _ := newWorld(t)
+	w.Log.Append(eventlog.SourceMQTT, eventlog.KindMQTTPublish, map[string]any{
+		"cmd":         wire.CmdDeviceBegin,
+		"lib_version": "0.0.0-e2e",
+	}, nil)
+
+	sc, cursor, err := run(t, w, "expect_publish",
+		"{cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 2s}", 0)
+	if err != nil {
+		t.Fatalf("expect_publish: %v", err)
+	}
+	if cursor != 1 {
+		t.Errorf("cursor = %d, want 1 (just past the matched event)", cursor)
+	}
+	// The consuming step is recorded, which is what annotates the timeline and
+	// what the strict sweep subtracts.
+	if step, ok := w.Log.ConsumedBy(1); !ok || step != "expect_publish" {
+		t.Errorf("event 1 consumed by %q (%t), want expect_publish", step, ok)
+	}
+	if !strings.Contains(sc.Detail, "Device.begin") {
+		t.Errorf("detail = %q, want it to name the command", sc.Detail)
+	}
+	if len(sc.Predicate.Constraints) != 4 {
+		t.Errorf("predicate has %d constraints, want source, kind and the two parameters",
+			len(sc.Predicate.Constraints))
+	}
+}
+
+// An expectation that is not met returns a timeout carrying the near misses,
+// which is what turns "timeout after 15s" into a field-level diff.
+func TestExpectationTimesOutWithNearMisses(t *testing.T) {
+	w, _ := newWorld(t)
+	w.Log.Append(eventlog.SourceMQTT, eventlog.KindMQTTPublish, map[string]any{
+		"cmd":         wire.CmdDeviceBegin,
+		"lib_version": "0.0.0-dev",
+	}, nil)
+
+	_, cursor, err := run(t, w, "expect_publish",
+		"{cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 100ms}", 0)
+	if err == nil {
+		t.Fatal("the expectation passed against a different lib_version")
+	}
+	var timeout *eventlog.TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("error is %T (%v), want a *TimeoutError", err, err)
+	}
+	if len(timeout.NearMiss) == 0 {
+		t.Error("no near miss recorded, so the report cannot say which field differed")
+	}
+	if cursor != 0 {
+		t.Errorf("cursor = %d, want it left where it was on failure", cursor)
+	}
+}
+
+// The state waits read best with `state:` in YAML, which is not the attribute
+// the poller records. The rename is what keeps both sides natural.
+func TestStateWaitsRenameTheParameter(t *testing.T) {
+	w, _ := newWorld(t)
+	w.Log.Append(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll, map[string]any{
+		"daemon":       "Provisioning",
+		"provisioning": "unprovisioned",
+		"cloud_state":  "Steady",
+	}, nil)
+
+	for _, tc := range []struct{ step, y string }{
+		{"await_daemon_state", "{state: Provisioning, timeout: 2s}"},
+		{"await_cloud_state", "{state: Steady, timeout: 2s}"},
+		{"await_provisioning_state", "{state: unprovisioned, timeout: 2s}"},
+	} {
+		if _, _, err := run(t, w, tc.step, tc.y, 0); err != nil {
+			t.Errorf("%s: %v", tc.step, err)
+		}
+	}
+}
+
+// The cursor is what gives ordering for free: a second expectation for the
+// same thing must match the second event, not re-match the first.
+func TestTheCursorPreventsRematching(t *testing.T) {
+	w, _ := newWorld(t)
+	for i := range 2 {
+		w.Log.Append(eventlog.SourceMQTT, eventlog.KindMQTTSubscribe, map[string]any{
+			"topic": fmt.Sprintf("/a/d/x/c/dw-%d", i),
+		}, nil)
+	}
+
+	_, first, err := run(t, w, "expect_subscribe", "{timeout: 2s}", 0)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	_, second, err := run(t, w, "expect_subscribe", "{timeout: 2s}", first)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if second != first+1 {
+		t.Errorf("second cursor = %d, want %d", second, first+1)
+	}
+}
+
+// cloud_publish is the cloud half of the handshake, and the injection lands on
+// the timeline as a harness note -- never as a device publish, or an
+// expectation could match the harness's own downlink.
+func TestCloudPublish(t *testing.T) {
+	w, _ := newWorld(t)
+
+	tests := []struct {
+		step string
+		y    string
+		cmd  string
+	}{
+		{"cloud_publish", "{cmd: Thing.update, thing_id: b2c3d4e5-6789-4abc-8def-0123456789ab}", wire.CmdThingUpdate},
+		{"cloud_publish", "{cmd: Thing.detach, thing_id: b2c3d4e5-6789-4abc-8def-0123456789ab}", wire.CmdThingDetach},
+		{"cloud_publish", "{cmd: LastValues.update, values: [{name: temp, value: 21.5}]}", wire.CmdLastValuesUpdate},
+	}
+	cursor := eventlog.Cursor(0)
+	for _, tc := range tests {
+		if _, _, err := run(t, w, tc.step, tc.y, cursor); err != nil {
+			t.Fatalf("%s %s: %v", tc.step, tc.cmd, err)
+		}
+		ev, next := awaitNote(t, w, cursor, tc.cmd)
+		if ev.Significant() {
+			t.Errorf("%s was recorded as significant", tc.cmd)
+		}
+		cursor = next
+	}
+
+	// A command the cloud does not send must be refused by name, not encoded
+	// into something the daemon will silently ignore.
+	if _, _, err := run(t, w, "cloud_publish", "{cmd: Device.begin}", 0); err == nil {
+		t.Error("cloud_publish accepted an uplink command")
+	}
+}
+
+func TestCloudPublishProp(t *testing.T) {
+	w, _ := newWorld(t)
+
+	if _, _, err := run(t, w, "cloud_publish_prop", "{variable: temp, value: 30.0}", 0); err != nil {
+		t.Fatalf("cloud_publish_prop: %v", err)
+	}
+	ev, _ := awaitEventForTest(t, w, 0, eventlog.Predicate{
+		Label: "property downlink",
+		Constraints: []eventlog.Constraint{
+			eventlog.Eq("kind", string(eventlog.KindHarnessNote)),
+			eventlog.Eq("attrs.value.temp", 30.0),
+		},
+	})
+	if got := ev.Attrs["topic"]; got != "/a/t/b2c3d4e5-6789-4abc-8def-0123456789ab/e/i" {
+		t.Errorf("topic = %v, want the thing inbound topic", got)
+	}
+
+	if _, _, err := run(t, w, "cloud_publish_prop", "{}", 0); err == nil {
+		t.Error("cloud_publish_prop with no values succeeded")
+	}
+}
+
+// The app-role actions: what they send is what the scenario said.
+func TestAppActions(t *testing.T) {
+	w, calls := newWorld(t)
+
+	if _, _, err := run(t, w, "app_post", "{path: /v1/provisioning/start}", 0); err != nil {
+		t.Fatalf("app_post: %v", err)
+	}
+	if _, _, err := run(t, w, "app_put", "{variable: temp, value: 42.0}", 0); err != nil {
+		t.Fatalf("app_put: %v", err)
+	}
+	if _, _, err := run(t, w, "app_sse_subscribe", "{variable: temp}", 0); err != nil {
+		t.Fatalf("app_sse_subscribe: %v", err)
+	}
+	// The subscription is open before the step returns, so the frame the daemon
+	// sends immediately is already on the timeline.
+	awaitEventForTest(t, w, 0, eventlog.Predicate{
+		Label: "first SSE frame",
+		Constraints: []eventlog.Constraint{
+			eventlog.Eq("kind", string(eventlog.KindSSEFrame)),
+			eventlog.Eq("attrs.variable", "temp"),
+		},
+	})
+
+	want := []string{"start:", "put:temp", "sse:temp"}
+	got := *calls
+	if len(got) != len(want) {
+		t.Fatalf("the daemon saw %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// The uhwid is the one value only the daemon knows, and a scenario needs it to
+// assert on the CSR subject. Learning it into the bag is the whole point of
+// the step.
+func TestAppGetIdentityLearnsTheUHWID(t *testing.T) {
+	w, calls := newWorld(t)
+
+	if _, ok := w.Vars.Get("uhwid"); ok {
+		t.Fatal("the bag already holds a uhwid, so this test would prove nothing")
+	}
+	sc, _, err := run(t, w, "app_get_identity", "{}", 0)
+	if err != nil {
+		t.Fatalf("app_get_identity: %v", err)
+	}
+	if got := w.Vars.MustGet("uhwid"); got != "3a7bd3e2360a3d29" {
+		t.Errorf("bag[uhwid] = %q, want the daemon value", got)
+	}
+	if !strings.Contains(sc.Detail, "3a7bd3e2360a3d29") {
+		t.Errorf("detail = %q, want it to name the uhwid", sc.Detail)
+	}
+	if got := *calls; len(got) != 1 || got[0] != "identity" {
+		t.Errorf("the daemon saw %v, want one identity call", got)
+	}
+
+	// And the value is then usable where it matters: the CSR subject the fake
+	// API records.
+	resolved, err := w.Vars.Interpolate("CN={uhwid}")
+	if err != nil {
+		t.Fatalf("interpolate: %v", err)
+	}
+	if resolved != "CN=3a7bd3e2360a3d29" {
+		t.Errorf("interpolated %q", resolved)
+	}
+
+	// The board token must not follow it into the bag: the bag is dumped into
+	// the artifact.
+	for _, key := range w.Vars.Keys() {
+		value := w.Vars.MustGet(key)
+		if strings.Contains(value, "secret-board-token") {
+			t.Errorf("the board token reached the bag as %q", key)
+		}
+	}
+}
+
+func TestAppStartProvisioning(t *testing.T) {
+	w, calls := newWorld(t)
+
+	if _, _, err := run(t, w, "app_start_provisioning", "{}", 0); err != nil {
+		t.Fatalf("app_start_provisioning: %v", err)
+	}
+	// No organization: the body is omitted entirely, as the API allows.
+	if got := *calls; len(got) != 1 || got[0] != "start:" {
+		t.Errorf("the daemon saw %v, want a start with no body", got)
+	}
+
+	sc, _, err := run(t, w, "app_start_provisioning", "{organization_id: org-1}", 0)
+	if err != nil {
+		t.Fatalf("app_start_provisioning: %v", err)
+	}
+	if got := (*calls)[1]; !strings.Contains(got, `"organization_id":"org-1"`) {
+		t.Errorf("the daemon saw %q, want the organization id", got)
+	}
+	if !strings.Contains(sc.Detail, "org-1") {
+		t.Errorf("detail = %q", sc.Detail)
+	}
+	// The organization is worth keeping: a later step asserts the daemon
+	// stored it, and the status reports it back.
+	if got, _ := w.Vars.Get("organization_id"); got != "org-1" {
+		t.Errorf("bag[organization_id] = %q", got)
+	}
+}
+
+func TestActionsValidateTheirParameters(t *testing.T) {
+	w, _ := newWorld(t)
+	tests := []struct{ step, y string }{
+		{"app_post", "{}"},
+		{"app_get_identity", "{uhwid: x}"},
+		{"app_start_provisioning", "{organization: x}"},
+		{"app_put", "{value: 1}"},
+		{"app_sse_subscribe", "{}"},
+		// A misspelled parameter must fail rather than be ignored: the step
+		// would otherwise quietly do something else.
+		{"app_put", "{variable: temp, valu: 1}"},
+		{"cloud_publish", "{cmd: Thing.update, thingid: x}"},
+		{"stop_daemon", "{}"}, // no daemon in this World
+	}
+	for _, tc := range tests {
+		t.Run(tc.step+" "+tc.y, func(t *testing.T) {
+			if _, _, err := run(t, w, tc.step, tc.y, 0); err == nil {
+				t.Error("the step succeeded, want an error")
+			}
+		})
+	}
+}
+
+func TestTakeTimeout(t *testing.T) {
+	if got, err := takeTimeout(map[string]any{}); err != nil || got != DefaultTimeout {
+		t.Errorf("no timeout given: got %v, %v; want the default", got, err)
+	}
+	params := map[string]any{"timeout": "250ms", "cmd": "x"}
+	got, err := takeTimeout(params)
+	if err != nil {
+		t.Fatalf("takeTimeout: %v", err)
+	}
+	if got != 250*time.Millisecond {
+		t.Errorf("timeout = %v, want 250ms", got)
+	}
+	// It must be removed, or it would become a constraint on a non-existent
+	// attribute and nothing would ever match.
+	if _, ok := params["timeout"]; ok {
+		t.Error("the timeout stayed in the parameters")
+	}
+	if _, ok := params["cmd"]; !ok {
+		t.Error("takeTimeout removed a real parameter")
+	}
+	if _, err := takeTimeout(map[string]any{"timeout": "soon"}); err == nil {
+		t.Error("an unparsable timeout was accepted")
+	}
+	if got, err := takeTimeout(map[string]any{"timeout": 3}); err != nil || got != 3*time.Second {
+		t.Errorf("a bare number should read as seconds: got %v, %v", got, err)
+	}
+}
+
+// The predicate convention is the scenario query language, and it is shared
+// with the tolerate list, so it is worth pinning on its own.
+func TestBuildPredicate(t *testing.T) {
+	p := BuildPredicate(
+		map[string]any{"source": "mqtt"},
+		map[string]any{"cmd": "Thing.begin", "thing_id": ""},
+		nil,
+	)
+	fields := map[string]bool{}
+	for _, c := range p.Constraints {
+		fields[c.Field] = true
+	}
+	for _, want := range []string{"source", "attrs.cmd", "attrs.thing_id"} {
+		if !fields[want] {
+			t.Errorf("no constraint on %q (got %v)", want, fields)
+		}
+	}
+	if p.Label == "" {
+		t.Error("the predicate has no label, so a failure cannot name it")
+	}
+
+	// seq and kind stay event fields; everything else is an attribute.
+	p = BuildPredicate(nil, map[string]any{"kind": "mqtt_publish", "seq": 3, "topic": "x"}, nil)
+	fields = map[string]bool{}
+	for _, c := range p.Constraints {
+		fields[c.Field] = true
+	}
+	for _, want := range []string{"kind", "seq", "attrs.topic"} {
+		if !fields[want] {
+			t.Errorf("no constraint on %q (got %v)", want, fields)
+		}
+	}
+}
+
+func TestDefaultRegistryCoversTheScenarioVocabulary(t *testing.T) {
+	reg := Default()
+	for _, name := range []string{
+		"await_daemon_state", "await_cloud_state", "await_provisioning_state",
+		"expect_api_call", "expect_mqtt_connect", "expect_disconnect",
+		"expect_subscribe", "expect_unsubscribe", "expect_publish",
+		"expect_prop_publish", "expect_sse", "expect_tls_error", "expect_daemon_exit",
+		"app_get_identity", "app_start_provisioning",
+		"app_post", "app_put", "app_sse_subscribe",
+		"cloud_publish", "cloud_publish_prop", "stop_daemon",
+	} {
+		if _, ok := reg[name]; !ok {
+			t.Errorf("the registry has no %q", name)
+		}
+	}
+}
+
+func awaitNote(t *testing.T, w *harness.World, from eventlog.Cursor, cmd string) (eventlog.Event, eventlog.Cursor) {
+	t.Helper()
+	return awaitEventForTest(t, w, from, eventlog.Predicate{
+		Label: "harness note " + cmd,
+		Constraints: []eventlog.Constraint{
+			eventlog.Eq("kind", string(eventlog.KindHarnessNote)),
+			eventlog.Eq("attrs.cmd", cmd),
+		},
+	})
+}
+
+func awaitEventForTest(t *testing.T, w *harness.World, from eventlog.Cursor, p eventlog.Predicate) (eventlog.Event, eventlog.Cursor) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ev, cursor, err := w.Log.Await(ctx, from, p, 5*time.Second)
+	if err != nil {
+		t.Fatalf("awaiting %s: %v", p, err)
+	}
+	return ev, cursor
+}
