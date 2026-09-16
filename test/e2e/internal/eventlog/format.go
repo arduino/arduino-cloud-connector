@@ -116,6 +116,14 @@ func (r Result) Format() string {
 	switch {
 	case r.Aborted != nil:
 		fmt.Fprintf(&b, "scenario %s — ABORTED: %s\n", r.Scenario, r.Aborted.Reason)
+	// Every step passed and the run still failed: the final sweep found
+	// protocol traffic nobody claimed. The header has to say so, because this
+	// is the one failure with no failed step to point at, and a report that
+	// opens with PASS while the exit code says otherwise is worse than no
+	// report at all.
+	case failed == nil && len(r.Unconsumed) > 0:
+		fmt.Fprintf(&b, "scenario %s — FAIL: all %d steps passed but %d significant event(s) went unclaimed (%d events)\n",
+			r.Scenario, len(r.Steps), len(r.Unconsumed), len(r.Events))
 	case failed == nil:
 		fmt.Fprintf(&b, "scenario %s — PASS (%d steps, %d events)\n",
 			r.Scenario, len(r.Steps), len(r.Events))

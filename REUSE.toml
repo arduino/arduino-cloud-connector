@@ -11,6 +11,7 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 path = [
   "HANDOFF.md",
   "docs/**",
+  "test/e2e/SCENARIOS.md",
 ]
 SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
 SPDX-License-Identifier = "GPL-3.0-or-later"

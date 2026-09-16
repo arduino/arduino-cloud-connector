@@ -170,6 +170,17 @@ func TestReportMarksUnexpectedEvents(t *testing.T) {
 	if !strings.Contains(out, "+ #2") {
 		t.Error("timeline does not mark the unexpected event with +")
 	}
+	// The header must agree with the verdict. Every step passed here, so the
+	// sweep is the only thing that failed the run -- and the header used to
+	// read PASS while Failed() said otherwise, which is what a CI artifact
+	// opens with.
+	header, _, _ := strings.Cut(out, "\n")
+	if strings.Contains(header, "PASS") || !strings.Contains(header, "FAIL") {
+		t.Errorf("header = %q, want it to report the failure", header)
+	}
+	if !strings.Contains(header, "unclaimed") {
+		t.Errorf("header = %q, want it to name the reason", header)
+	}
 }
 
 func TestReportOnPass(t *testing.T) {
