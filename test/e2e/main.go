@@ -23,8 +23,7 @@
 //	e2e -daemon ../../build/arduino-cloud-connector-mock
 //	e2e -daemon <path> -run full-lifecycle -artifacts /tmp/e2e
 //
-// SCENARIOS.md is the guide to writing one: the predicate rule, the attribute
-// each event carries, and the traps the shared cursor sets.
+// Please, read the README.md file for further information.
 package main
 
 import (
