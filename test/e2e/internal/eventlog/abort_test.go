@@ -119,7 +119,7 @@ func TestResultFailsWhenAborted(t *testing.T) {
 	crash(l, 2)
 
 	r := l.Result("crash", []StepResult{
-		{Index: 1, Name: "expect_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
+		{Index: 1, Name: "expect_mqtt_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
 	}, nil)
 
 	if !r.Failed() {
@@ -146,9 +146,9 @@ func TestReportLeadsWithTheCrash(t *testing.T) {
 	err := <-pending
 
 	r := l.Result("crash", []StepResult{
-		{Index: 1, Name: "expect_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
-		{Index: 2, Name: "expect_publish", Detail: "cmd=Thing.begin", Status: StepFailed, Err: err},
-		{Index: 3, Name: "await_cloud_state", Detail: "state=Steady", Status: StepSkipped},
+		{Index: 1, Name: "expect_mqtt_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
+		{Index: 2, Name: "expect_mqtt_publish", Detail: "cmd=Thing.begin", Status: StepFailed, Err: err},
+		{Index: 3, Name: "await_daemon_cloud_state", Detail: "state=Steady", Status: StepSkipped},
 	}, nil)
 
 	out := r.Format()

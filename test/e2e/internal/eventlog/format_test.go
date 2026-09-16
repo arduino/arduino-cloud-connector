@@ -51,10 +51,10 @@ func simulateHandshakeFailure(t *testing.T) Result {
 		{Index: 2, Name: "expect_api_call", Detail: "provision/csr", Status: StepPassed, Since: events[3].Since, MatchedSeq: 4},
 		{Index: 3, Name: "expect_api_call", Detail: "provision/complete", Status: StepPassed, Since: events[4].Since, MatchedSeq: 5},
 		{Index: 4, Name: "expect_mqtt_connect", Detail: "client_id_matches_cert_cn", Status: StepPassed, Since: events[5].Since, MatchedSeq: 6},
-		{Index: 5, Name: "expect_subscribe", Detail: "/a/d/{device_id}/c/dw", Status: StepPassed, Since: events[6].Since, MatchedSeq: 7},
-		{Index: 6, Name: "expect_publish", Detail: "cmd=Thing.begin", Status: StepPassed, Since: events[8].Since, MatchedSeq: 9},
+		{Index: 5, Name: "expect_mqtt_subscribe", Detail: "/a/d/{device_id}/c/dw", Status: StepPassed, Since: events[6].Since, MatchedSeq: 7},
+		{Index: 6, Name: "expect_mqtt_publish", Detail: "cmd=Thing.begin", Status: StepPassed, Since: events[8].Since, MatchedSeq: 9},
 		{Index: 7, Name: "cloud_publish", Detail: "cmd=Thing.update", Status: StepPassed, Since: events[9].Since, MatchedSeq: 10},
-		{Index: 8, Name: "expect_subscribe", Detail: "/a/t/{thing_id}/e/i", Status: StepPassed, Since: events[10].Since, MatchedSeq: 11},
+		{Index: 8, Name: "expect_mqtt_subscribe", Detail: "/a/t/{thing_id}/e/i", Status: StepPassed, Since: events[10].Since, MatchedSeq: 11},
 	}
 	for _, s := range steps {
 		l.Consume(s.MatchedSeq, "step "+itoa(s.Index)+" ✓")
@@ -67,9 +67,9 @@ func simulateHandshakeFailure(t *testing.T) Result {
 		t.Fatal("expected the simulated step to time out")
 	}
 	steps = append(steps,
-		StepResult{Index: 9, Name: "expect_publish", Detail: "cmd=LastValues.begin", Status: StepFailed, Err: err},
+		StepResult{Index: 9, Name: "expect_mqtt_publish", Detail: "cmd=LastValues.begin", Status: StepFailed, Err: err},
 		StepResult{Index: 10, Name: "cloud_publish", Detail: "cmd=LastValues.update", Status: StepSkipped},
-		StepResult{Index: 11, Name: "await_cloud_state", Detail: "state=Steady", Status: StepSkipped},
+		StepResult{Index: 11, Name: "await_daemon_cloud_state", Detail: "state=Steady", Status: StepSkipped},
 	)
 
 	return l.Result("full-lifecycle", steps, nil)
@@ -131,7 +131,7 @@ func TestReportShowsFieldLevelDiff(t *testing.T) {
 	_, _, err := l.Await(context.Background(), 0, want, 20*time.Millisecond)
 
 	r := l.Result("version-mismatch", []StepResult{
-		{Index: 1, Name: "expect_publish", Detail: "cmd=Device.begin", Status: StepFailed, Err: err},
+		{Index: 1, Name: "expect_mqtt_publish", Detail: "cmd=Device.begin", Status: StepFailed, Err: err},
 	}, nil)
 	out := r.Format()
 	t.Logf("\n%s", out)
@@ -156,7 +156,7 @@ func TestReportMarksUnexpectedEvents(t *testing.T) {
 	publish(l, "Device.begin") // a second announce with no reconnect: a real bug
 
 	r := l.Result("strict", []StepResult{
-		{Index: 1, Name: "expect_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
+		{Index: 1, Name: "expect_mqtt_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: ev.Seq},
 	}, nil)
 	out := r.Format()
 	t.Logf("\n%s", out)
@@ -189,7 +189,7 @@ func TestReportOnPass(t *testing.T) {
 	l.Consume(ev.Seq, "step 1 ✓")
 
 	r := l.Result("happy", []StepResult{
-		{Index: 1, Name: "expect_publish", Status: StepPassed, MatchedSeq: ev.Seq},
+		{Index: 1, Name: "expect_mqtt_publish", Status: StepPassed, MatchedSeq: ev.Seq},
 	}, nil)
 
 	if r.Failed() {

@@ -16,7 +16,7 @@
 //
 // Every expect_* step is the same operation: build a predicate from a fixed
 // source and kind plus one constraint per remaining parameter, then Await it
-// from the current cursor. That is why `expect_publish: {cmd: Thing.begin,
+// from the current cursor. That is why `expect_mqtt_publish: {cmd: Thing.begin,
 // thing_id: ""}` needs no code of its own -- cmd and thing_id are simply
 // attribute constraints, and the event log's predicates are data, so the
 // failure report can say which of them did not hold.
@@ -86,35 +86,35 @@ type Registry map[string]Func
 func Default() Registry {
 	return Registry{
 		// ── expectations ──────────────────────────────────────────────────
-		"expect_api_call":     awaitEvent(eventlog.SourceProvisioningAPI, eventlog.KindHTTPRequest, nil),
-		"expect_mqtt_connect": awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTConnect, nil),
-		"expect_disconnect":   awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTDisconnect, nil),
-		"expect_subscribe":    awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTSubscribe, nil),
-		"expect_unsubscribe":  awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTUnsubscribe, nil),
-		"expect_publish":      awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTPublish, nil),
-		"expect_prop_publish": awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTPublish, nil),
-		"expect_tls_error":    awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTTLSError, nil),
-		"expect_sse":          awaitEvent(eventlog.SourceSSE, eventlog.KindSSEFrame, nil),
-		"expect_daemon_exit":  awaitEvent(eventlog.SourceDaemonProcess, eventlog.KindProcessExit, nil),
+		"expect_api_call":         awaitEvent(eventlog.SourceProvisioningAPI, eventlog.KindHTTPRequest, nil),
+		"expect_mqtt_connect":     awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTConnect, nil),
+		"expect_mqtt_disconnect":  awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTDisconnect, nil),
+		"expect_mqtt_subscribe":   awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTSubscribe, nil),
+		"expect_mqtt_unsubscribe": awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTUnsubscribe, nil),
+		"expect_mqtt_publish":     awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTPublish, nil),
+		"expect_var_publish":      awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTPublish, nil),
+		"expect_tls_error":        awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTTLSError, nil),
+		"expect_app_event":        awaitEvent(eventlog.SourceSSE, eventlog.KindSSEFrame, nil),
+		"expect_daemon_exit":      awaitEvent(eventlog.SourceDaemonProcess, eventlog.KindProcessExit, nil),
 		// The two state waits are the same primitive with the parameter the
 		// scenario reads best: `state` rather than the attribute name.
 		"await_daemon_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
 			map[string]string{"state": "daemon"}),
-		"await_cloud_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
+		"await_daemon_cloud_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
 			map[string]string{"state": "cloud_state"}),
-		"await_provisioning_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
+		"await_daemon_provisioning_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
 			map[string]string{"state": "provisioning"}),
 
 		// ── actions ───────────────────────────────────────────────────────
-		"app_get_identity":       appGetIdentity,
-		"app_get_status":         appGetStatus,
-		"app_start_provisioning": appStartProvisioning,
-		"app_post":               appPost,
-		"app_put":                appPut,
-		"app_sse_subscribe":      appSSESubscribe,
-		"cloud_publish":          cloudPublish,
-		"cloud_publish_prop":     cloudPublishProp,
-		"stop_daemon":            stopDaemon,
+		"get_device_identity": getDeviceIdentity,
+		"get_daemon_status":   getDaemonStatus,
+		"start_provisioning":  startProvisioning,
+		"app_post":            appPost,
+		"app_var_write":       appVarWrite,
+		"app_var_subscribe":   appVarSubscribe,
+		"cloud_publish":       cloudPublish,
+		"cloud_publish_var":   cloudPublishVar,
+		"stop_daemon":         stopDaemon,
 	}
 }
 
@@ -195,11 +195,11 @@ func fieldFor(key string, rename map[string]string) string {
 
 // ── actions ──────────────────────────────────────────────────────────────────
 
-// appGetIdentityParams takes no parameters. Declaring the type empty is what
+// getDeviceIdentityParams takes no parameters. Declaring the type empty is what
 // makes a stray parameter an error rather than silence.
-type appGetIdentityParams struct{}
+type getDeviceIdentityParams struct{}
 
-// appGetIdentity reads the board identity and puts the uhwid in the bag.
+// getDeviceIdentity reads the board identity and puts the uhwid in the bag.
 //
 // This is the one value only the daemon knows: it derives the uhwid from the
 // hardware (a fixed one under -tags mock), and the harness has no way to guess
@@ -210,30 +210,30 @@ type appGetIdentityParams struct{}
 //
 // The board token comes back too and is deliberately NOT put in the bag: it is
 // a credential, and the bag ends up in the artifact dump.
-func appGetIdentity(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p appGetIdentityParams
+func getDeviceIdentity(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p getDeviceIdentityParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
 	id, err := sc.World.App.Identity(ctx)
 	if err != nil {
-		return sc.Cursor, fmt.Errorf("app_get_identity: %w", err)
+		return sc.Cursor, fmt.Errorf("get_device_identity: %w", err)
 	}
 	if id.UHWID == "" {
-		return sc.Cursor, fmt.Errorf("app_get_identity: the daemon answered with no uhwid")
+		return sc.Cursor, fmt.Errorf("get_device_identity: the daemon answered with no uhwid")
 	}
 	// A missing board token is worth failing on here: it authenticates every
 	// provisioning call, so without it the next step fails with an opaque 401
 	// from the API instead of naming the cause.
 	if id.BoardToken == "" {
-		return sc.Cursor, fmt.Errorf("app_get_identity: the daemon answered with no board token")
+		return sc.Cursor, fmt.Errorf("get_device_identity: the daemon answered with no board token")
 	}
 	sc.World.Vars.Set("uhwid", id.UHWID)
 	sc.Detail = "identity uhwid=" + id.UHWID
 	return sc.Cursor, nil
 }
 
-// statusFields are the identifiers app_get_status learns from the daemon, in
+// statusFields are the identifiers get_daemon_status learns from the daemon, in
 // the order the report names them.
 //
 // Identifiers only. The three state words the status also carries (daemon,
@@ -242,7 +242,7 @@ func appGetIdentity(ctx context.Context, sc *Context, node *yaml.Node) (eventlog
 // scenario two ways to ask the same question.
 var statusFields = []string{"device_id", "thing_id", "organization_id"}
 
-type appGetStatusParams struct {
+type getDaemonStatusParams struct {
 	// Require names the fields that must be present, and is what makes this
 	// step fail where the cause is visible. Without it a missing device id
 	// surfaces fifteen seconds later as an expectation waiting on a topic
@@ -250,7 +250,7 @@ type appGetStatusParams struct {
 	Require []string `yaml:"require"`
 }
 
-// appGetStatus reads the daemon's status and relearns the identifiers from it.
+// getDaemonStatus reads the daemon's status and relearns the identifiers from it.
 //
 // The background poller already puts every transition on the timeline, so this
 // step is not about waiting -- await_daemon_state does that. It is about the
@@ -268,8 +268,8 @@ type appGetStatusParams struct {
 // rather than as the step that blanked the value. Use require to assert
 // presence; the same convention is what appclient.recordStatus applies to the
 // attributes it records.
-func appGetStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p appGetStatusParams
+func getDaemonStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p getDaemonStatusParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
@@ -277,14 +277,14 @@ func appGetStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.C
 	// the failure mode strict parameter decoding exists to prevent.
 	for _, field := range p.Require {
 		if !slices.Contains(statusFields, field) {
-			return sc.Cursor, fmt.Errorf("app_get_status: cannot require %q; the status carries %s",
+			return sc.Cursor, fmt.Errorf("get_daemon_status: cannot require %q; the status carries %s",
 				field, strings.Join(statusFields, ", "))
 		}
 	}
 
 	status, err := sc.World.App.Status(ctx)
 	if err != nil {
-		return sc.Cursor, fmt.Errorf("app_get_status: %w", err)
+		return sc.Cursor, fmt.Errorf("get_daemon_status: %w", err)
 	}
 	reported := map[string]string{
 		"device_id":       status.DeviceID,
@@ -296,7 +296,7 @@ func appGetStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.C
 
 	for _, field := range p.Require {
 		if reported[field] == "" {
-			return sc.Cursor, fmt.Errorf("app_get_status: the daemon reports no %s "+
+			return sc.Cursor, fmt.Errorf("get_daemon_status: the daemon reports no %s "+
 				"(daemon=%s provisioning=%s)", field, status.Daemon, status.Provisioning)
 		}
 	}
@@ -327,13 +327,13 @@ func appGetStatus(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.C
 	return sc.Cursor, nil
 }
 
-type appStartProvisioningParams struct {
+type startProvisioningParams struct {
 	// OrganizationID is optional, exactly as in the API: a board can be
 	// provisioned without one.
 	OrganizationID string `yaml:"organization_id"`
 }
 
-// appStartProvisioning asks the daemon to provision, which is what App Lab
+// startProvisioning asks the daemon to provision, which is what App Lab
 // does and the only way out of the Provisioning state.
 //
 // It is a named primitive rather than a generic POST because the endpoint has
@@ -341,13 +341,13 @@ type appStartProvisioningParams struct {
 // answer is 202 -- a 409 means a provisioning was already running, which is a
 // different failure from an unreachable daemon and a scenario has to be able
 // to tell them apart.
-func appStartProvisioning(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p appStartProvisioningParams
+func startProvisioning(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p startProvisioningParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
 	if err := sc.World.App.StartProvisioning(ctx, p.OrganizationID); err != nil {
-		return sc.Cursor, fmt.Errorf("app_start_provisioning: %w", err)
+		return sc.Cursor, fmt.Errorf("start_provisioning: %w", err)
 	}
 	sc.Detail = "start provisioning"
 	if p.OrganizationID != "" {
@@ -364,7 +364,7 @@ type appPostParams struct {
 }
 
 // appPost is the escape hatch for an endpoint with no named primitive yet. Use
-// app_start_provisioning and app_get_identity for the two that have one: they
+// start_provisioning and get_device_identity for the two that have one: they
 // check the status the API documents and learn what the scenario needs.
 func appPost(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
 	var p appPostParams
@@ -389,41 +389,41 @@ func appPost(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor
 	return sc.Cursor, nil
 }
 
-type appPutParams struct {
+type appVarWriteParams struct {
 	Variable string `yaml:"variable"`
 	Value    any    `yaml:"value"`
 }
 
-// appPut is the app writing a variable, the uplink half of the app role.
-func appPut(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p appPutParams
+// appVarWrite is the app writing a variable, the uplink half of the app role.
+func appVarWrite(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p appVarWriteParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
 	if p.Variable == "" {
-		return sc.Cursor, fmt.Errorf("app_put: variable is required")
+		return sc.Cursor, fmt.Errorf("app_var_write: variable is required")
 	}
 	sc.Detail = fmt.Sprintf("PUT %s=%v", p.Variable, p.Value)
 
 	if err := sc.World.App.PutVariable(ctx, p.Variable, p.Value); err != nil {
-		return sc.Cursor, fmt.Errorf("app_put %s: %w", p.Variable, err)
+		return sc.Cursor, fmt.Errorf("app_var_write %s: %w", p.Variable, err)
 	}
 	return sc.Cursor, nil
 }
 
-type appSubscribeParams struct {
+type appVarSubscribeParams struct {
 	Variable string `yaml:"variable"`
 }
 
-// appSSESubscribe opens the variable's event stream. It returns only once the
+// appVarSubscribe opens the variable's event stream. It returns only once the
 // response headers are in, so a following injection cannot race it.
-func appSSESubscribe(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p appSubscribeParams
+func appVarSubscribe(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p appVarSubscribeParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
 	if p.Variable == "" {
-		return sc.Cursor, fmt.Errorf("app_sse_subscribe: variable is required")
+		return sc.Cursor, fmt.Errorf("app_var_subscribe: variable is required")
 	}
 	sc.Detail = "subscribe " + p.Variable
 
@@ -432,7 +432,7 @@ func appSSESubscribe(ctx context.Context, sc *Context, node *yaml.Node) (eventlo
 	// nobody reads.
 	stream, err := sc.World.App.SubscribeVariable(context.WithoutCancel(ctx), p.Variable)
 	if err != nil {
-		return sc.Cursor, fmt.Errorf("app_sse_subscribe %s: %w", p.Variable, err)
+		return sc.Cursor, fmt.Errorf("app_var_subscribe %s: %w", p.Variable, err)
 	}
 	sc.World.AddStream(stream)
 	return sc.Cursor, nil
@@ -487,17 +487,17 @@ func cloudPublish(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.C
 	return sc.Cursor, nil
 }
 
-type cloudPublishPropParams struct {
+type cloudPublishVarParams struct {
 	ThingID  string        `yaml:"thing_id"`
 	Variable string        `yaml:"variable"`
 	Value    any           `yaml:"value"`
 	Values   []valueParams `yaml:"values"`
 }
 
-// cloudPublishProp is the cloud changing a property value, which is what an
+// cloudPublishVar is the cloud changing a property value, which is what an
 // operator does in the Cloud UI.
-func cloudPublishProp(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
-	var p cloudPublishPropParams
+func cloudPublishVar(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p cloudPublishVarParams
 	if err := decodeInto(node, &p); err != nil {
 		return sc.Cursor, err
 	}
@@ -511,20 +511,20 @@ func cloudPublishProp(ctx context.Context, sc *Context, node *yaml.Node) (eventl
 		values = append(values, valueParams{Name: p.Variable, Value: p.Value})
 	}
 	if len(values) == 0 {
-		return sc.Cursor, fmt.Errorf("cloud_publish_prop: give either variable/value or values")
+		return sc.Cursor, fmt.Errorf("cloud_publish_var: give either variable/value or values")
 	}
 	wireValues, err := toWireValues(values)
 	if err != nil {
-		return sc.Cursor, fmt.Errorf("cloud_publish_prop: %w", err)
+		return sc.Cursor, fmt.Errorf("cloud_publish_var: %w", err)
 	}
 	payload, err := wire.EncodeSenML(wireValues)
 	if err != nil {
-		return sc.Cursor, fmt.Errorf("cloud_publish_prop: %w", err)
+		return sc.Cursor, fmt.Errorf("cloud_publish_var: %w", err)
 	}
 	sc.Detail = fmt.Sprintf("cloud set %s on %s", describeValues(wireValues), broker.PropertyInTopic(thingID))
 
 	if err := sc.World.Broker.PublishProperty(thingID, payload); err != nil {
-		return sc.Cursor, fmt.Errorf("cloud_publish_prop: %w", err)
+		return sc.Cursor, fmt.Errorf("cloud_publish_var: %w", err)
 	}
 	return sc.Cursor, nil
 }

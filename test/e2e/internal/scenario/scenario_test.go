@@ -59,7 +59,7 @@ fakes:
 steps:
   - await_daemon_state: { state: Provisioning, timeout: 10s }
   - app_post: { path: /v1/provisioning/start }
-  - expect_publish: { cmd: Thing.begin, thing_id: "" }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
 `)
 
 	sc, err := Load(path)
@@ -78,7 +78,7 @@ steps:
 	if len(sc.Steps) != 3 {
 		t.Fatalf("got %d steps, want 3", len(sc.Steps))
 	}
-	if sc.Steps[0].Name != "await_daemon_state" || sc.Steps[2].Name != "expect_publish" {
+	if sc.Steps[0].Name != "await_daemon_state" || sc.Steps[2].Name != "expect_mqtt_publish" {
 		t.Errorf("step names = %q, %q, %q", sc.Steps[0].Name, sc.Steps[1].Name, sc.Steps[2].Name)
 	}
 	if got := sc.Fakes.ProvisioningAPI["csr"]; len(got) != 2 || got[0].Status != 503 ||
@@ -89,7 +89,7 @@ steps:
 
 // The name falls back to the file name, so a scenario file needs no ceremony.
 func TestLoadDefaultsTheNameToTheFileName(t *testing.T) {
-	path := write(t, "reconnect.yaml", "steps:\n  - expect_publish: {}\n")
+	path := write(t, "reconnect.yaml", "steps:\n  - expect_mqtt_publish: {}\n")
 	sc, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -110,17 +110,17 @@ func TestLoadRejectsMalformedScenarios(t *testing.T) {
 	}{
 		{
 			name: "unknown top-level key",
-			body: "name: x\nstrict_event: true\nsteps:\n  - expect_publish: {}\n",
+			body: "name: x\nstrict_event: true\nsteps:\n  - expect_mqtt_publish: {}\n",
 			want: "strict_event",
 		},
 		{
 			name: "step is not a mapping",
-			body: "steps:\n  - expect_publish\n",
+			body: "steps:\n  - expect_mqtt_publish\n",
 			want: "single-key mapping",
 		},
 		{
 			name: "step with two keys",
-			body: "steps:\n  - {expect_publish: {}, app_put: {}}\n",
+			body: "steps:\n  - {expect_mqtt_publish: {}, app_var_write: {}}\n",
 			want: "single-key mapping",
 		},
 		{
@@ -153,7 +153,7 @@ func TestLoadRejectsMalformedScenarios(t *testing.T) {
 func TestLoadDirIsSorted(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"b.yaml", "a.yaml", "ignored.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("steps:\n  - expect_publish: {}\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("steps:\n  - expect_mqtt_publish: {}\n"), 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 	}
@@ -169,7 +169,7 @@ func TestLoadDirIsSorted(t *testing.T) {
 // A typo in a step name must fail before anything starts, not after eighteen
 // steps and a daemon launch.
 func TestValidateNamesTheUnknownSteps(t *testing.T) {
-	sc, err := Load(write(t, "s.yaml", "steps:\n  - expect_publish: {}\n  - expect_pubish: {}\n"))
+	sc, err := Load(write(t, "s.yaml", "steps:\n  - expect_mqtt_publish: {}\n  - expect_pubish: {}\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestValidateNamesTheUnknownSteps(t *testing.T) {
 		t.Errorf("the error should name the step: %v", err)
 	}
 	// And list the vocabulary, which is what makes the message actionable.
-	if !strings.Contains(err.Error(), "expect_publish") {
+	if !strings.Contains(err.Error(), "expect_mqtt_publish") {
 		t.Errorf("the error should list the known steps: %v", err)
 	}
 }
@@ -244,8 +244,8 @@ func TestRunPassesAndRecordsEachStep(t *testing.T) {
 name: two-steps
 strict_events: true
 steps:
-  - expect_publish: { cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 2s }
-  - expect_subscribe: { topic: "/a/t/{thing_id}/e/i", timeout: 2s }
+  - expect_mqtt_publish: { cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 2s }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i", timeout: 2s }
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -279,9 +279,9 @@ func TestRunSkipsTheStepsAfterAFailure(t *testing.T) {
 	sc, err := Load(write(t, "s.yaml", `
 name: fails-first
 steps:
-  - expect_publish: { cmd: Device.begin, timeout: 100ms }
-  - expect_subscribe: { timeout: 100ms }
-  - app_put: { variable: temp, value: 1 }
+  - expect_mqtt_publish: { cmd: Device.begin, timeout: 100ms }
+  - expect_mqtt_subscribe: { timeout: 100ms }
+  - app_var_write: { variable: temp, value: 1 }
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -321,7 +321,7 @@ func TestStrictEventsFailsOnUnconsumedTraffic(t *testing.T) {
 name: strict
 strict_events: true
 steps:
-  - expect_publish: { cmd: Device.begin, timeout: 2s }
+  - expect_mqtt_publish: { cmd: Device.begin, timeout: 2s }
 `
 	sc, err := Load(write(t, "strict.yaml", body))
 	if err != nil {
@@ -350,7 +350,7 @@ strict_events: true
 tolerate:
   - { source: mqtt, cmd: Thing.begin }
 steps:
-  - expect_publish: { cmd: Device.begin, timeout: 2s }
+  - expect_mqtt_publish: { cmd: Device.begin, timeout: 2s }
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -370,7 +370,7 @@ func TestNonStrictScenarioIgnoresUnconsumedTraffic(t *testing.T) {
 	sc, err := Load(write(t, "loose.yaml", `
 name: loose
 steps:
-  - expect_publish: { cmd: Thing.begin, timeout: 2s }
+  - expect_mqtt_publish: { cmd: Thing.begin, timeout: 2s }
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -468,7 +468,7 @@ func TestWriteArtifacts(t *testing.T) {
 	w := newWorld(t)
 	w.Log.Append(eventlog.SourceMQTT, eventlog.KindMQTTPublish, map[string]any{"cmd": "Device.begin"}, nil)
 	result := w.Log.Result("full lifecycle/1", []eventlog.StepResult{{
-		Index: 1, Name: "expect_publish", Status: eventlog.StepPassed, MatchedSeq: 1,
+		Index: 1, Name: "expect_mqtt_publish", Status: eventlog.StepPassed, MatchedSeq: 1,
 	}}, nil)
 
 	dir := filepath.Join(t.TempDir(), "_artifacts")
@@ -493,7 +493,7 @@ func TestWriteArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(string(text), "expect_publish") {
+	if !strings.Contains(string(text), "expect_mqtt_publish") {
 		t.Errorf("the report does not mention the step:\n%s", text)
 	}
 

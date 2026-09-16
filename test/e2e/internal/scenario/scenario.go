@@ -63,12 +63,12 @@ type Step struct {
 	Params yaml.Node
 }
 
-// UnmarshalYAML accepts `- expect_publish: {cmd: Device.begin}` and
+// UnmarshalYAML accepts `- expect_mqtt_publish: {cmd: Device.begin}` and
 // `- app_post:` with no parameters at all.
 func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode || len(node.Content) != 2 {
 		return fmt.Errorf("line %d: a step must be a single-key mapping like "+
-			"`- expect_publish: {cmd: Device.begin}`", node.Line)
+			"`- expect_mqtt_publish: {cmd: Device.begin}`", node.Line)
 	}
 	s.Name = node.Content[0].Value
 	s.Params = *node.Content[1]
