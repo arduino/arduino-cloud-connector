@@ -22,14 +22,24 @@
 //
 //	e2e -daemon ../../build/arduino-cloud-connector-mock
 //	e2e -daemon <path> -run full-lifecycle -artifacts /tmp/e2e
+//
+// SCENARIOS.md is the guide to writing one: the predicate rule, the attribute
+// each event carries, and the traps the shared cursor sets.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
+
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/harness"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/scenario"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/steps"
 )
 
 // Version is overridden at build time with -ldflags.
@@ -59,20 +69,105 @@ func run() error {
 		return nil
 	}
 
-	names, err := discoverScenarios(opts.scenarios, opts.run)
+	all, err := scenario.LoadDir(opts.scenarios)
 	if err != nil {
 		return err
 	}
-	if len(names) == 0 {
+	selected := filter(all, opts.run)
+	if len(selected) == 0 {
 		return fmt.Errorf("no scenarios found in %s (filter %q)", opts.scenarios, opts.run)
 	}
 
-	// The scenario runner lands with internal/scenario and internal/steps.
-	// Until then this reports honestly rather than exiting 0 on work it did
-	// not do — an E2E tool that silently passes is worse than one that is
-	// plainly unfinished.
-	return fmt.Errorf("scenario runner not wired yet: %d scenario(s) discovered (%v), daemon=%s",
-		len(names), names, opts.daemonBin)
+	// Every selected scenario is validated before the first one runs. A typo in
+	// the second file must not be discovered after the first has spawned a
+	// daemon and spent thirty seconds of somebody's time.
+	reg := steps.Default()
+	for _, sc := range selected {
+		if err := sc.Validate(reg); err != nil {
+			return err
+		}
+	}
+
+	// Ctrl-C cancels the run rather than killing it: the deferred teardown is
+	// what stops the daemon and removes its data directory, and skipping it
+	// leaves a process holding that directory behind.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var failed []string
+	for _, sc := range selected {
+		result := runScenario(ctx, opts.daemonBin, sc, reg)
+
+		textPath, jsonPath, werr := scenario.WriteArtifacts(opts.artifacts, result)
+		if werr != nil {
+			// Worth reporting but not worth losing the result over: the report
+			// is on stdout either way.
+			fmt.Fprintf(os.Stderr, "e2e: %v\n", werr)
+		}
+
+		if result.Failed() {
+			failed = append(failed, sc.Name)
+			// The whole report, on a failure: the operator running this binary
+			// by hand has no CI artifact browser to open.
+			fmt.Print(result.Format())
+		} else {
+			fmt.Printf("scenario %s — PASS (%d steps, %d events)\n",
+				result.Scenario, len(result.Steps), len(result.Events))
+		}
+		if textPath != "" {
+			fmt.Printf("  report %s\n  events %s\n", textPath, jsonPath)
+		}
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("interrupted after %s", sc.Name)
+		}
+	}
+
+	if len(failed) > 0 {
+		return fmt.Errorf("%d of %d scenario(s) failed: %s",
+			len(failed), len(selected), strings.Join(failed, ", "))
+	}
+	fmt.Printf("all %d scenario(s) passed\n", len(selected))
+	return nil
+}
+
+// runScenario brings up a World of its own for one scenario and runs it.
+//
+// A fresh World per scenario, not one shared: each gets its own data directory,
+// its own device identity and its own event log, so a scenario cannot pass
+// because of state an earlier one left behind.
+//
+// The servers and the daemon are started in two steps rather than through
+// harness.Setup, because Setup tears the World down on a failed start and the
+// event log goes with it. That log is the only thing that explains a daemon
+// which would not come up: its own stderr lines and its exit event are in
+// there. Keeping the World alive turns "start_daemon: timeout" into a report
+// with the daemon's last words in it.
+func runScenario(ctx context.Context, daemonBin string, sc scenario.Scenario, reg steps.Registry) eventlog.Result {
+	w, err := harness.SetupServers(harness.Config{DaemonBinary: daemonBin})
+	if err != nil {
+		// No World means no log and no artifact; this is the one failure that
+		// can only be an error string.
+		return eventlog.Result{
+			Scenario: sc.Name,
+			Steps: []eventlog.StepResult{{
+				Index: 1, Name: "setup_servers", Status: eventlog.StepFailed,
+				Err: err, ErrText: err.Error(),
+			}},
+		}
+	}
+	defer func() {
+		if terr := w.Teardown(context.WithoutCancel(ctx)); terr != nil {
+			fmt.Fprintf(os.Stderr, "e2e: teardown %s: %v\n", sc.Name, terr)
+		}
+	}()
+
+	if err := w.StartDaemon(ctx); err != nil {
+		return w.Log.Result(sc.Name, []eventlog.StepResult{{
+			Index: 1, Name: "start_daemon", Status: eventlog.StepFailed, Err: err,
+		}}, nil)
+	}
+	return scenario.Run(ctx, w, sc, reg)
 }
 
 func parseFlags() (options, bool, error) {
@@ -102,21 +197,18 @@ func parseFlags() (options, bool, error) {
 	return opts, false, nil
 }
 
-// discoverScenarios lists the scenario files, optionally filtered by a
-// substring of the file name.
-func discoverScenarios(dir, filter string) ([]string, error) {
-	entries, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
-	if err != nil {
-		return nil, fmt.Errorf("scan %s: %w", dir, err)
+// filter keeps the scenarios whose name contains the substring, which is the
+// same shape as `go test -run` without promising regexp semantics it does not
+// have.
+func filter(scenarios []scenario.Scenario, substring string) []scenario.Scenario {
+	if substring == "" {
+		return scenarios
 	}
-	var names []string
-	for _, path := range entries {
-		name := filepath.Base(path)
-		name = name[:len(name)-len(filepath.Ext(name))]
-		if filter != "" && !strings.Contains(name, filter) {
-			continue
+	out := make([]scenario.Scenario, 0, len(scenarios))
+	for _, sc := range scenarios {
+		if strings.Contains(sc.Name, substring) {
+			out = append(out, sc)
 		}
-		names = append(names, name)
 	}
-	return names, nil
+	return out
 }

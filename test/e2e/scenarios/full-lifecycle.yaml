@@ -1,0 +1,97 @@
+# The happy path, end to end: an unprovisioned daemon is told to provision, gets
+# a certificate from the fake Provisioning API, completes the cloud handshake
+# over mutual TLS, and then serves an app through its REST API in both
+# directions.
+#
+# Read it as the state machine it asserts: every expectation consumes one event
+# and the cursor only moves forward, so the order the steps are written in IS
+# the ordering assertion. Nothing here waits on a clock.
+name: full-lifecycle
+strict_events: true
+
+tolerate:
+  # The daemon resends Thing.begin every 2s while it waits for Thing.update, so
+  # a reply injected a few steps later legitimately leaves extra publishes
+  # behind. Tolerated rather than asserted, because how many arrive depends on
+  # how fast the machine running the suite is.
+  - { source: mqtt, cmd: Thing.begin }
+  # The app's own write comes back on the app's own subscription: runOutbound
+  # stores the value (which fans out to SSE subscribers) BEFORE publishing it to
+  # the broker. Which of the two reaches the harness first is a race between an
+  # HTTP stream and an MQTT round trip, so claiming both in a fixed order would
+  # be flaky by construction. The MQTT publish is the fact this scenario is
+  # about and is asserted; the echo is forgiven here, narrowly -- this entry
+  # matches only the value the app wrote.
+  - { source: sse, event: update, variable: temp, value: 42 }
+
+steps:
+  # ── the daemon comes up unprovisioned and waits to be told ────────────────
+  # With no credentials on disk the daemon settles in Provisioning and does
+  # nothing until an app asks: that idleness is the contract App Lab relies on.
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+
+  # The uhwid is the one value only the daemon knows, and the next step needs
+  # it: a CSR subject carrying anything but this CN is the bug the fake CA
+  # reflects RDNs to catch.
+  - app_get_identity: {}
+  - app_start_provisioning: {}
+
+  # ── provisioning ──────────────────────────────────────────────────────────
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+
+  # ── the cloud handshake ───────────────────────────────────────────────────
+  # No state wait between provisioning and here, deliberately. Status polls are
+  # recorded on change, so the poll that first shows "provisioned" can land
+  # AFTER the connect it was meant to precede; consuming it would move the
+  # shared cursor past the connect and the next step would wait forever for an
+  # event already behind it. The connect is the better proof anyway:
+  # client_id_matches_cert_cn can only hold if the certificate was issued,
+  # activated and accepted.
+  - expect_mqtt_connect:
+      client_id_matches_cert_cn: true
+      clean_session: false
+      keepalive: 30
+      timeout: 60s
+  - expect_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_publish: { cmd: Device.begin }
+  # Deterministic only under -tags mock, which returns a fixed {wifi, SSIDTEST1}
+  # instead of shelling out to the host's network tools.
+  - expect_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - expect_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  # The identifiers are constrained here rather than in a step of their own:
+  # one status poll carries the state AND both ids, so this single expectation
+  # also asserts the daemon agrees with the harness about who it is and what it
+  # is attached to.
+  - await_cloud_state:
+      state: Steady
+      thing_id: "{thing_id}"
+      device_id: "{device_id}"
+      timeout: 30s
+
+  # ── the app role, both directions ─────────────────────────────────────────
+  # Subscribing after Steady is what makes the first frame deterministic: while
+  # the cloud is not steady the daemon answers thing_unavailable instead.
+  - app_sse_subscribe: { variable: temp }
+  - expect_sse: { event: lastvalue, variable: temp, value: 21.5, last_value: true }
+
+  # cloud → app
+  - cloud_publish_prop: { variable: temp, value: 30.0 }
+  - expect_sse: { event: update, variable: temp, value: 30.0 }
+
+  # app → cloud
+  - app_put: { variable: temp, value: 42.0 }
+  - expect_prop_publish:
+      topic: "/a/t/{thing_id}/e/o"
+      variable: temp
+      value: 42.0
