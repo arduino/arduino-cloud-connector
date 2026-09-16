@@ -27,3 +27,12 @@ jobs:
       - name: Run tests
         run: go test -v -race ./...
 
+      # The E2E harness is a separate Go module, so the command above does not
+      # reach it. These are the harness's own unit tests -- what keeps the thing
+      # that judges the daemon honest -- and they spawn no daemon, so they
+      # belong on every PR. -short is what leaves out the scenario driver: that
+      # one spawns the binary and runs in the E2E workflow.
+      - name: Run E2E harness unit tests
+        working-directory: test/e2e
+        run: go test -short -race ./...
+

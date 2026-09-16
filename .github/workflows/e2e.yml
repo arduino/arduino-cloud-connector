@@ -1,0 +1,76 @@
+name: E2E
+
+# Runs the black-box scenarios under test/e2e: the harness stands up a fake
+# Provisioning API, a connectivity probe and an MQTT broker with mutual TLS,
+# spawns the real daemon binary against all three, and asserts on what crosses
+# those boundaries.
+#
+# It is a job of its own rather than a step in Test because it spawns a daemon
+# and binds four listeners, which is minutes rather than seconds. The harness's
+# own unit tests spawn nothing and run in Test on every PR.
+#
+# DELIBERATELY NOT A REQUIRED CHECK yet. A failure here shows up red on the pull
+# request but does not block the merge, and it should stay that way until the
+# suite has a stability record: a new E2E gate that blocks merges from day one
+# is a gate somebody disables. Add it to the branch protection rules once it has
+# been green for a few weeks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  scenarios:
+    name: E2E scenarios
+    runs-on: ubuntu-latest
+    # Every step in a scenario has its own timeout and `go test -timeout` bounds
+    # the run, so this is only a backstop against a job that hangs before the
+    # tests start.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      # Built through the task so the binary under test is the same one a
+      # developer builds locally. The `mock` build tag is not optional: it is
+      # what makes the UHWID readable off a board and DeviceNetConfig
+      # deterministic, without which the handshake the scenarios assert on does
+      # not happen on a runner at all.
+      - name: Build the daemon under test
+        run: |
+          go tool \
+            github.com/go-task/task/v3/cmd/task \
+              build:mock
+
+      # This runs the harness's own unit tests too. The overlap with the Test
+      # workflow is deliberate: this job has to be runnable on its own to
+      # reproduce a scenario failure.
+      - name: Run the scenarios
+        working-directory: test/e2e
+        env:
+          E2E_DAEMON_BIN: ../../build/arduino-cloud-connector-mock
+        run: go test -v -timeout 15m ./...
+
+      # The console is not where a failure is read. _artifacts/<scenario>.txt
+      # places the failed expectation at the instant it was waiting, prints
+      # which fields differed and interleaves every source on one timeline;
+      # the .json beside it is the same run as data.
+      - name: Upload the timelines
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-timelines
+          path: test/e2e/_artifacts/
