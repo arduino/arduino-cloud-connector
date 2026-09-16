@@ -140,18 +140,18 @@ func TestExpectationMatchesOnAttributes(t *testing.T) {
 		"lib_version": "0.0.0-e2e",
 	}, nil)
 
-	sc, cursor, err := run(t, w, "expect_publish",
+	sc, cursor, err := run(t, w, "expect_mqtt_publish",
 		"{cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 2s}", 0)
 	if err != nil {
-		t.Fatalf("expect_publish: %v", err)
+		t.Fatalf("expect_mqtt_publish: %v", err)
 	}
 	if cursor != 1 {
 		t.Errorf("cursor = %d, want 1 (just past the matched event)", cursor)
 	}
 	// The consuming step is recorded, which is what annotates the timeline and
 	// what the strict sweep subtracts.
-	if step, ok := w.Log.ConsumedBy(1); !ok || step != "expect_publish" {
-		t.Errorf("event 1 consumed by %q (%t), want expect_publish", step, ok)
+	if step, ok := w.Log.ConsumedBy(1); !ok || step != "expect_mqtt_publish" {
+		t.Errorf("event 1 consumed by %q (%t), want expect_mqtt_publish", step, ok)
 	}
 	if !strings.Contains(sc.Detail, "Device.begin") {
 		t.Errorf("detail = %q, want it to name the command", sc.Detail)
@@ -171,7 +171,7 @@ func TestExpectationTimesOutWithNearMisses(t *testing.T) {
 		"lib_version": "0.0.0-dev",
 	}, nil)
 
-	_, cursor, err := run(t, w, "expect_publish",
+	_, cursor, err := run(t, w, "expect_mqtt_publish",
 		"{cmd: Device.begin, lib_version: 0.0.0-e2e, timeout: 100ms}", 0)
 	if err == nil {
 		t.Fatal("the expectation passed against a different lib_version")
@@ -200,8 +200,8 @@ func TestStateWaitsRenameTheParameter(t *testing.T) {
 
 	for _, tc := range []struct{ step, y string }{
 		{"await_daemon_state", "{state: Provisioning, timeout: 2s}"},
-		{"await_cloud_state", "{state: Steady, timeout: 2s}"},
-		{"await_provisioning_state", "{state: unprovisioned, timeout: 2s}"},
+		{"await_daemon_cloud_state", "{state: Steady, timeout: 2s}"},
+		{"await_daemon_provisioning_state", "{state: unprovisioned, timeout: 2s}"},
 	} {
 		if _, _, err := run(t, w, tc.step, tc.y, 0); err != nil {
 			t.Errorf("%s: %v", tc.step, err)
@@ -219,11 +219,11 @@ func TestTheCursorPreventsRematching(t *testing.T) {
 		}, nil)
 	}
 
-	_, first, err := run(t, w, "expect_subscribe", "{timeout: 2s}", 0)
+	_, first, err := run(t, w, "expect_mqtt_subscribe", "{timeout: 2s}", 0)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	_, second, err := run(t, w, "expect_subscribe", "{timeout: 2s}", first)
+	_, second, err := run(t, w, "expect_mqtt_subscribe", "{timeout: 2s}", first)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -266,11 +266,11 @@ func TestCloudPublish(t *testing.T) {
 	}
 }
 
-func TestCloudPublishProp(t *testing.T) {
+func TestCloudPublishVar(t *testing.T) {
 	w, _ := newWorld(t)
 
-	if _, _, err := run(t, w, "cloud_publish_prop", "{variable: temp, value: 30.0}", 0); err != nil {
-		t.Fatalf("cloud_publish_prop: %v", err)
+	if _, _, err := run(t, w, "cloud_publish_var", "{variable: temp, value: 30.0}", 0); err != nil {
+		t.Fatalf("cloud_publish_var: %v", err)
 	}
 	ev, _ := awaitEventForTest(t, w, 0, eventlog.Predicate{
 		Label: "property downlink",
@@ -283,8 +283,8 @@ func TestCloudPublishProp(t *testing.T) {
 		t.Errorf("topic = %v, want the thing inbound topic", got)
 	}
 
-	if _, _, err := run(t, w, "cloud_publish_prop", "{}", 0); err == nil {
-		t.Error("cloud_publish_prop with no values succeeded")
+	if _, _, err := run(t, w, "cloud_publish_var", "{}", 0); err == nil {
+		t.Error("cloud_publish_var with no values succeeded")
 	}
 }
 
@@ -295,11 +295,11 @@ func TestAppActions(t *testing.T) {
 	if _, _, err := run(t, w, "app_post", "{path: /v1/provisioning/start}", 0); err != nil {
 		t.Fatalf("app_post: %v", err)
 	}
-	if _, _, err := run(t, w, "app_put", "{variable: temp, value: 42.0}", 0); err != nil {
-		t.Fatalf("app_put: %v", err)
+	if _, _, err := run(t, w, "app_var_write", "{variable: temp, value: 42.0}", 0); err != nil {
+		t.Fatalf("app_var_write: %v", err)
 	}
-	if _, _, err := run(t, w, "app_sse_subscribe", "{variable: temp}", 0); err != nil {
-		t.Fatalf("app_sse_subscribe: %v", err)
+	if _, _, err := run(t, w, "app_var_subscribe", "{variable: temp}", 0); err != nil {
+		t.Fatalf("app_var_subscribe: %v", err)
 	}
 	// The subscription is open before the step returns, so the frame the daemon
 	// sends immediately is already on the timeline.
@@ -326,15 +326,15 @@ func TestAppActions(t *testing.T) {
 // The uhwid is the one value only the daemon knows, and a scenario needs it to
 // assert on the CSR subject. Learning it into the bag is the whole point of
 // the step.
-func TestAppGetIdentityLearnsTheUHWID(t *testing.T) {
+func TestGetDeviceIdentityLearnsTheUHWID(t *testing.T) {
 	w, calls := newWorld(t)
 
 	if _, ok := w.Vars.Get("uhwid"); ok {
 		t.Fatal("the bag already holds a uhwid, so this test would prove nothing")
 	}
-	sc, _, err := run(t, w, "app_get_identity", "{}", 0)
+	sc, _, err := run(t, w, "get_device_identity", "{}", 0)
 	if err != nil {
-		t.Fatalf("app_get_identity: %v", err)
+		t.Fatalf("get_device_identity: %v", err)
 	}
 	if got := w.Vars.MustGet("uhwid"); got != "3a7bd3e2360a3d29" {
 		t.Errorf("bag[uhwid] = %q, want the daemon value", got)
@@ -366,20 +366,20 @@ func TestAppGetIdentityLearnsTheUHWID(t *testing.T) {
 	}
 }
 
-func TestAppStartProvisioning(t *testing.T) {
+func TestStartProvisioning(t *testing.T) {
 	w, calls := newWorld(t)
 
-	if _, _, err := run(t, w, "app_start_provisioning", "{}", 0); err != nil {
-		t.Fatalf("app_start_provisioning: %v", err)
+	if _, _, err := run(t, w, "start_provisioning", "{}", 0); err != nil {
+		t.Fatalf("start_provisioning: %v", err)
 	}
 	// No organization: the body is omitted entirely, as the API allows.
 	if got := *calls; len(got) != 1 || got[0] != "start:" {
 		t.Errorf("the daemon saw %v, want a start with no body", got)
 	}
 
-	sc, _, err := run(t, w, "app_start_provisioning", "{organization_id: org-1}", 0)
+	sc, _, err := run(t, w, "start_provisioning", "{organization_id: org-1}", 0)
 	if err != nil {
-		t.Fatalf("app_start_provisioning: %v", err)
+		t.Fatalf("start_provisioning: %v", err)
 	}
 	if got := (*calls)[1]; !strings.Contains(got, `"organization_id":"org-1"`) {
 		t.Errorf("the daemon saw %q, want the organization id", got)
@@ -394,11 +394,11 @@ func TestAppStartProvisioning(t *testing.T) {
 	}
 }
 
-// app_get_status exists for the bag, not for the timeline: the identifiers it
+// get_daemon_status exists for the bag, not for the timeline: the identifiers it
 // learns must come from the daemon and must beat what Setup seeded from the
 // fake Provisioning API. The stub therefore answers with ids that differ from
 // the seeds, which is the only way to tell the two apart.
-func TestAppGetStatusLearnsTheIdentifiersFromTheDaemon(t *testing.T) {
+func TestGetDaemonStatusLearnsTheIdentifiersFromTheDaemon(t *testing.T) {
 	w, calls := newWorld(t)
 
 	seededDevice := w.Vars.MustGet("device_id")
@@ -410,9 +410,9 @@ func TestAppGetStatusLearnsTheIdentifiersFromTheDaemon(t *testing.T) {
 		t.Fatal("the bag already holds an organization_id")
 	}
 
-	sc, next, err := run(t, w, "app_get_status", "{require: [device_id, thing_id]}", 0)
+	sc, next, err := run(t, w, "get_daemon_status", "{require: [device_id, thing_id]}", 0)
 	if err != nil {
-		t.Fatalf("app_get_status: %v", err)
+		t.Fatalf("get_daemon_status: %v", err)
 	}
 	if next != 0 {
 		t.Errorf("cursor moved to %d: an action must leave it where it was", next)
@@ -452,7 +452,7 @@ func TestAppGetStatusLearnsTheIdentifiersFromTheDaemon(t *testing.T) {
 
 // The re-provisioning sequence, which is the case the step was added for: no
 // device id yet, then one, then a different one.
-func TestAppGetStatusRelearnsTheDeviceID(t *testing.T) {
+func TestGetDaemonStatusRelearnsTheDeviceID(t *testing.T) {
 	w, _ := newWorld(t)
 	seeded := w.Vars.MustGet("device_id")
 
@@ -471,8 +471,8 @@ func TestAppGetStatusRelearnsTheDeviceID(t *testing.T) {
 	// must not be learned: writing "" over the seed would make cloud_publish
 	// address "/a/d//c/dw" -- a topic that never matches, reported as a failed
 	// expectation instead of as the step that blanked the value.
-	if _, _, err := run(t, w, "app_get_status", "{}", 0); err != nil {
-		t.Fatalf("app_get_status on an unprovisioned daemon: %v", err)
+	if _, _, err := run(t, w, "get_daemon_status", "{}", 0); err != nil {
+		t.Fatalf("get_daemon_status on an unprovisioned daemon: %v", err)
 	}
 	if got := w.Vars.MustGet("device_id"); got != seeded {
 		t.Fatalf("bag[device_id] = %q after an unprovisioned status, want the seed %q", got, seeded)
@@ -480,20 +480,20 @@ func TestAppGetStatusRelearnsTheDeviceID(t *testing.T) {
 
 	// require is what turns that silence into a failure at the step, for a
 	// scenario that has reached the point where the id must exist.
-	if _, _, err := run(t, w, "app_get_status", "{require: [device_id]}", 0); err == nil {
-		t.Error("app_get_status passed with no device id, want an error")
+	if _, _, err := run(t, w, "get_daemon_status", "{require: [device_id]}", 0); err == nil {
+		t.Error("get_daemon_status passed with no device id, want an error")
 	}
 
-	if _, _, err := run(t, w, "app_get_status", "{require: [device_id]}", 0); err != nil {
-		t.Fatalf("app_get_status after provisioning: %v", err)
+	if _, _, err := run(t, w, "get_daemon_status", "{require: [device_id]}", 0); err != nil {
+		t.Fatalf("get_daemon_status after provisioning: %v", err)
 	}
 	if got := w.Vars.MustGet("device_id"); got != "1111aaaa-0000-4000-8000-000000000001" {
 		t.Fatalf("bag[device_id] = %q, want the first provisioned id", got)
 	}
 
-	sc, _, err := run(t, w, "app_get_status", "{}", 0)
+	sc, _, err := run(t, w, "get_daemon_status", "{}", 0)
 	if err != nil {
-		t.Fatalf("app_get_status after re-provisioning: %v", err)
+		t.Fatalf("get_daemon_status after re-provisioning: %v", err)
 	}
 	if got := w.Vars.MustGet("device_id"); got != "2222bbbb-0000-4000-8000-000000000002" {
 		t.Errorf("bag[device_id] = %q, want the re-provisioned id", got)
@@ -514,10 +514,10 @@ func TestAppGetStatusRelearnsTheDeviceID(t *testing.T) {
 // A require naming a field the status does not carry is the scenario's
 // mistake, and the message has to say so: "the daemon reports no uhwid" would
 // send a reader looking at the daemon for a typo in the YAML.
-func TestAppGetStatusRejectsAnUnknownRequireField(t *testing.T) {
+func TestGetDaemonStatusRejectsAnUnknownRequireField(t *testing.T) {
 	w, calls := newWorld(t)
 
-	_, _, err := run(t, w, "app_get_status", "{require: [uhwid]}", 0)
+	_, _, err := run(t, w, "get_daemon_status", "{require: [uhwid]}", 0)
 	if err == nil {
 		t.Fatal("the step passed, want an error")
 	}
@@ -564,14 +564,14 @@ func TestActionsValidateTheirParameters(t *testing.T) {
 	w, _ := newWorld(t)
 	tests := []struct{ step, y string }{
 		{"app_post", "{}"},
-		{"app_get_identity", "{uhwid: x}"},
-		{"app_get_status", "{device_id: x}"},
-		{"app_start_provisioning", "{organization: x}"},
-		{"app_put", "{value: 1}"},
-		{"app_sse_subscribe", "{}"},
+		{"get_device_identity", "{uhwid: x}"},
+		{"get_daemon_status", "{device_id: x}"},
+		{"start_provisioning", "{organization: x}"},
+		{"app_var_write", "{value: 1}"},
+		{"app_var_subscribe", "{}"},
 		// A misspelled parameter must fail rather than be ignored: the step
 		// would otherwise quietly do something else.
-		{"app_put", "{variable: temp, valu: 1}"},
+		{"app_var_write", "{variable: temp, valu: 1}"},
 		{"cloud_publish", "{cmd: Thing.update, thingid: x}"},
 		{"stop_daemon", "{}"}, // no daemon in this World
 	}
@@ -649,13 +649,13 @@ func TestBuildPredicate(t *testing.T) {
 func TestDefaultRegistryCoversTheScenarioVocabulary(t *testing.T) {
 	reg := Default()
 	for _, name := range []string{
-		"await_daemon_state", "await_cloud_state", "await_provisioning_state",
-		"expect_api_call", "expect_mqtt_connect", "expect_disconnect",
-		"expect_subscribe", "expect_unsubscribe", "expect_publish",
-		"expect_prop_publish", "expect_sse", "expect_tls_error", "expect_daemon_exit",
-		"app_get_identity", "app_get_status", "app_start_provisioning",
-		"app_post", "app_put", "app_sse_subscribe",
-		"cloud_publish", "cloud_publish_prop", "stop_daemon",
+		"await_daemon_state", "await_daemon_cloud_state", "await_daemon_provisioning_state",
+		"expect_api_call", "expect_mqtt_connect", "expect_mqtt_disconnect",
+		"expect_mqtt_subscribe", "expect_mqtt_unsubscribe", "expect_mqtt_publish",
+		"expect_var_publish", "expect_app_event", "expect_tls_error", "expect_daemon_exit",
+		"get_device_identity", "get_daemon_status", "start_provisioning",
+		"app_post", "app_var_write", "app_var_subscribe",
+		"cloud_publish", "cloud_publish_var", "stop_daemon",
 	} {
 		if _, ok := reg[name]; !ok {
 			t.Errorf("the registry has no %q", name)

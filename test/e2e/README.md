@@ -83,7 +83,7 @@ fakes:
     csr: [{ respond: status, status: 503 }, { respond: issue_cert }]
 steps:
   - await_daemon_state: { state: Provisioning }
-  - expect_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: Device.begin }
 ```
 
 Unknown keys are an error, both at the top level and inside a step's
@@ -132,14 +132,14 @@ their attributes are documented.
 | `provisioning_api` | `http_request` | **yes** | see [`expect_api_call`](#expect_api_call) |
 | `provisioning_api` | `harness_note` | **yes** | `error` — the fake API's own HTTP server failed. A harness bug, not the daemon's |
 | `mqtt` | `mqtt_connect` | **yes** | see [`expect_mqtt_connect`](#expect_mqtt_connect) |
-| `mqtt` | `mqtt_disconnect` | **yes** | see [`expect_disconnect`](#expect_disconnect) |
-| `mqtt` | `mqtt_subscribe` | **yes** | see [`expect_subscribe`](#expect_subscribe) |
-| `mqtt` | `mqtt_unsubscribe` | **yes** | see [`expect_unsubscribe`](#expect_unsubscribe) |
-| `mqtt` | `mqtt_publish` | **yes** | see [`expect_publish`](#expect_publish) |
+| `mqtt` | `mqtt_disconnect` | **yes** | see [`expect_mqtt_disconnect`](#expect_mqtt_disconnect) |
+| `mqtt` | `mqtt_subscribe` | **yes** | see [`expect_mqtt_subscribe`](#expect_mqtt_subscribe) |
+| `mqtt` | `mqtt_unsubscribe` | **yes** | see [`expect_mqtt_unsubscribe`](#expect_mqtt_unsubscribe) |
+| `mqtt` | `mqtt_publish` | **yes** | see [`expect_mqtt_publish`](#expect_mqtt_publish) |
 | `mqtt` | `mqtt_tls_error` | **yes** | see [`expect_tls_error`](#expect_tls_error) |
 | `mqtt` | `mqtt_keepalive` | no | `client_id` |
-| `mqtt` | `harness_note` | no | the harness's own downlink injections, from `cloud_publish` and `cloud_publish_prop` |
-| `sse` | `sse_frame` | **yes** | see [`expect_sse`](#expect_sse) |
+| `mqtt` | `harness_note` | no | the harness's own downlink injections, from `cloud_publish` and `cloud_publish_var` |
+| `sse` | `sse_frame` | **yes** | see [`expect_app_event`](#expect_app_event) |
 | `sse` | `harness_note` | **yes** | `action: sse_closed` with `variable` and possibly `error`, or `note: unrecognised SSE line` with `line` |
 | `daemon_process` | `process_exit` | **yes** | see [`expect_daemon_exit`](#expect_daemon_exit) |
 | `daemon_process` | `harness_note` | no | `action`: `started` (with `binary`, `pid`), `sigterm`, `sigterm_unsupported` |
@@ -166,7 +166,7 @@ event** and constrains it to that value. Those attribute names are exactly the
 ones documented for each step: the last column of the catalogue says where to
 find them.
 
-So to forgive the retried `Thing.begin`, look up [`expect_publish`](#expect_publish),
+So to forgive the retried `Thing.begin`, look up [`expect_mqtt_publish`](#expect_mqtt_publish),
 find that a command publish carries `cmd`, and write it:
 
 ```yaml
@@ -237,8 +237,8 @@ parameters.
 
 ```yaml
 steps:
-  - app_get_identity: {}
-  - expect_publish: { cmd: Device.begin }
+  - get_device_identity: {}
+  - expect_mqtt_publish: { cmd: Device.begin }
 ```
 
 Steps come in two kinds:
@@ -261,26 +261,26 @@ with a timeout.
 | **Expectations** | |
 | [`expect_api_call`](#expect_api_call) | waits for a request to the fake Provisioning API |
 | [`expect_mqtt_connect`](#expect_mqtt_connect) | waits for the daemon to connect to the broker |
-| [`expect_disconnect`](#expect_disconnect) | waits for the daemon to disconnect from the broker |
-| [`expect_subscribe`](#expect_subscribe) | waits for a subscription to one topic |
-| [`expect_unsubscribe`](#expect_unsubscribe) | waits for an unsubscription from one topic |
-| [`expect_publish`](#expect_publish) | waits for a message the daemon publishes |
-| [`expect_prop_publish`](#expect_prop_publish) | same as above, phrased for property values |
+| [`expect_mqtt_disconnect`](#expect_mqtt_disconnect) | waits for the daemon to disconnect from the broker |
+| [`expect_mqtt_subscribe`](#expect_mqtt_subscribe) | waits for a subscription to one topic |
+| [`expect_mqtt_unsubscribe`](#expect_mqtt_unsubscribe) | waits for an unsubscription from one topic |
+| [`expect_mqtt_publish`](#expect_mqtt_publish) | waits for a message the daemon publishes |
+| [`expect_var_publish`](#expect_var_publish) | same as above, phrased for property values |
 | [`expect_tls_error`](#expect_tls_error) | waits for the broker to refuse the client certificate |
-| [`expect_sse`](#expect_sse) | waits for one frame on a subscribed variable stream |
+| [`expect_app_event`](#expect_app_event) | waits for one frame on a subscribed variable stream |
 | [`expect_daemon_exit`](#expect_daemon_exit) | waits for the daemon process to terminate |
 | [`await_daemon_state`](#await_daemon_state) | waits for a daemon state |
-| [`await_cloud_state`](#await_cloud_state) | waits for a cloud FSM state |
-| [`await_provisioning_state`](#await_provisioning_state) | waits for a provisioning state |
+| [`await_daemon_cloud_state`](#await_daemon_cloud_state) | waits for a cloud FSM state |
+| [`await_daemon_provisioning_state`](#await_daemon_provisioning_state) | waits for a provisioning state |
 | **Actions** | |
-| [`app_get_identity`](#app_get_identity) | reads the board identity and learns `uhwid` |
-| [`app_get_status`](#app_get_status) | reads the daemon status and re-learns the identifiers |
-| [`app_start_provisioning`](#app_start_provisioning) | asks the daemon to provision |
-| [`app_put`](#app_put) | writes a variable as an app would |
-| [`app_sse_subscribe`](#app_sse_subscribe) | opens a variable's event stream |
+| [`get_device_identity`](#get_device_identity) | reads the board identity and learns `uhwid` |
+| [`get_daemon_status`](#get_daemon_status) | reads the daemon status and re-learns the identifiers |
+| [`start_provisioning`](#start_provisioning) | asks the daemon to provision |
+| [`app_var_write`](#app_var_write) | writes a variable as an app would |
+| [`app_var_subscribe`](#app_var_subscribe) | opens a variable's event stream |
 | [`app_post`](#app_post) | POSTs to any REST endpoint (escape hatch) |
 | [`cloud_publish`](#cloud_publish) | sends a command as the cloud |
-| [`cloud_publish_prop`](#cloud_publish_prop) | changes a property value as the cloud |
+| [`cloud_publish_var`](#cloud_publish_var) | changes a property value as the cloud |
 | [`stop_daemon`](#stop_daemon) | shuts the daemon down and waits for it |
 
 ### Parameters are validators
@@ -296,7 +296,7 @@ daemon really announced that library version, on that topic, at that QoS — any
 other combination does not satisfy the step:
 
 ```yaml
-- expect_publish:
+- expect_mqtt_publish:
     cmd: Device.begin
     lib_version: 0.0.0-e2e-mock
     topic: "/a/d/{device_id}/c/up"
@@ -309,7 +309,7 @@ the scenario. Every step after it is skipped, and the report names the field
 that differed, quoting the event that came closest:
 
 ```
- 9 ✗  expect_publish   mqtt_publish mqtt cmd=DeviceNetConfig network_type=wifi ssid=WRONG timeout 15s
+ 9 ✗  expect_mqtt_publish   mqtt_publish mqtt cmd=DeviceNetConfig network_type=wifi ssid=WRONG timeout 15s
 
     4/5 constraints satisfied — differs:
         attrs.ssid             want "WRONG"           got "SSIDTEST1"
@@ -388,7 +388,7 @@ already succeeded by the time this event exists.
     protocol_version: 4
 ```
 
-### `expect_disconnect`
+### `expect_mqtt_disconnect`
 
 Waits for the daemon to disconnect from the broker.
 
@@ -400,13 +400,13 @@ Waits for the daemon to disconnect from the broker.
 
 ```yaml
 # after a stop_daemon, or when testing a reconnect
-- expect_disconnect: { client_id: "{device_id}" }
+- expect_mqtt_disconnect: { client_id: "{device_id}" }
 
 # the session must survive the disconnect, so it can resume
-- expect_disconnect: { expire: false }
+- expect_mqtt_disconnect: { expire: false }
 ```
 
-### `expect_subscribe`
+### `expect_mqtt_subscribe`
 
 Waits for a subscription. One event per topic filter, even when a single
 SUBSCRIBE packet carries several.
@@ -420,13 +420,13 @@ SUBSCRIBE packet carries several.
 
 ```yaml
 # the command channel, subscribed before the daemon announces itself
-- expect_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+- expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
 
 # the property channel, only possible once a thing_id is known
-- expect_subscribe: { topic: "/a/t/{thing_id}/e/i", qos: 1, reason_code: 1 }
+- expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i", qos: 1, reason_code: 1 }
 ```
 
-### `expect_unsubscribe`
+### `expect_mqtt_unsubscribe`
 
 Waits for an unsubscription.
 
@@ -437,10 +437,10 @@ Waits for an unsubscription.
 
 ```yaml
 # what the daemon does on Thing.detach
-- expect_unsubscribe: { topic: "/a/t/{thing_id}/e/i" }
+- expect_mqtt_unsubscribe: { topic: "/a/t/{thing_id}/e/i" }
 ```
 
-### `expect_publish`
+### `expect_mqtt_publish`
 
 Waits for a message the daemon publishes. Always available:
 
@@ -486,33 +486,33 @@ On a **property** topic (`/e/o`, `/e/i`) the SenML payload is decoded instead:
 
 ```yaml
 # the daemon announcing itself
-- expect_publish: { cmd: Device.begin }
+- expect_mqtt_publish: { cmd: Device.begin }
 
 # the first Thing.begin asks for a thing: the empty id is the assertion
-- expect_publish: { cmd: Thing.begin, thing_id: "" }
+- expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
 
 # deterministic only under -tags mock
-- expect_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+- expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
 
 # a specific version, on a specific topic
-- expect_publish:
+- expect_mqtt_publish:
     cmd: Device.begin
     lib_version: 0.0.0-e2e-mock
     topic: "/a/d/{device_id}/c/up"
     qos: 1
 ```
 
-### `expect_prop_publish`
+### `expect_var_publish`
 
-Identical to `expect_publish` — same event, same parameters. The separate name
+Identical to `expect_mqtt_publish` — same event, same parameters. The separate name
 exists because it reads better next to a property topic.
 
 ```yaml
 # a value the app wrote, on its way to the cloud
-- expect_prop_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+- expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
 
 # a batch: assert the count and each value by name
-- expect_prop_publish:
+- expect_var_publish:
     topic: "/a/t/{thing_id}/e/o"
     values: 2
     value.temp: 42.0
@@ -537,9 +537,9 @@ not degrade into a timeout with no explanation.
 - expect_tls_error: { cert_cn: "{device_id}", timeout: 60s }
 ```
 
-### `expect_sse`
+### `expect_app_event`
 
-Waits for one frame on a variable stream opened by `app_sse_subscribe`.
+Waits for one frame on a variable stream opened by `app_var_subscribe`.
 
 | Parameter | Meaning | Values |
 |---|---|---|
@@ -554,21 +554,21 @@ Waits for one frame on a variable stream opened by `app_sse_subscribe`.
 The **first** frame on a stream is always a sync frame, and which one depends
 on the daemon's state: `thing_unavailable` while the cloud is not steady,
 `lastvalue` when the variable has a cloud value, `lastvalue_missing` when it
-does not. Subscribe after `await_cloud_state: { state: Steady }` if you want it
+does not. Subscribe after `await_daemon_cloud_state: { state: Steady }` if you want it
 to be deterministic. Every later change is `update`.
 
 ```yaml
 # the sync frame, when the variable already has a cloud value
-- expect_sse: { event: lastvalue, variable: temp, value: 21.5, last_value: true }
+- expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true }
 
 # a live change pushed by the cloud
-- expect_sse: { event: update, variable: temp, value: 30.0 }
+- expect_app_event: { event: update, variable: temp, value: 30.0 }
 
 # subscribing before the cloud is steady gets this instead
-- expect_sse: { event: thing_unavailable, variable: temp }
+- expect_app_event: { event: thing_unavailable, variable: temp }
 
 # a variable the cloud has never had a value for
-- expect_sse: { event: lastvalue_missing, variable: humidity }
+- expect_app_event: { event: lastvalue_missing, variable: humidity }
 ```
 
 ### `expect_daemon_exit`
@@ -615,7 +615,7 @@ One poll carries all of these at once, so a single step can assert the state
 - await_daemon_state: { state: Run, device_id: "{device_id}", timeout: 30s }
 ```
 
-### `await_cloud_state`
+### `await_daemon_cloud_state`
 
 The same poll, with `state` reading the cloud FSM state instead
 (`Disconnected`, `Reconnecting`, `Connecting`, `AnnouncingDevice`,
@@ -624,28 +624,28 @@ still applies.
 
 ```yaml
 # the handshake finished, and the daemon agrees with the harness on both ids
-- await_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}" }
+- await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}" }
 
 # after cutting the broker, the daemon must come back by itself
-- await_cloud_state: { state: Reconnecting, timeout: 60s }
+- await_daemon_cloud_state: { state: Reconnecting, timeout: 60s }
 ```
 
-### `await_provisioning_state`
+### `await_daemon_provisioning_state`
 
 The same poll, with `state` reading the provisioning state — **lower case**.
 Every other parameter above still applies.
 
 ```yaml
 # the credentials are on disk and the certificate is activated
-- await_provisioning_state: { state: provisioned, timeout: 30s }
+- await_daemon_provisioning_state: { state: provisioned, timeout: 30s }
 
 # it ran out of its retry window: pair this with a `fakes` queue of failures
-- await_provisioning_state: { state: error, timeout: 60s }
+- await_daemon_provisioning_state: { state: error, timeout: 60s }
 ```
 
 ---
 
-### `app_get_identity`
+### `get_device_identity`
 
 Reads `GET /v1/identity` and puts `uhwid` in the bag — the one value only the
 daemon knows, and what lets a later step assert the CSR subject.
@@ -656,11 +656,11 @@ with an opaque 401 instead of naming the cause. The token is deliberately kept
 out of the bag, because the bag is written to the artifact.
 
 ```yaml
-- app_get_identity: {}
+- get_device_identity: {}
 - expect_api_call: { endpoint: provision/csr, csr_subject: "CN={uhwid}" }
 ```
 
-### `app_get_status`
+### `get_daemon_status`
 
 Reads `GET /v1/status` and re-learns `device_id`, `thing_id` and
 `organization_id` from the daemon, replacing what the harness seeded. Its
@@ -673,14 +673,14 @@ reason to exist is re-provisioning, where the daemon takes a **new**
 
 ```yaml
 # after a second provisioning: pick up the new identity and use it
-- app_get_status: { require: [device_id] }
-- expect_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+- get_daemon_status: { require: [device_id] }
+- expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
 
 # just record what the daemon reports, requiring nothing
-- app_get_status: {}
+- get_daemon_status: {}
 ```
 
-### `app_start_provisioning`
+### `start_provisioning`
 
 POSTs `/v1/provisioning/start`, which is what App Lab does and the only way out
 of the `Provisioning` state. Expects 202; a 409 means one was already running,
@@ -692,13 +692,13 @@ which is a different failure from an unreachable daemon.
 
 ```yaml
 # the plain case
-- app_start_provisioning: {}
+- start_provisioning: {}
 
 # with an organization, which then becomes available as {organization_id}
-- app_start_provisioning: { organization_id: 6f1c2d3e-4567-89ab-cdef-0123456789ab }
+- start_provisioning: { organization_id: 6f1c2d3e-4567-89ab-cdef-0123456789ab }
 ```
 
-### `app_put`
+### `app_var_write`
 
 `PUT /v1/variables/{name}` — the app writing a variable.
 
@@ -711,17 +711,17 @@ The daemon answers 409 unless the cloud is `Steady`. Note that the write also
 comes back on the app's own stream as an `update` frame.
 
 ```yaml
-- app_put: { variable: temp, value: 42.0 }
-- expect_prop_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+- app_var_write: { variable: temp, value: 42.0 }
+- expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
 ```
 
 ```yaml
 # values do not have to be numbers
-- app_put: { variable: led, value: true }
-- app_put: { variable: label, value: "kitchen" }
+- app_var_write: { variable: led, value: true }
+- app_var_write: { variable: label, value: "kitchen" }
 ```
 
-### `app_sse_subscribe`
+### `app_var_subscribe`
 
 Opens `GET /v1/variables/{name}/events`. Returns once the response headers are
 in, so a following injection cannot race it; the stream stays open until the
@@ -732,8 +732,8 @@ scenario ends.
 | `variable` | the variable to stream (required) | string |
 
 ```yaml
-- app_sse_subscribe: { variable: temp }
-- expect_sse: { event: lastvalue, variable: temp, value: 21.5 }
+- app_var_subscribe: { variable: temp }
+- expect_app_event: { event: lastvalue, variable: temp, value: 21.5 }
 ```
 
 ### `app_post`
@@ -783,7 +783,7 @@ Publishes a command on the device's downlink topic, as the cloud would.
 - cloud_publish: { cmd: Thing.detach, thing_id: "{thing_id}" }
 ```
 
-### `cloud_publish_prop`
+### `cloud_publish_var`
 
 Publishes property values on the thing's inbound topic — what an operator
 changing a value in the Cloud UI produces.
@@ -799,13 +799,13 @@ Give either `variable` + `value` or `values`.
 
 ```yaml
 # one variable changed in the Cloud UI
-- cloud_publish_prop: { variable: temp, value: 30.0 }
-- expect_sse: { event: update, variable: temp, value: 30.0 }
+- cloud_publish_var: { variable: temp, value: 30.0 }
+- expect_app_event: { event: update, variable: temp, value: 30.0 }
 ```
 
 ```yaml
 # several at once
-- cloud_publish_prop:
+- cloud_publish_var:
     values:
       - { name: temp, value: 30.0 }
       - { name: humidity, value: 61 }
@@ -840,8 +840,8 @@ unknown key is an **error**, never left in place as text.
 | `device_id` | the start — the identity the fake Provisioning API will assign |
 | `thing_id` | the start |
 | `api_url`, `broker_url`, `ntp_addr`, `daemon_url`, `data_dir` | the start |
-| `uhwid` | after `app_get_identity` |
-| `organization_id` | after `app_start_provisioning` with one, or `app_get_status` |
+| `uhwid` | after `get_device_identity` |
+| `organization_id` | after `start_provisioning` with one, or `get_daemon_status` |
 
 The bag is written to the artifact, so no credential is ever put in it.
 
@@ -861,15 +861,3 @@ Three things to know, because they decide where a step can go:
    arrive *after* the MQTT connect; consuming it would skip past the connect
    and the next step would wait forever. Prefer the protocol event as the
    proof, and constrain the identifiers on a poll you are already waiting for.
-
-## Not available yet
-
-- **Silencing the NTP probe** from a scenario: `fakes` only has
-  `provisioning_api`, so a connectivity-loss scenario needs a `fakes: ntp:` key
-  first.
-- **Injecting a malformed MQTT payload**: `cloud_publish` and
-  `cloud_publish_prop` only produce well-formed messages.
-- **Changing timers**: the status poll interval, the readiness timeout and the
-  daemon's own back-offs are fixed. Only the per-step `timeout` is yours.
-- **Operators other than equality**: `ne`, `contains`, `prefix`, `gt` and `lt`
-  exist in the event log but no step exposes them.

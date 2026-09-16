@@ -27,7 +27,7 @@ const (
 // apart.
 type StepResult struct {
 	Index      int           `json:"index"` // 1-based, as printed
-	Name       string        `json:"name"`  // e.g. "expect_publish"
+	Name       string        `json:"name"`  // e.g. "expect_mqtt_publish"
 	Detail     string        `json:"detail,omitempty"`
 	Status     StepStatus    `json:"status"`
 	MatchedSeq int           `json:"matched_seq,omitempty"`

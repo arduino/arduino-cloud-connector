@@ -28,7 +28,7 @@ func TestUnconsumedReportsUnclaimedSignificantEvents(t *testing.T) {
 	l := New()
 	claimed := publish(l, "Device.begin")
 	publish(l, "Device.begin") // a second one: nobody asked for this
-	l.Consume(claimed.Seq, "step 7 expect_publish")
+	l.Consume(claimed.Seq, "step 7 expect_mqtt_publish")
 
 	got := l.Unconsumed(nil)
 	if len(got) != 1 {
@@ -86,7 +86,7 @@ func TestResultPassesWhenEverythingIsClaimed(t *testing.T) {
 	l.Consume(ev.Seq, "step 1")
 
 	r := l.Result("probe", []StepResult{
-		{Index: 1, Name: "expect_publish", Status: StepPassed, MatchedSeq: ev.Seq},
+		{Index: 1, Name: "expect_mqtt_publish", Status: StepPassed, MatchedSeq: ev.Seq},
 	}, nil)
 
 	if r.Failed() {
