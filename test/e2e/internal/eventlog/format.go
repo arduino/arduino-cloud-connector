@@ -113,25 +113,7 @@ func (r Result) Format() string {
 	var b strings.Builder
 
 	failed := r.firstFailed()
-	switch {
-	case r.Aborted != nil:
-		fmt.Fprintf(&b, "scenario %s — ABORTED: %s\n", r.Scenario, r.Aborted.Reason)
-	// Every step passed and the run still failed: the final sweep found
-	// protocol traffic nobody claimed. The header has to say so, because this
-	// is the one failure with no failed step to point at, and a report that
-	// opens with PASS while the exit code says otherwise is worse than no
-	// report at all.
-	case failed == nil && len(r.Unconsumed) > 0:
-		fmt.Fprintf(&b, "scenario %s — FAIL: all %d steps passed but %d significant event(s) went unclaimed (%d events)\n",
-			r.Scenario, len(r.Steps), len(r.Unconsumed), len(r.Events))
-	case failed == nil:
-		fmt.Fprintf(&b, "scenario %s — PASS (%d steps, %d events)\n",
-			r.Scenario, len(r.Steps), len(r.Events))
-	default:
-		fmt.Fprintf(&b, "scenario %s — FAIL at step %d/%d (%s)\n",
-			r.Scenario, failed.Index, len(r.Steps), failed.Name)
-	}
-
+	r.writeHeader(&b, failed)
 	b.WriteString("\n")
 	r.writeSteps(&b)
 
@@ -147,6 +129,48 @@ func (r Result) Format() string {
 	r.writeTimeline(&b, failed)
 
 	return b.String()
+}
+
+// Summary is the report without the timeline: the verdict and the step table.
+//
+// It exists for the run that passed. The full report is the right thing to
+// read on a failure and the wrong thing to print on every green run -- the
+// timeline is the bulk of it, and a log nobody can skim is a log nobody reads.
+// The step table answers the question a green run actually raises, which is
+// what the suite asserted, and it fits on a screen. The timeline is still
+// written to the artifact either way.
+//
+// It shares writeHeader with Format on purpose: two renderings of the same
+// result that can disagree about the verdict is precisely the bug that put
+// "PASS" at the top of a failing report once already.
+func (r Result) Summary() string {
+	var b strings.Builder
+	r.writeHeader(&b, r.firstFailed())
+	b.WriteString("\n")
+	r.writeSteps(&b)
+	return b.String()
+}
+
+// writeHeader states the verdict in one line.
+func (r Result) writeHeader(b *strings.Builder, failed *StepResult) {
+	switch {
+	case r.Aborted != nil:
+		fmt.Fprintf(b, "scenario %s — ABORTED: %s\n", r.Scenario, r.Aborted.Reason)
+	// Every step passed and the run still failed: the final sweep found
+	// protocol traffic nobody claimed. The header has to say so, because this
+	// is the one failure with no failed step to point at, and a report that
+	// opens with PASS while the exit code says otherwise is worse than no
+	// report at all.
+	case failed == nil && len(r.Unconsumed) > 0:
+		fmt.Fprintf(b, "scenario %s — FAIL: all %d steps passed but %d significant event(s) went unclaimed (%d events)\n",
+			r.Scenario, len(r.Steps), len(r.Unconsumed), len(r.Events))
+	case failed == nil:
+		fmt.Fprintf(b, "scenario %s — PASS (%d steps, %d events)\n",
+			r.Scenario, len(r.Steps), len(r.Events))
+	default:
+		fmt.Fprintf(b, "scenario %s — FAIL at step %d/%d (%s)\n",
+			r.Scenario, failed.Index, len(r.Steps), failed.Name)
+	}
 }
 
 func (r Result) firstFailed() *StepResult {

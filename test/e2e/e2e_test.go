@@ -80,7 +80,10 @@ func TestScenarios(t *testing.T) {
 				t.Errorf("writing artifacts: %v", err)
 			}
 			if !result.Failed() {
-				t.Logf("%d steps, %d events; report %s", len(result.Steps), len(result.Events), textPath)
+				// The step table even on a pass, for the same reason the
+				// binary prints it: a count says nothing about what was
+				// actually asserted. Visible under `go test -v`.
+				t.Logf("\n%s\nreport %s", result.Summary(), textPath)
 				return
 			}
 			// The whole report, not a summary. The step table, the field-level
