@@ -32,3 +32,19 @@ jobs:
         run: |
           go mod tidy
           git diff --color --exit-code
+
+      # The E2E harness is a separate module with its own .golangci.yml, and
+      # the rule that matters lives there: a default-deny depguard that stops
+      # the harness importing the daemon's packages instead of reimplementing
+      # the wire formats it checks. An unlinted harness is an unenforced rule.
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.11.4
+          args: --timeout 300s
+          working-directory: test/e2e
+
+      - name: Check E2E harness go mod is tidy
+        working-directory: test/e2e
+        run: |
+          go mod tidy
+          git diff --color --exit-code

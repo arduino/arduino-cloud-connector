@@ -5,6 +5,12 @@ cache_path: .licenses
 
 apps:
   - source_path: ./cmd/arduino-cloud-connector
+  # The E2E test harness is a separate Go module with its own dependency set.
+  # It is registered as its own app (rather than left unaudited) because the
+  # repository is public. The explicit name keeps the cache readable: without
+  # it licensed would derive "e2e" from the directory basename.
+  - name: arduino-cloud-connector-e2e
+    source_path: ./test/e2e
 
 reviewed:
   go:
