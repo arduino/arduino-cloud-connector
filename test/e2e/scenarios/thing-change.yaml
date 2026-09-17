@@ -104,4 +104,17 @@ steps:
   # thing re-attachment
   - cloud_publish: { cmd: Thing.update, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2" }
   - expect_mqtt_subscribe: { topic: "/a/t/519bfb1c-1946-4e9e-a278-16a58f32b5a2/e/i" }
-  - await_daemon_cloud_state: { state: Steady, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2", device_id: "{device_id}", timeout: 30s }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - await_daemon_cloud_state: { state: SyncingLastValues, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2", device_id: "{device_id}", timeout: 30s }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: calc, value: 21.5 }]
+  # The identifiers are constrained here rather than in a step of their own:
+  # one status poll carries the state AND both ids, so this single expectation
+  # also asserts the daemon agrees with the harness about who it is and what it
+  # is attached to.
+  - await_daemon_cloud_state:
+      state: Steady
+      thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2"
+      device_id: "{device_id}"
+      timeout: 30s
