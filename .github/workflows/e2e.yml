@@ -33,9 +33,9 @@ jobs:
   scenarios:
     name: E2E scenarios
     runs-on: ubuntu-latest
-    # Every step in a scenario has its own timeout and `go test -timeout` bounds
-    # the run, so this is only a backstop against a job that hangs before the
-    # tests start.
+    # Every expectation in a scenario carries its own timeout, so a scenario
+    # bounds itself. This is the backstop for what those cannot bound: a hang
+    # before the first scenario starts, or an action wedged on a socket.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -55,14 +55,28 @@ jobs:
             github.com/go-task/task/v3/cmd/task \
               build:mock
 
-      # This runs the harness's own unit tests too. The overlap with the Test
-      # workflow is deliberate: this job has to be runnable on its own to
-      # reproduce a scenario failure.
+      - name: Build the E2E tool
+        run: |
+          go tool \
+            github.com/go-task/task/v3/cmd/task \
+              build-e2e
+
+      # The tool, not `go test`: this job exists to run the scenarios, and the
+      # tool's output IS the verdict -- a PASS line per scenario, the full
+      # report on a failure, and a non-zero exit when any scenario failed.
+      # Running the module's tests here instead would bury that under the
+      # harness's own unit tests, whose formatter cases deliberately print
+      # example FAILED reports -- indistinguishable, in a log, from a real one.
+      # Those unit tests belong to the Test workflow, which runs them with
+      # -race on every PR.
+      #
+      # The daemon is configured by the harness, not from here: World.Env()
+      # builds MQTT_BROKER, MQTT_CA_FILE, PROVISIONING_API and NTP_PROBE_HOST
+      # from the ports the kernel assigns at startup, and daemonproc passes
+      # them to the child. -daemon is only which binary to drive.
       - name: Run the scenarios
         working-directory: test/e2e
-        env:
-          E2E_DAEMON_BIN: ../../build/arduino-cloud-connector-mock
-        run: go test -v -timeout 15m ./...
+        run: ../../build/arduino-cloud-connector-e2e -daemon ../../build/arduino-cloud-connector-mock
 
       # The console is not where a failure is read. _artifacts/<scenario>.txt
       # places the failed expectation at the instant it was waiting, prints
