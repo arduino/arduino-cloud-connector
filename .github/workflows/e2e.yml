@@ -78,13 +78,23 @@ jobs:
         working-directory: test/e2e
         run: ../../build/arduino-cloud-connector-e2e -daemon ../../build/arduino-cloud-connector-mock
 
-      # The console is not where a failure is read. _artifacts/<scenario>.txt
-      # places the failed expectation at the instant it was waiting, prints
-      # which fields differed and interleaves every source on one timeline;
-      # the .json beside it is the same run as data.
+      # Uploaded on every outcome, not only on a failure. _artifacts/<scenario>.txt
+      # places a failed expectation at the instant it was waiting, prints which
+      # fields differed and interleaves every source on one timeline; the .json
+      # beside it is the same run as data. On a green run that timeline is the
+      # only record of what the daemon actually did -- discarding it is how a
+      # suite becomes a boolean, and it is also what you diff against when the
+      # next run goes red for no apparent reason.
+      #
+      # `if: always()` rather than no condition at all: a step with no condition
+      # is skipped once an earlier one fails, which would drop the artifact in
+      # the only case it was originally kept for.
       - name: Upload the timelines
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-timelines
           path: test/e2e/_artifacts/
+          # A build failure means there is no run to upload, and that is not
+          # itself an error worth a second red step.
+          if-no-files-found: ignore

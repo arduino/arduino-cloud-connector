@@ -110,8 +110,12 @@ func run() error {
 			// by hand has no CI artifact browser to open.
 			fmt.Print(result.Format())
 		} else {
-			fmt.Printf("scenario %s — PASS (%d steps, %d events)\n",
-				result.Scenario, len(result.Steps), len(result.Events))
+			// The step table, on a pass. A green run that prints one line
+			// leaves the reader unable to tell a suite that asserted twenty
+			// things from one that asserted nothing -- which is the failure
+			// mode of a test nobody looks at. The timeline stays in the
+			// artifact; this is the part worth reading every time.
+			fmt.Print(result.Summary())
 		}
 		if textPath != "" {
 			fmt.Printf("  report %s\n  events %s\n", textPath, jsonPath)

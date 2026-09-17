@@ -200,6 +200,51 @@ func TestReportOnPass(t *testing.T) {
 	}
 }
 
+// TestSummaryIsTheReportWithoutTheTimeline pins the two properties the binary
+// relies on when it prints a green run: the verdict line is the same one
+// Format() opens with, and the step table is all of it -- no timeline.
+func TestSummaryIsTheReportWithoutTheTimeline(t *testing.T) {
+	l := New()
+	first := publish(l, "Device.begin")
+	l.Consume(first.Seq, "step 1")
+	second := publish(l, "Thing.begin")
+	l.Consume(second.Seq, "step 2")
+
+	r := l.Result("happy", []StepResult{
+		{Index: 1, Name: "expect_mqtt_publish", Detail: "cmd=Device.begin", Status: StepPassed, MatchedSeq: first.Seq},
+		{Index: 2, Name: "expect_mqtt_publish", Detail: "cmd=Thing.begin", Status: StepPassed, MatchedSeq: second.Seq},
+	}, nil)
+
+	summary := r.Summary()
+	full := r.Format()
+
+	header := strings.SplitN(full, "\n", 2)[0]
+	if got := strings.SplitN(summary, "\n", 2)[0]; got != header {
+		t.Errorf("header\n got %q\nwant %q (Format's own)", got, header)
+	}
+	if !strings.Contains(header, "PASS") {
+		t.Errorf("header %q should say PASS", header)
+	}
+	// Both steps, with their detail: a summary that lost a step would be
+	// exactly as uninformative as the one line it replaces.
+	for _, want := range []string{"cmd=Device.begin", "cmd=Thing.begin"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary is missing step detail %q:\n%s", want, summary)
+		}
+	}
+	// And no timeline. Checked through Format() too, so the test fails if the
+	// section is ever renamed rather than silently passing on a stale word.
+	if !strings.Contains(full, "timeline") {
+		t.Fatal("Format() no longer has a timeline section; update this test")
+	}
+	if strings.Contains(summary, "timeline") {
+		t.Errorf("Summary() should not carry the timeline:\n%s", summary)
+	}
+	if len(summary) >= len(full) {
+		t.Errorf("Summary() (%d bytes) should be shorter than Format() (%d bytes)", len(summary), len(full))
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
