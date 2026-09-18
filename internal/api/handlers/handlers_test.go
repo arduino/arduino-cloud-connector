@@ -343,3 +343,32 @@ func TestVariableSendRejectsWhenThingUnavailable(t *testing.T) {
 		t.Errorf("error = %q, want thing_unavailable", payload["error"])
 	}
 }
+
+// The registry holds the BOARD's value, so an app subscribing while the cloud
+// is not steady still gets "lastvalue" as long as the board has a value — not
+// "thing_unavailable". Two apps sharing a variable must start from the same
+// number whatever the cloud is doing; before the fix the not-steady check came
+// first and the second app started blind.
+func TestVariableEventsFirstFrameLastValueWhileNotSteady(t *testing.T) {
+	reg := variables.NewRegistry()
+	reg.SetValue("temp", float64(42), time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC))
+	mux := http.NewServeMux()
+	mux.Handle("GET /v1/variables/{name}/events", handlers.HandleVariableEvents(reg, fakeSteady{false}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	event, data := readFirstSSEEvent(t, srv.URL, "temp")
+	if event != string(variables.EventLastValue) {
+		t.Fatalf("first event = %q, want %q", event, variables.EventLastValue)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		t.Fatalf("unmarshal data %q: %v", data, err)
+	}
+	if payload["value"] != float64(42) {
+		t.Errorf("value = %v, want 42", payload["value"])
+	}
+	if payload["last_value"] != true {
+		t.Errorf("last_value = %v, want true", payload["last_value"])
+	}
+}
