@@ -41,13 +41,24 @@ type Variable struct {
 // receives is always one of the three "sync" kinds, telling it how to resolve
 // its local value; every subsequent live change is EventUpdate.
 //
-//   - EventThingUnavailable: no thing is assigned yet (cloud not steady). The
-//     app keeps its local value and waits; a resync frame follows once steady.
-//   - EventLastValue: the thing is assigned and this variable has a cloud last
-//     value — the app resolves local vs cloud per its sync policy.
-//   - EventLastValueMissing: the thing is assigned but this variable has no
-//     cloud value — the local value wins and is pushed up.
-//   - EventUpdate: a live cloud-side change after the initial sync.
+// The value a sync frame carries is THE BOARD'S value for that variable, not
+// specifically the cloud's: the registry is the one place where "temp on this
+// board is 10" lives, fed both by inbound cloud traffic and by app writes, so
+// that two apps sharing a variable always see the same number. The sync
+// policies (DEVICE_WINS / CLOUD_WINS / MOST_RECENT_WINS) are how an app
+// arbitrates its own local value against it — between apps just as much as
+// between device and cloud. Do not "correct" a sync frame into carrying only
+// cloud-sourced values: that would give each app its own truth.
+//
+//   - EventThingUnavailable: no thing is assigned yet AND the board has no
+//     value for this variable. The app keeps its local value and waits; a sync
+//     frame follows once the cloud's last values are applied.
+//   - EventLastValue: the board has a value for this variable — the app
+//     resolves its local value against it per its sync policy.
+//   - EventLastValueMissing: the board has no value and the cloud announced
+//     none either, so the local value wins and is pushed up.
+//   - EventUpdate: a live change after the initial sync — inbound cloud traffic
+//     or another app's write.
 
 // EventKind is the SSE event name emitted for a variable event (one of the
 // Event* constants below).
@@ -71,8 +82,8 @@ type UpdateEvent struct {
 	LastValue bool      `json:"last_value,omitempty"`
 	// Kind is the SSE event name to emit for this event (one of the Event*
 	// constants). It is transport metadata, not part of the JSON data payload.
-	// Producers always set it: SetValue tags live changes as EventUpdate and
-	// NotifyResync tags sync frames accordingly.
+	// Producers always set it: SetValue tags live changes as EventUpdate,
+	// ApplyLastValues tags sync frames accordingly.
 	Kind EventKind `json:"-"`
 }
 
@@ -88,6 +99,13 @@ type Subscription struct {
 	mu     sync.Mutex
 	queue  []UpdateEvent
 	closed bool
+
+	// pending is true while this subscriber has been told EventThingUnavailable
+	// and still owes a sync verdict. It is guarded by the owning Registry's mu
+	// (NOT by s.mu above): it is only ever set by Subscribe and cleared by
+	// ApplyLastValues, both of which hold the registry lock, so the decision
+	// "does this subscriber need a frame" cannot race with the frame itself.
+	pending bool
 }
 
 func newSubscription() *Subscription {
@@ -244,50 +262,106 @@ func (r *Registry) SetValue(name string, value any, ts time.Time) {
 	}
 }
 
-// NotifyResync sends every current subscriber a fresh sync frame reflecting the
-// variable's stored state: EventLastValue if the variable has a value, or
-// EventLastValueMissing if it does not. It is called when the cloud reaches
-// Steady so that subscribers which connected while no thing was assigned (and
-// were told EventThingUnavailable) can now resolve their local value against the
-// freshly-synced cloud state according to their sync policy. The sync value is
-// always delivered as an EventLastValue (never EventUpdate) so the client can
-// distinguish an initial/resync value from a live change.
-func (r *Registry) NotifyResync() {
+// ApplyLastValues stores the last values the cloud announced for the currently
+// assigned thing and delivers exactly one sync frame per subscribed variable
+// that needs one. It is the single point where a last-values payload becomes
+// visible to apps, and it replaces the old "sweep every subscriber and decide
+// from the stored timestamp" resync: the payload itself says which variables
+// the cloud spoke about, so nothing has to be inferred.
+//
+//   - a variable IN the payload is stored and announced to every subscriber as
+//     EventLastValue (LastValue: true) — the cloud confirmed this value, which
+//     is genuine information even for a subscriber that already had it;
+//   - a subscribed variable NOT in the payload is left untouched, and only
+//     PENDING subscribers are told EventLastValueMissing. A subscriber that
+//     already knows the board value is deliberately sent nothing: the cloud has
+//     not contradicted it, so there is nothing to say. Re-announcing the cached
+//     value as a cloud last value is the defect this replaces — it crossed a
+//     thing boundary and passed an app's own write back as cloud truth.
+//
+// Both passes run under one lock, so a subscriber cannot receive both a
+// snapshot from Subscribe and a frame from here for the same sync.
+//
+// Called with no values when the cloud announced nothing — an empty or
+// unreadable payload, or an exhausted LastValues retry — which resolves every
+// pending subscriber with EventLastValueMissing so apps stop waiting and can
+// publish. Treating a timeout as an absence is deliberate: the request pipeline
+// makes a late answer unlikely, and a subscriber left pending is frozen in both
+// directions (the brick neither publishes nor applies live updates while it
+// waits for a sync frame).
+func (r *Registry) ApplyLastValues(values []Variable) {
+	now := time.Now().UTC()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	announced := make(map[string]bool, len(values))
+	for _, in := range values {
+		ts := in.Timestamp
+		if ts.IsZero() {
+			ts = now
+		}
+		announced[in.Name] = true
+
+		v := r.getOrCreate(in.Name)
+		v.Value = in.Value
+		v.Timestamp = ts
+
+		evt := UpdateEvent{Name: in.Name, Value: in.Value, Timestamp: ts, LastValue: true, Kind: EventLastValue}
+		for _, sub := range r.listeners[in.Name] {
+			sub.pending = false
+			sub.enqueue(evt)
+		}
+	}
+
 	for name, subs := range r.listeners {
-		if len(subs) == 0 {
+		if announced[name] {
 			continue
 		}
-		v := r.getOrCreate(name)
 		evt := UpdateEvent{Name: name, Kind: EventLastValueMissing}
-		if !v.Timestamp.IsZero() {
-			evt = UpdateEvent{Name: name, Value: v.Value, Timestamp: v.Timestamp, LastValue: true, Kind: EventLastValue}
-		}
 		for _, sub := range subs {
+			if !sub.pending {
+				continue
+			}
+			sub.pending = false
 			sub.enqueue(evt)
 		}
 	}
 }
 
 // Subscribe registers a FIFO Subscription for the named variable (creating it
-// if absent) and atomically returns the current stored value as a snapshot.
-// hasValue is true if the variable has ever been set (the snapshot is then the
-// "last value" to replay to the new subscriber as its first event). Capturing
-// the snapshot and registering the subscription under the same lock guarantees
-// no concurrent SetValue is lost between the two. The caller must call
-// Unsubscribe when done.
-func (r *Registry) Subscribe(name string) (snapshot UpdateEvent, hasValue bool, sub *Subscription) {
+// if absent) and returns the sync frame to deliver as the subscriber's first
+// event. Deciding the frame here — rather than in the caller — keeps a single
+// place that answers "what does this subscriber need to know", and setting the
+// pending flag under the same lock means a concurrent ApplyLastValues cannot
+// slip between the subscribe and the flag. The caller must call Unsubscribe
+// when done.
+//
+// The returned Kind is one of:
+//
+//   - EventLastValue: the board has a value for this variable. Returned whether
+//     or not the daemon is currently synced with the cloud: the cache IS the
+//     board's value, and every app must see the same one.
+//   - EventThingUnavailable: no value yet and no thing assigned. The
+//     subscription is marked pending — ApplyLastValues owes it a verdict.
+//   - EventLastValueMissing: no value, but a thing is assigned and its last
+//     values have already been applied, so the cloud has nothing for it.
+func (r *Registry) Subscribe(name string, cloudSteady bool) (first UpdateEvent, sub *Subscription) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v := r.getOrCreate(name)
 	sub = newSubscription()
 	r.listeners[name] = append(r.listeners[name], sub)
-	hasValue = !v.Timestamp.IsZero()
-	if hasValue {
-		snapshot = UpdateEvent{Name: name, Value: v.Value, Timestamp: v.Timestamp, LastValue: true}
+
+	switch {
+	case !v.Timestamp.IsZero():
+		return UpdateEvent{Name: name, Value: v.Value, Timestamp: v.Timestamp, LastValue: true, Kind: EventLastValue}, sub
+	case !cloudSteady:
+		sub.pending = true
+		return UpdateEvent{Name: name, Kind: EventThingUnavailable}, sub
+	default:
+		return UpdateEvent{Name: name, Kind: EventLastValueMissing}, sub
 	}
-	return snapshot, hasValue, sub
 }
 
 // Unsubscribe removes the subscription and stops its pump goroutine.
