@@ -157,12 +157,43 @@ type sendValueRequest struct {
 	Value any `json:"value"`
 }
 
+// clientIDHeader carries the calling app's own opaque identifier, sent on both
+// the value PUT and the SSE subscription. It exists so the daemon can avoid
+// handing an app back its own write (see variables.Registry.SetValue). The
+// daemon compares it for equality and does nothing else with it.
+const clientIDHeader = "X-App-Client-ID"
+
+// maxClientIDLen caps the identifier the daemon is willing to keep. A uuid4 in
+// canonical form is 36 bytes, so the cap is never reached in practice; it is
+// here only so a client cannot make the daemon hold an unbounded string per
+// subscription.
+const maxClientIDLen = 128
+
+// clientID returns the caller's identifier, or "" when it sent none or sent one
+// longer than maxClientIDLen. An over-long id is treated as ABSENT rather than
+// truncated: a truncated id could collide with another app's and suppress a
+// frame that app was entitled to, whereas treating it as absent degrades to the
+// pre-header behaviour, which is merely one redundant frame.
+//
+// The value is opaque — not parsed, not validated as a UUID, and deliberately
+// never logged, since it identifies an app instance.
+func clientID(r *http.Request) string {
+	id := r.Header.Get(clientIDHeader)
+	if len(id) > maxClientIDLen {
+		return ""
+	}
+	return id
+}
+
 // HandleVariableSend queues a variable's value for ordered delivery to the
 // cloud (stored in the registry and published in FIFO order by the daemon's
 // outbound worker). The variable is created on first use. Returns 204 once
 // queued. If no thing is assigned yet (cloud not steady) the value is NOT queued
 // and the handler returns 409 with error "thing_unavailable", so the app can log
 // it and keep the value locally until the cloud syncs.
+//
+// An X-App-Client-ID sent here is carried with the value so the update is
+// not echoed back on that same app's own event streams.
 func HandleVariableSend(d *daemon.Daemon) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -171,7 +202,7 @@ func HandleVariableSend(d *daemon.Daemon) http.Handler {
 			writeError(w, http.StatusBadRequest, "invalid request body", err)
 			return
 		}
-		if err := d.EnqueueVariable(r.Context(), name, req.Value); err != nil {
+		if err := d.EnqueueVariable(r.Context(), name, req.Value, clientID(r)); err != nil {
 			if errors.Is(err, daemon.ErrThingUnavailable) {
 				writeError(w, http.StatusConflict, "thing_unavailable", err)
 				return
@@ -211,11 +242,15 @@ type steadyReporter interface {
 // The connection is established immediately even for an unknown/never-set
 // variable: the response headers are flushed up front, before the first frame,
 // otherwise the client's EventSource would not open until a write occurs.
+//
+// An X-App-Client-ID sent here identifies the subscribing app: values this
+// same app PUTs (carrying the same header) are not echoed back on this stream.
+// Cloud-originated frames are unaffected and always delivered.
 func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 
-		first, sub := reg.Subscribe(name, cloud.CloudSteady())
+		first, sub := reg.Subscribe(name, clientID(r), cloud.CloudSteady())
 		defer reg.Unsubscribe(name, sub)
 
 		flusher, ok := w.(http.Flusher)

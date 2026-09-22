@@ -626,7 +626,10 @@ func (f *FSM) applyProperties(payload []byte, isLastValues bool) error {
 			return err
 		}
 		for _, v := range vars {
-			f.reg.SetValue(v.Name, v.Value, v.Timestamp)
+			// No origin id: this value came from the cloud, not from an app, so
+			// it must reach every subscriber — including one that wrote the
+			// same variable earlier and needs to learn the cloud changed it.
+			f.reg.SetValue(v.Name, v.Value, v.Timestamp, "")
 		}
 		return nil
 	}
