@@ -157,12 +157,43 @@ type sendValueRequest struct {
 	Value any `json:"value"`
 }
 
+// clientIDHeader carries the calling app's own opaque identifier, sent on both
+// the value PUT and the SSE subscription. It exists so the daemon can avoid
+// handing an app back its own write (see variables.Registry.SetValue). The
+// daemon compares it for equality and does nothing else with it.
+const clientIDHeader = "X-App-Client-ID"
+
+// maxClientIDLen caps the identifier the daemon is willing to keep. A uuid4 in
+// canonical form is 36 bytes, so the cap is never reached in practice; it is
+// here only so a client cannot make the daemon hold an unbounded string per
+// subscription.
+const maxClientIDLen = 128
+
+// clientID returns the caller's identifier, or "" when it sent none or sent one
+// longer than maxClientIDLen. An over-long id is treated as ABSENT rather than
+// truncated: a truncated id could collide with another app's and suppress a
+// frame that app was entitled to, whereas treating it as absent degrades to the
+// pre-header behaviour, which is merely one redundant frame.
+//
+// The value is opaque — not parsed, not validated as a UUID, and deliberately
+// never logged, since it identifies an app instance.
+func clientID(r *http.Request) string {
+	id := r.Header.Get(clientIDHeader)
+	if len(id) > maxClientIDLen {
+		return ""
+	}
+	return id
+}
+
 // HandleVariableSend queues a variable's value for ordered delivery to the
 // cloud (stored in the registry and published in FIFO order by the daemon's
 // outbound worker). The variable is created on first use. Returns 204 once
 // queued. If no thing is assigned yet (cloud not steady) the value is NOT queued
 // and the handler returns 409 with error "thing_unavailable", so the app can log
 // it and keep the value locally until the cloud syncs.
+//
+// An X-App-Client-ID sent here is carried with the value so the update is
+// not echoed back on that same app's own event streams.
 func HandleVariableSend(d *daemon.Daemon) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -171,7 +202,7 @@ func HandleVariableSend(d *daemon.Daemon) http.Handler {
 			writeError(w, http.StatusBadRequest, "invalid request body", err)
 			return
 		}
-		if err := d.EnqueueVariable(r.Context(), name, req.Value); err != nil {
+		if err := d.EnqueueVariable(r.Context(), name, req.Value, clientID(r)); err != nil {
 			if errors.Is(err, daemon.ErrThingUnavailable) {
 				writeError(w, http.StatusConflict, "thing_unavailable", err)
 				return
@@ -193,25 +224,33 @@ type steadyReporter interface {
 // frame is always one of three sync events telling the app how to seed its
 // local value:
 //
-//   - "thing_unavailable": the cloud has no thing assigned yet. The app keeps
-//     its local value; a resync frame ("lastvalue"/"lastvalue_missing") is sent
-//     later when the cloud reaches Steady (see Registry.NotifyResync).
-//   - "lastvalue": the thing is assigned and this variable has a cloud last
-//     value (replayed with last_value:true) — the app resolves per sync policy.
-//   - "lastvalue_missing": the thing is assigned but this variable has no cloud
-//     value — the local value wins and is pushed up.
+//   - "lastvalue": the board has a value for this variable (replayed with
+//     last_value:true) — the app resolves per sync policy. Sent whether or not
+//     the daemon is synced with the cloud, so two apps sharing a variable
+//     always start from the same number.
+//   - "thing_unavailable": the board has no value yet and no thing is assigned.
+//     The app keeps its local value; a sync frame follows once the cloud's last
+//     values are applied (see Registry.ApplyLastValues).
+//   - "lastvalue_missing": the board has no value and the cloud announced none
+//     either — the local value wins and is pushed up.
 //
 // Every subsequent live change is an "update" event. Multiple apps may
-// subscribe to the same variable concurrently — each gets its own first frame.
+// subscribe to the same variable concurrently — each gets its own first frame,
+// and which one they get depends on when they arrived, so the frames are
+// chosen by the Registry under its lock rather than here.
 //
 // The connection is established immediately even for an unknown/never-set
 // variable: the response headers are flushed up front, before the first frame,
 // otherwise the client's EventSource would not open until a write occurs.
+//
+// An X-App-Client-ID sent here identifies the subscribing app: values this
+// same app PUTs (carrying the same header) are not echoed back on this stream.
+// Cloud-originated frames are unaffected and always delivered.
 func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 
-		snapshot, hasValue, sub := reg.Subscribe(name)
+		first, sub := reg.Subscribe(name, clientID(r), cloud.CloudSteady())
 		defer reg.Unsubscribe(name, sub)
 
 		flusher, ok := w.(http.Flusher)
@@ -226,25 +265,18 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush() // open the stream now, before the first frame
 
-		// First frame: the sync state the app resolves against.
-		var (
-			kind variables.EventKind
-			err  error
-		)
-		switch {
-		case !cloud.CloudSteady():
-			kind = variables.EventThingUnavailable
-			err = writeSSE(w, kind, map[string]string{"name": name})
-		case hasValue:
-			kind = variables.EventLastValue
-			err = writeSSE(w, kind, snapshot)
-		default:
-			kind = variables.EventLastValueMissing
-			err = writeSSE(w, kind, map[string]string{"name": name})
+		// First frame: the sync state the app resolves against. Registry.Subscribe
+		// already chose it; all that is left here is the payload shape, because a
+		// value-less frame must not carry a null value and a zero timestamp.
+		var err error
+		if first.Kind == variables.EventLastValue {
+			err = writeSSE(w, first.Kind, first)
+		} else {
+			err = writeSSE(w, first.Kind, map[string]string{"name": name})
 		}
 		if err != nil {
 			// Client gone before the seed, or the payload could not be sent.
-			slog.Error("sse: failed to write first frame", "name", name, "event", string(kind), "error", err)
+			slog.Error("sse: failed to write first frame", "name", name, "event", string(first.Kind), "error", err)
 			return
 		}
 		flusher.Flush()

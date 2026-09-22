@@ -433,3 +433,64 @@ func TestFSM_GracefulShutdown(t *testing.T) {
 
 	require.Equal(t, StateDisconnected, fsm.Snapshot().State)
 }
+
+// A thing reassignment in place (ThingUpdate with a different non-empty id while
+// Steady) must sync SSE subscribers with the new thing's last values. That path
+// is handled by handleSteadyCommand and returns nil, so it never re-enters
+// runSteady: while the resync lived at the entry of Steady it produced no sync
+// frame at all, and the new thing's values reached apps tagged as live updates.
+func TestFSM_Steady_ThingReassignment_SyncsSubscribers(t *testing.T) {
+	client, fsm := newTestFSM(t)
+	runFSM(t, fsm)
+	driveToSteady(t, client, fsm)
+
+	first, sub := fsm.reg.Subscribe("temp", "", true)
+	defer fsm.reg.Unsubscribe("temp", sub)
+	require.Equal(t, variables.EventLastValueMissing, first.Kind,
+		"no value stored yet and a thing is assigned")
+
+	const newThingID command.ThingID = "99999999-9999-9999-9999-999999999999"
+	client.injectCommand(command.NewCmd(command.ThingUpdateCmd{ThingID: newThingID}))
+
+	payload, err := senml.Encode([]senml.Variable{{Name: "temp", Value: 21.5}})
+	require.NoError(t, err)
+	client.injectCommand(command.NewCmd(command.LastValuesUpdateCmd{Values: payload}))
+
+	select {
+	case evt := <-sub.Events():
+		require.Equal(t, variables.EventLastValue, evt.Kind,
+			"the new thing's last value must arrive as a sync frame, not a live update")
+		require.True(t, evt.LastValue)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no sync frame after an in-place thing reassignment")
+	}
+}
+
+// When LastValues never arrives and the retries are exhausted, the FSM enters
+// Steady without an initial sync. A subscriber that was told thing_unavailable
+// must still get a verdict, otherwise the brick's leaf stays pending and is
+// frozen in both directions — it neither publishes local changes nor applies
+// live updates. No answer is treated as "the cloud announced nothing".
+func TestFSM_Syncing_LastValuesTimeoutResolvesPendingSubscriber(t *testing.T) {
+	client, fsm := newTestFSM(t)
+	runFSM(t, fsm)
+
+	waitFor(t, fsm, StateAwaitingThingID)
+	client.injectCommand(command.NewCmd(command.ThingUpdateCmd{ThingID: "thing-timeout"}))
+	waitFor(t, fsm, StateSyncingLastValues)
+
+	// An app subscribes while the cloud is not steady: pending, owed a verdict.
+	first, sub := fsm.reg.Subscribe("temp", "", false)
+	defer fsm.reg.Unsubscribe("temp", sub)
+	require.Equal(t, variables.EventThingUnavailable, first.Kind)
+
+	// Do NOT inject LastValuesUpdateCmd — let the retries run out.
+	waitFor(t, fsm, StateSteady)
+
+	select {
+	case evt := <-sub.Events():
+		require.Equal(t, variables.EventLastValueMissing, evt.Kind)
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending subscriber got no verdict after the last-values retries were exhausted")
+	}
+}

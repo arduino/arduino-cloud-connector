@@ -238,6 +238,10 @@ type outboundValue struct {
 	value any
 	ts    time.Time
 	seq   uint64
+	// clientID identifies the app that submitted this value, carried through so
+	// runOutbound can tell the registry not to echo the value back to that app's
+	// own subscriptions. Empty when the client sent no identifier.
+	clientID string
 }
 
 // EnqueueVariable submits a locally-set variable value for ordered delivery to
@@ -250,7 +254,12 @@ type outboundValue struct {
 //
 // Blocks (back-pressure) only if the queue is full; returns ctx.Err() if ctx is
 // cancelled (e.g. the client disconnected) before the value could be queued.
-func (d *Daemon) EnqueueVariable(ctx context.Context, name string, value any) error {
+//
+// clientID is the submitting app's opaque identifier (empty when it sent none).
+// It travels with the value so that, when the value is stored, the registry can
+// skip that app's own subscriptions instead of handing it back its own write —
+// see the origin exclusion on variables.Registry.SetValue.
+func (d *Daemon) EnqueueVariable(ctx context.Context, name string, value any, clientID string) error {
 	// Reject (and do not queue) while no thing is assigned yet: the value could
 	// not reach the cloud and, if stored via the outbound worker, would become a
 	// stale "last value" replayed to later subscribers. The app is told via
@@ -259,10 +268,11 @@ func (d *Daemon) EnqueueVariable(ctx context.Context, name string, value any) er
 		return ErrThingUnavailable
 	}
 	ov := outboundValue{
-		name:  name,
-		value: value,
-		ts:    time.Now().UTC(),
-		seq:   d.outboundSeq.Add(1),
+		name:     name,
+		value:    value,
+		ts:       time.Now().UTC(),
+		seq:      d.outboundSeq.Add(1),
+		clientID: clientID,
 	}
 	// Diagnostic: a full queue means the single outbound worker (runOutbound) is
 	// not draining — almost always because a publish is wedged on a dead or
@@ -304,7 +314,7 @@ func (d *Daemon) runOutbound(ctx context.Context) {
 			wait := time.Until((*pending)[0].ts.Add(outboundReorderWindow))
 			if wait <= 0 {
 				ov := heap.Pop(pending).(outboundValue)
-				d.reg.SetValue(ov.name, ov.value, ov.ts)
+				d.reg.SetValue(ov.name, ov.value, ov.ts, ov.clientID)
 				if err := d.publishVariable(ov.name, ov.value); err != nil {
 					// Elevated from Debug: a value the app set is NOT reaching the
 					// cloud (kept only in the local registry). At info level this

@@ -196,9 +196,13 @@ paths:
         with error `thing_unavailable`, so the app can keep the value locally and
         retry once the thing is available (see the `thing_unavailable` /
         `lastvalue` / `lastvalue_missing` SSE frames on the events stream).
+
+        Send `X-App-Client-ID` here and on the event stream to avoid being
+        handed back your own write — see the parameter description.
       operationId: setVariableValue
       parameters:
         - $ref: "#/components/parameters/VariableName"
+        - $ref: "#/components/parameters/ClientID"
       requestBody:
         required: true
         content:
@@ -250,13 +254,18 @@ paths:
         - `lastvalue_missing`: a thing is assigned but this variable has no cloud
           value — the app's local value wins and is pushed up.
 
-        Every subsequent live cloud-side change is sent as an `update` event.
+        Every subsequent live change is sent as an `update` event — inbound
+        cloud traffic, or another app's write. A value written by THIS app is
+        not sent back on this stream when the same `X-App-Client-ID` was
+        used on both calls; see the parameter description.
+
         Multiple apps may subscribe to the same variable concurrently — each
         receives its own first frame. Ordering is FIFO per subscriber; a slow
         consumer never blocks the producer and no event is dropped.
       operationId: streamVariableEvents
       parameters:
         - $ref: "#/components/parameters/VariableName"
+        - $ref: "#/components/parameters/ClientID"
       responses:
         "200":
           description: |
@@ -277,6 +286,38 @@ paths:
 
 components:
   parameters:
+    ClientID:
+      name: X-App-Client-ID
+      in: header
+      required: false
+      description: |
+        The calling app's own opaque identifier, generated once per app
+        instance and sent on **both** this endpoint and the variable's event
+        stream.
+
+        A value PUT with this identifier is not echoed back on an event stream
+        opened with the same identifier, so an app is never handed back its own
+        write. Without it, the echo of a PUT arrives after the app has already
+        computed its next value locally, and a `CLOUD_WINS` variable adopts the
+        stale echoed value — a read-modify-write app (a counter, an
+        accumulator) then silently loses an update.
+
+        The exclusion applies to locally-written values only. Values arriving
+        from the cloud are never filtered: they reach every subscriber,
+        including the app that last wrote the variable. Other apps subscribed
+        to the same variable always receive the write — that stream is how they
+        learn about it.
+
+        Opaque to the daemon: compared for equality only, never parsed,
+        validated as a UUID, or logged. An identifier longer than 128 bytes is
+        ignored (treated as absent) rather than truncated. Omitting the header
+        is supported and simply keeps the previous behaviour, in which an app
+        also receives the echo of its own write.
+      schema:
+        type: string
+        maxLength: 128
+      example: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+
     VariableName:
       name: name
       in: path
