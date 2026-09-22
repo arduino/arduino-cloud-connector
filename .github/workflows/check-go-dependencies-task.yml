@@ -70,7 +70,7 @@ jobs:
 
       # This is required to allow licensee/setup-licensed to install Licensed via Ruby gem.
       - name: Install Ruby
-        uses: ruby/setup-ruby@v1.321.0
+        uses: ruby/setup-ruby@v1.323.0
         with:
           ruby-version: ruby # Install latest version
 
@@ -132,7 +132,7 @@ jobs:
 
       # This is required to allow licensee/setup-licensed to install Licensed via Ruby gem.
       - name: Install Ruby
-        uses: ruby/setup-ruby@v1.321.0
+        uses: ruby/setup-ruby@v1.323.0
         with:
           ruby-version: ruby # Install latest version
 
