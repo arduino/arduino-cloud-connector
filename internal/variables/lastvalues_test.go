@@ -39,9 +39,9 @@ func TestThingChangeDoesNotReannounceForeignValue(t *testing.T) {
 
 	// runOutbound calls SetValue before publishing, so the app's PUT lands here.
 	appWrite := time.Date(2026, 9, 17, 9, 26, 40, 991363985, time.UTC)
-	r.SetValue("temp", 42.0, appWrite)
+	r.SetValue("temp", 42.0, appWrite, "")
 
-	first, sub := r.Subscribe("temp", true)
+	first, sub := r.Subscribe("temp", "", true)
 	defer r.Unsubscribe("temp", sub)
 	if first.Kind != EventLastValue || first.Value != 42.0 {
 		t.Fatalf("first frame = %q/%v, want %q/42", first.Kind, first.Value, EventLastValue)
@@ -62,9 +62,9 @@ func TestThingChangeDoesNotReannounceForeignValue(t *testing.T) {
 func TestSubscribeWhileNotSteadyReplaysBoardValue(t *testing.T) {
 	r := NewRegistry()
 	ts := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
-	r.SetValue("temp", 42.0, ts)
+	r.SetValue("temp", 42.0, ts, "")
 
-	first, sub := r.Subscribe("temp", false) // cloud NOT steady
+	first, sub := r.Subscribe("temp", "", false) // cloud NOT steady
 	defer r.Unsubscribe("temp", sub)
 
 	if first.Kind != EventLastValue {
@@ -81,7 +81,7 @@ func TestSubscribeWhileNotSteadyReplaysBoardValue(t *testing.T) {
 func TestSubscribeWhileNotSteadyWithEmptyCacheIsPending(t *testing.T) {
 	r := NewRegistry()
 
-	first, sub := r.Subscribe("temp", false)
+	first, sub := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", sub)
 
 	if first.Kind != EventThingUnavailable {
@@ -96,7 +96,7 @@ func TestSubscribeWhileNotSteadyWithEmptyCacheIsPending(t *testing.T) {
 func TestApplyLastValuesEmitsExactlyOneLastValueFrame(t *testing.T) {
 	r := NewRegistry()
 
-	_, sub := r.Subscribe("temp", false)
+	_, sub := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", sub)
 
 	ts := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
@@ -120,7 +120,7 @@ func TestApplyLastValuesStoresTheAnnouncedValue(t *testing.T) {
 
 	r.ApplyLastValues([]Variable{{Name: "temp", Value: 21.5, Timestamp: ts}})
 
-	first, sub := r.Subscribe("temp", true)
+	first, sub := r.Subscribe("temp", "", true)
 	defer r.Unsubscribe("temp", sub)
 	if first.Kind != EventLastValue || first.Value != 21.5 || !first.Timestamp.Equal(ts) {
 		t.Errorf("got kind=%q value=%v ts=%v, want %q/21.5/%v",
@@ -134,7 +134,7 @@ func TestApplyLastValuesStoresTheAnnouncedValue(t *testing.T) {
 func TestApplyLastValuesResolvesPendingWithMissing(t *testing.T) {
 	r := NewRegistry()
 
-	first, sub := r.Subscribe("temp", false)
+	first, sub := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", sub)
 	if first.Kind != EventThingUnavailable {
 		t.Fatalf("first.Kind = %q, want %q", first.Kind, EventThingUnavailable)
@@ -159,7 +159,7 @@ func TestApplyLastValuesTreatsPendingAndKnowingSubscribersDifferently(t *testing
 	r := NewRegistry()
 
 	// app1 arrives while no thing is assigned and the board has no value yet.
-	waiting, subWaiting := r.Subscribe("temp", false)
+	waiting, subWaiting := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", subWaiting)
 	if waiting.Kind != EventThingUnavailable {
 		t.Fatalf("app1 first.Kind = %q, want %q", waiting.Kind, EventThingUnavailable)
@@ -167,11 +167,11 @@ func TestApplyLastValuesTreatsPendingAndKnowingSubscribersDifferently(t *testing
 
 	// An app writes the variable, so the board now has a value: app1 sees it as
 	// a live update, and app2 gets it as its first frame.
-	r.SetValue("temp", 42.0, time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC))
+	r.SetValue("temp", 42.0, time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC), "")
 	if evt := next(t, subWaiting); evt.Kind != EventUpdate {
 		t.Fatalf("app1 saw %q for the local write, want %q", evt.Kind, EventUpdate)
 	}
-	knowing, subKnowing := r.Subscribe("temp", false)
+	knowing, subKnowing := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", subKnowing)
 	if knowing.Kind != EventLastValue || knowing.Value != 42.0 {
 		t.Fatalf("app2 first.Kind = %q value=%v, want %q/42", knowing.Kind, knowing.Value, EventLastValue)
@@ -193,11 +193,11 @@ func TestApplyLastValuesTreatsPendingAndKnowingSubscribersDifferently(t *testing
 func TestApplyLastValuesWithNoValuesResolvesPendingOnly(t *testing.T) {
 	r := NewRegistry()
 
-	_, subWaiting := r.Subscribe("temp", false)
+	_, subWaiting := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", subWaiting)
 
-	r.SetValue("calc", 7.0, time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC))
-	_, subKnowing := r.Subscribe("calc", false)
+	r.SetValue("calc", 7.0, time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC), "")
+	_, subKnowing := r.Subscribe("calc", "", false)
 	defer r.Unsubscribe("calc", subKnowing)
 
 	r.ApplyLastValues(nil)
@@ -215,7 +215,7 @@ func TestApplyLastValuesWithNoValuesResolvesPendingOnly(t *testing.T) {
 func TestApplyLastValuesDoesNotRepeatTheVerdict(t *testing.T) {
 	r := NewRegistry()
 
-	_, sub := r.Subscribe("temp", false)
+	_, sub := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", sub)
 
 	r.ApplyLastValues(nil)
@@ -232,7 +232,7 @@ func TestApplyLastValuesDoesNotRepeatTheVerdict(t *testing.T) {
 func TestApplyLastValuesClearsPendingOnAnnouncedVariable(t *testing.T) {
 	r := NewRegistry()
 
-	_, sub := r.Subscribe("temp", false)
+	_, sub := r.Subscribe("temp", "", false)
 	defer r.Unsubscribe("temp", sub)
 
 	r.ApplyLastValues([]Variable{{Name: "temp", Value: 21.5, Timestamp: time.Now().UTC()}})

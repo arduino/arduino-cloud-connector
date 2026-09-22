@@ -7,10 +7,12 @@ package daemon
 
 import (
 	"container/heap"
+	"context"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/arduino/arduino-cloud-connector/internal/daemon/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
 )
 
@@ -62,10 +64,10 @@ func TestOutboundHeapTiebreakBySeq(t *testing.T) {
 func TestPropertyPacket(t *testing.T) {
 	d := &Daemon{reg: variables.NewRegistry()}
 	ts := time.Now().UTC()
-	d.reg.SetValue("clight:swi", true, ts)
-	d.reg.SetValue("clight:hue", 30.0, ts)
-	d.reg.SetValue("clight:sat", 50.0, ts)
-	d.reg.SetValue("clight:bri", 70.0, ts)
+	d.reg.SetValue("clight:swi", true, ts, "")
+	d.reg.SetValue("clight:hue", 30.0, ts, "")
+	d.reg.SetValue("clight:sat", 50.0, ts, "")
+	d.reg.SetValue("clight:bri", 70.0, ts, "")
 
 	// Scalar: only itself.
 	scalar := d.propertyPacket("led", false)
@@ -87,5 +89,58 @@ func TestPropertyPacket(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("property packet = %v, want %v", got, want)
+	}
+}
+
+// The submitting app's id must survive the whole outbound path — EnqueueVariable
+// queues it, runOutbound hands it to the registry — because that is what the
+// origin exclusion matches on. Dropping it anywhere in between silently
+// restores the bug: the app gets the echo of its own PUT, and a
+// read-modify-write app loses the increment it had already computed.
+//
+// The test drives the real path rather than asserting on the queued struct,
+// since the plumbing between the two ends is exactly what used to be missing.
+func TestOutboundCarriesClientIDToTheRegistry(t *testing.T) {
+	reg := variables.NewRegistry()
+	d := &Daemon{
+		reg:      reg,
+		outbound: make(chan outboundValue, outboundQueueSize),
+		state:    StateRun,
+		// Steady but with no thing_id: CloudSteady() accepts the value, and
+		// publishVariable then bails out with ErrNotSteady before touching the
+		// (absent) MQTT client — so the outbound worker runs for real with no
+		// broker. runOutbound logs the failed publish and keeps the value
+		// locally, which is the behaviour under test here.
+		snapshot: Snapshot{State: StateRun, Cloud: &cloud.Snapshot{State: cloud.StateSteady}},
+	}
+
+	_, writer := reg.Subscribe("counter", "app-1", true)
+	defer reg.Unsubscribe("counter", writer)
+	_, other := reg.Subscribe("counter", "app-2", true)
+	defer reg.Unsubscribe("counter", other)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.runOutbound(ctx)
+
+	if err := d.EnqueueVariable(ctx, "counter", int64(1), "app-1"); err != nil {
+		t.Fatalf("EnqueueVariable: %v", err)
+	}
+
+	// The second app is served first; both enqueues happen under one registry
+	// lock, so once this arrives the writer's frame would already be queued if
+	// the exclusion had failed.
+	select {
+	case evt := <-other.Events():
+		if evt.Value != int64(1) {
+			t.Errorf("second app got %v, want 1", evt.Value)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the second app's update")
+	}
+	select {
+	case evt := <-writer.Events():
+		t.Errorf("writer received the echo of its own PUT: value=%v", evt.Value)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

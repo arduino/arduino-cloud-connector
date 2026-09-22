@@ -444,7 +444,7 @@ func TestFSM_Steady_ThingReassignment_SyncsSubscribers(t *testing.T) {
 	runFSM(t, fsm)
 	driveToSteady(t, client, fsm)
 
-	first, sub := fsm.reg.Subscribe("temp", true)
+	first, sub := fsm.reg.Subscribe("temp", "", true)
 	defer fsm.reg.Unsubscribe("temp", sub)
 	require.Equal(t, variables.EventLastValueMissing, first.Kind,
 		"no value stored yet and a thing is assigned")
@@ -480,7 +480,7 @@ func TestFSM_Syncing_LastValuesTimeoutResolvesPendingSubscriber(t *testing.T) {
 	waitFor(t, fsm, StateSyncingLastValues)
 
 	// An app subscribes while the cloud is not steady: pending, owed a verdict.
-	first, sub := fsm.reg.Subscribe("temp", false)
+	first, sub := fsm.reg.Subscribe("temp", "", false)
 	defer fsm.reg.Unsubscribe("temp", sub)
 	require.Equal(t, variables.EventThingUnavailable, first.Kind)
 

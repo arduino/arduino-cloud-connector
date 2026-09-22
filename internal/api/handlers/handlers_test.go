@@ -244,7 +244,7 @@ func TestVariableEventsFirstFrameLastValueMissing(t *testing.T) {
 // frame is "lastvalue" carrying that value.
 func TestVariableEventsFirstFrameLastValue(t *testing.T) {
 	reg := variables.NewRegistry()
-	reg.SetValue("temp", float64(21.5), time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC))
+	reg.SetValue("temp", float64(21.5), time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC), "")
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/variables/{name}/events", handlers.HandleVariableEvents(reg, fakeSteady{true}))
 	srv := httptest.NewServer(mux)
@@ -351,7 +351,7 @@ func TestVariableSendRejectsWhenThingUnavailable(t *testing.T) {
 // first and the second app started blind.
 func TestVariableEventsFirstFrameLastValueWhileNotSteady(t *testing.T) {
 	reg := variables.NewRegistry()
-	reg.SetValue("temp", float64(42), time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC))
+	reg.SetValue("temp", float64(42), time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC), "")
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/variables/{name}/events", handlers.HandleVariableEvents(reg, fakeSteady{false}))
 	srv := httptest.NewServer(mux)

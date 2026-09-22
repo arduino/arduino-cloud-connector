@@ -32,7 +32,7 @@ func next(t *testing.T, sub *Subscription) UpdateEvent {
 func TestSubscribeNoValueYet(t *testing.T) {
 	r := NewRegistry()
 
-	first, sub := r.Subscribe("x", true)
+	first, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	if first.Kind != EventLastValueMissing {
@@ -47,9 +47,9 @@ func TestSubscribeReplaysLastValue(t *testing.T) {
 	r := NewRegistry()
 
 	ts := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
-	r.SetValue("x", int64(42), ts)
+	r.SetValue("x", int64(42), ts, "")
 
-	snapshot, sub := r.Subscribe("x", true)
+	snapshot, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	if snapshot.Kind != EventLastValue {
@@ -71,7 +71,7 @@ func TestSetValueZeroTimestampDefaultsToNow(t *testing.T) {
 	r := NewRegistry()
 
 	before := time.Now().UTC()
-	r.SetValue("x", int64(1), time.Time{})
+	r.SetValue("x", int64(1), time.Time{}, "")
 	v, err := r.Get("x")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -85,11 +85,11 @@ func TestSetValueZeroTimestampDefaultsToNow(t *testing.T) {
 func TestSubscribeReceivesLiveUpdates(t *testing.T) {
 	r := NewRegistry()
 
-	_, sub := r.Subscribe("x", true)
+	_, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	ts := time.Date(2026, 6, 22, 11, 0, 0, 0, time.UTC)
-	r.SetValue("x", int64(7), ts)
+	r.SetValue("x", int64(7), ts, "")
 
 	evt := next(t, sub)
 	if evt.Value != int64(7) {
@@ -107,13 +107,13 @@ func TestSubscribeReceivesLiveUpdates(t *testing.T) {
 // dropping nothing — the core ordering guarantee.
 func TestFIFOOrderingUnderBurst(t *testing.T) {
 	r := NewRegistry()
-	_, sub := r.Subscribe("x", true)
+	_, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	const n = 1000
 	go func() {
 		for i := 0; i < n; i++ {
-			r.SetValue("x", int64(i), time.Now().UTC())
+			r.SetValue("x", int64(i), time.Now().UTC(), "")
 		}
 	}()
 
@@ -130,10 +130,10 @@ func TestFIFOOrderingUnderBurst(t *testing.T) {
 func TestLastValueIsAlwaysLatest(t *testing.T) {
 	r := NewRegistry()
 
-	r.SetValue("x", int64(1), time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC))
-	r.SetValue("x", int64(2), time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC))
+	r.SetValue("x", int64(1), time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC), "")
+	r.SetValue("x", int64(2), time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC), "")
 
-	snapshot, sub := r.Subscribe("x", true)
+	snapshot, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	if snapshot.Kind != EventLastValue || snapshot.Value != int64(2) {
@@ -145,11 +145,11 @@ func TestLastValueIsAlwaysLatest(t *testing.T) {
 // receive subsequent live updates in order.
 func TestMultipleSubscribers(t *testing.T) {
 	r := NewRegistry()
-	r.SetValue("x", int64(5), time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC))
+	r.SetValue("x", int64(5), time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC), "")
 
-	s1snap, sub1 := r.Subscribe("x", true)
+	s1snap, sub1 := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub1)
-	s2snap, sub2 := r.Subscribe("x", true)
+	s2snap, sub2 := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub2)
 
 	if s1snap.Kind != EventLastValue || s2snap.Kind != EventLastValue ||
@@ -157,7 +157,7 @@ func TestMultipleSubscribers(t *testing.T) {
 		t.Fatalf("both subscribers should replay last value 5, got %v / %v", s1snap.Value, s2snap.Value)
 	}
 
-	r.SetValue("x", int64(9), time.Date(2026, 6, 22, 13, 0, 0, 0, time.UTC))
+	r.SetValue("x", int64(9), time.Date(2026, 6, 22, 13, 0, 0, 0, time.UTC), "")
 
 	for i, sub := range []*Subscription{sub1, sub2} {
 		if evt := next(t, sub); evt.Value != int64(9) {
@@ -172,9 +172,9 @@ func TestCloudValueBeforeSubscribeIsReplayed(t *testing.T) {
 	r := NewRegistry()
 
 	ts := time.Date(2026, 6, 22, 9, 0, 0, 0, time.UTC)
-	r.SetValue("cloudvar", "hello", ts) // no prior registration/subscription
+	r.SetValue("cloudvar", "hello", ts, "") // no prior registration/subscription
 
-	snapshot, sub := r.Subscribe("cloudvar", true)
+	snapshot, sub := r.Subscribe("cloudvar", "", true)
 	defer r.Unsubscribe("cloudvar", sub)
 
 	if snapshot.Kind != EventLastValue || snapshot.Value != "hello" || !snapshot.Timestamp.Equal(ts) {
@@ -186,7 +186,7 @@ func TestCloudValueBeforeSubscribeIsReplayed(t *testing.T) {
 // Unsubscribe closes the subscription's channel and stops its pump.
 func TestUnsubscribeClosesChannel(t *testing.T) {
 	r := NewRegistry()
-	_, sub := r.Subscribe("x", true)
+	_, sub := r.Subscribe("x", "", true)
 	r.Unsubscribe("x", sub)
 
 	select {
@@ -202,7 +202,7 @@ func TestUnsubscribeClosesChannel(t *testing.T) {
 // Concurrent writers and a subscriber must not race (run under -race).
 func TestConcurrentWritersNoRace(t *testing.T) {
 	r := NewRegistry()
-	_, sub := r.Subscribe("x", true)
+	_, sub := r.Subscribe("x", "", true)
 	defer r.Unsubscribe("x", sub)
 
 	// Drain in the background.
@@ -219,7 +219,7 @@ func TestConcurrentWritersNoRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
-				r.SetValue("x", int64(i), time.Now().UTC())
+				r.SetValue("x", int64(i), time.Now().UTC(), "")
 			}
 		}()
 	}
@@ -238,14 +238,14 @@ func TestGetUnknownVariable(t *testing.T) {
 func TestWithPrefix(t *testing.T) {
 	r := NewRegistry()
 	ts := time.Now().UTC()
-	r.SetValue("clight:swi", true, ts)
-	r.SetValue("clight:hue", 30.0, ts)
-	r.SetValue("clight:bri", 70.0, ts)
-	r.SetValue("led", false, ts) // unrelated scalar, must not match
+	r.SetValue("clight:swi", true, ts, "")
+	r.SetValue("clight:hue", 30.0, ts, "")
+	r.SetValue("clight:bri", 70.0, ts, "")
+	r.SetValue("led", false, ts, "") // unrelated scalar, must not match
 
 	// A subscribed-but-never-set placeholder (nil value, zero ts) must be
 	// excluded — it has no value to send in a property packet.
-	_, sub := r.Subscribe("clight:sat", true)
+	_, sub := r.Subscribe("clight:sat", "", true)
 	defer r.Unsubscribe("clight:sat", sub)
 
 	got := r.WithPrefix("clight:")
