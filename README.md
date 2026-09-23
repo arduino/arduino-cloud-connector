@@ -59,4 +59,5 @@ the `arduino-cloud-connector` systemd service.
 Configuration is read from the environment with the `ARDUINO_CLOUD_CONNECTOR__`
 prefix (see [`internal/config`](internal/config)). The available settings cover the
 data directory, the API port, the UNIX socket path, the MQTT broker and Provisioning
-API endpoints, an optional MQTT CA file, and the log level.
+API endpoints, an optional MQTT CA file, the host used for the connectivity probe,
+and the log level.
