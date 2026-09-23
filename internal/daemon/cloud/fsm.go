@@ -427,6 +427,12 @@ func (f *FSM) runSyncingLastValues(ctx context.Context) stateFn {
 			if attempts >= lastValuesMaxRetries {
 				slog.Error("cloud: no LastValues.update after max attempts; entering steady state without initial sync",
 					"attempts", attempts, "thing_id", f.thingID)
+				// No answer is treated as "the cloud announced nothing": every
+				// pending subscriber gets lastvalue_missing so apps stop waiting
+				// and can publish. Leaving them pending would freeze them in both
+				// directions, and the request pipeline makes a late answer
+				// unlikely enough that waiting for one is the worse bet.
+				f.reg.ApplyLastValues(nil)
 				return f.runSteady
 			}
 			attempts++
@@ -464,12 +470,6 @@ func (f *FSM) runSyncingLastValues(ctx context.Context) stateFn {
 func (f *FSM) runSteady(ctx context.Context) stateFn {
 	f.transition(StateSteady, f.thingID)
 	slog.Info("cloud: entered steady state", "thing_id", f.thingID)
-
-	// Resync SSE subscribers now that a thing is assigned and last values have
-	// been applied: each subscribed variable gets a lastvalue / lastvalue_missing
-	// frame so apps that connected while unprovisioned (told thing_unavailable)
-	// can resolve their local value against the cloud per their sync policy.
-	f.reg.NotifyResync()
 
 	for {
 		select {
@@ -595,23 +595,49 @@ func (f *FSM) shutdown() {
 
 // applyProperties decodes a SenML+CBOR payload and writes each variable into
 // the registry (creating entries on demand, so values pushed by the cloud
-// before any app subscribes are still stored as the last value). When logEach
-// is true (last-values sync) each decoded variable's name is logged.
-func (f *FSM) applyProperties(payload []byte, logEach bool) error {
-	if len(payload) == 0 {
+// before any app subscribes are still stored as the board's value).
+//
+// isLastValues distinguishes the two kinds of inbound payload, and it decides
+// which SSE event apps see — it is not just a logging switch:
+//
+//   - true (a LastValues.update, the reply to LastValues.begin): the payload is
+//     handed to Registry.ApplyLastValues, which emits "lastvalue" sync frames
+//     for what the cloud announced and "lastvalue_missing" to subscribers still
+//     waiting for a verdict. Each decoded variable's NAME is logged (never its
+//     value — see TestApplyProperties_NeverLogsVariableValue).
+//   - false (a live property message on the thing's inbound topic): each value
+//     goes through SetValue, which emits "update".
+//
+// On the last-values path exactly one ApplyLastValues call happens on every
+// exit path, including an empty or undecodable payload: a pending subscriber
+// must always get its verdict, and "we could not read the answer" is no
+// different from "there was no answer".
+func (f *FSM) applyProperties(payload []byte, isLastValues bool) error {
+	var (
+		vars []senml.Variable
+		err  error
+	)
+	if len(payload) > 0 {
+		vars, err = senml.Decode(payload)
+	}
+
+	if !isLastValues {
+		if err != nil {
+			return err
+		}
+		for _, v := range vars {
+			f.reg.SetValue(v.Name, v.Value, v.Timestamp)
+		}
 		return nil
 	}
-	vars, err := senml.Decode(payload)
-	if err != nil {
-		return err
-	}
+
+	values := make([]variables.Variable, 0, len(vars))
 	for _, v := range vars {
-		if logEach {
-			slog.Info("cloud: last value received", "name", v.Name)
-		}
-		f.reg.SetValue(v.Name, v.Value, v.Timestamp)
+		slog.Info("cloud: last value received", "name", v.Name)
+		values = append(values, variables.Variable{Name: v.Name, Value: v.Value, Timestamp: v.Timestamp})
 	}
-	return nil
+	f.reg.ApplyLastValues(values)
+	return err
 }
 
 func nextConnBackoff(current time.Duration) time.Duration {
