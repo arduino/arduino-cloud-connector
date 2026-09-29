@@ -1,7 +1,7 @@
 # SIGTERM from Steady is a clean exit.
 #
-# systemd stops the service with SIGTERM. The daemon must close its broker
-# session (a DISCONNECT, not a dropped socket the broker only notices at the
+# systemd stops the service with SIGTERM. The daemon must unsubscribe from the
+# thing's property topic, close its broker session (a DISCONNECT, not a dropped socket the broker only notices at the
 # keepalive), keep the session resumable (expire: false, so a restart finds its
 # subscriptions and in-flight QoS 1 messages), and exit 0 on its own before
 # stop_daemon's timeout -- a daemon that hangs gets SIGKILLed by systemd and
@@ -48,6 +48,9 @@ steps:
 
   # ── SIGTERM ───────────────────────────────────────────────────────────────
   - stop_daemon: { timeout: 20s }
+  # The Cloud FSM's shutdown leaves the thing's topic first, then closes the
+  # session. Both travel on the one broker connection, so their order is real.
+  - expect_mqtt_unsubscribe: { topic: "/a/t/{thing_id}/e/i" }
   # The DISCONNECT is sent before the process exits, but the broker and the
   # process supervisor record them on different goroutines.
   - expect_any_order:
