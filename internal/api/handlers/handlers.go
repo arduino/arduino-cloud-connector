@@ -193,16 +193,20 @@ type steadyReporter interface {
 // frame is always one of three sync events telling the app how to seed its
 // local value:
 //
-//   - "thing_unavailable": the cloud has no thing assigned yet. The app keeps
-//     its local value; a resync frame ("lastvalue"/"lastvalue_missing") is sent
-//     later when the cloud reaches Steady (see Registry.NotifyResync).
-//   - "lastvalue": the thing is assigned and this variable has a cloud last
-//     value (replayed with last_value:true) — the app resolves per sync policy.
-//   - "lastvalue_missing": the thing is assigned but this variable has no cloud
-//     value — the local value wins and is pushed up.
+//   - "lastvalue": the board has a value for this variable (replayed with
+//     last_value:true) — the app resolves per sync policy. Sent whether or not
+//     the daemon is synced with the cloud, so two apps sharing a variable
+//     always start from the same number.
+//   - "thing_unavailable": the board has no value yet and no thing is assigned.
+//     The app keeps its local value; a sync frame follows once the cloud's last
+//     values are applied (see Registry.ApplyLastValues).
+//   - "lastvalue_missing": the board has no value and the cloud announced none
+//     either — the local value wins and is pushed up.
 //
 // Every subsequent live change is an "update" event. Multiple apps may
-// subscribe to the same variable concurrently — each gets its own first frame.
+// subscribe to the same variable concurrently — each gets its own first frame,
+// and which one they get depends on when they arrived, so the frames are
+// chosen by the Registry under its lock rather than here.
 //
 // The connection is established immediately even for an unknown/never-set
 // variable: the response headers are flushed up front, before the first frame,
@@ -211,7 +215,7 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 
-		snapshot, hasValue, sub := reg.Subscribe(name)
+		first, sub := reg.Subscribe(name, cloud.CloudSteady())
 		defer reg.Unsubscribe(name, sub)
 
 		flusher, ok := w.(http.Flusher)
@@ -226,25 +230,18 @@ func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Ha
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush() // open the stream now, before the first frame
 
-		// First frame: the sync state the app resolves against.
-		var (
-			kind variables.EventKind
-			err  error
-		)
-		switch {
-		case !cloud.CloudSteady():
-			kind = variables.EventThingUnavailable
-			err = writeSSE(w, kind, map[string]string{"name": name})
-		case hasValue:
-			kind = variables.EventLastValue
-			err = writeSSE(w, kind, snapshot)
-		default:
-			kind = variables.EventLastValueMissing
-			err = writeSSE(w, kind, map[string]string{"name": name})
+		// First frame: the sync state the app resolves against. Registry.Subscribe
+		// already chose it; all that is left here is the payload shape, because a
+		// value-less frame must not carry a null value and a zero timestamp.
+		var err error
+		if first.Kind == variables.EventLastValue {
+			err = writeSSE(w, first.Kind, first)
+		} else {
+			err = writeSSE(w, first.Kind, map[string]string{"name": name})
 		}
 		if err != nil {
 			// Client gone before the seed, or the payload could not be sent.
-			slog.Error("sse: failed to write first frame", "name", name, "event", string(kind), "error", err)
+			slog.Error("sse: failed to write first frame", "name", name, "event", string(first.Kind), "error", err)
 			return
 		}
 		flusher.Flush()
