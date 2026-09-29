@@ -34,6 +34,10 @@ type stubDaemon struct {
 	putCode  int
 	startErr int
 	puts     []string
+	// clientIDs records the identifier header seen on each variable call,
+	// keyed by "put" / "sse". A key absent means the call carried no header at
+	// all, which is a different fact from an empty one.
+	clientIDs map[string]string
 
 	frames chan string // pushed onto every open SSE stream
 }
@@ -41,9 +45,10 @@ type stubDaemon struct {
 func newStubDaemon(t *testing.T) (*stubDaemon, string) {
 	t.Helper()
 	d := &stubDaemon{
-		status:  Status{Provisioning: "unprovisioned", Daemon: "CheckInternet"},
-		putCode: http.StatusNoContent,
-		frames:  make(chan string, 16),
+		status:    Status{Provisioning: "unprovisioned", Daemon: "CheckInternet"},
+		putCode:   http.StatusNoContent,
+		frames:    make(chan string, 16),
+		clientIDs: map[string]string{},
 	}
 
 	mux := http.NewServeMux()
@@ -81,11 +86,15 @@ func newStubDaemon(t *testing.T) (*stubDaemon, string) {
 		d.mu.Lock()
 		code := d.putCode
 		d.puts = append(d.puts, r.PathValue("name")+":"+body)
+		d.recordClientID("put", r)
 		d.mu.Unlock()
 		w.WriteHeader(code)
 	})
 	mux.HandleFunc("GET /v1/variables/{name}/events", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
+		d.mu.Lock()
+		d.recordClientID("sse", r)
+		d.mu.Unlock()
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			t.Error("the stub needs a flusher")
@@ -128,6 +137,21 @@ func (d *stubDaemon) setStatus(s Status) {
 	d.mu.Lock()
 	d.status = s
 	d.mu.Unlock()
+}
+
+// recordClientID stores the header only when the request actually carried it.
+// The caller holds d.mu.
+func (d *stubDaemon) recordClientID(call string, r *http.Request) {
+	if vals := r.Header.Values(clientIDHeader); len(vals) > 0 {
+		d.clientIDs[call] = vals[0]
+	}
+}
+
+func (d *stubDaemon) seenClientID(call string) (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v, ok := d.clientIDs[call]
+	return v, ok
 }
 
 func (d *stubDaemon) recorded() []string {
@@ -287,7 +311,7 @@ func TestPutVariable(t *testing.T) {
 	c, _, stub := newClient(t)
 	ctx := context.Background()
 
-	if err := c.PutVariable(ctx, "temp", 42.0); err != nil {
+	if err := c.PutVariable(ctx, "temp", 42.0, c.ClientID()); err != nil {
 		t.Fatalf("PutVariable: %v", err)
 	}
 	if got := stub.recorded(); len(got) != 1 || got[0] != `temp:{"value":42}` {
@@ -300,7 +324,7 @@ func TestPutVariable(t *testing.T) {
 	stub.mu.Lock()
 	stub.putCode = http.StatusConflict
 	stub.mu.Unlock()
-	if err := c.PutVariable(ctx, "temp", 1); err == nil {
+	if err := c.PutVariable(ctx, "temp", 1, c.ClientID()); err == nil {
 		t.Error("a 409 was not reported")
 	} else if !strings.Contains(err.Error(), "409") {
 		t.Errorf("error should name the status: %v", err)
@@ -331,7 +355,7 @@ func TestIdentityDoesNotRecordTheBoardToken(t *testing.T) {
 func TestSSEFramesBecomeEvents(t *testing.T) {
 	c, log, stub := newClient(t)
 
-	stream, err := c.SubscribeVariable(context.Background(), "temp")
+	stream, err := c.SubscribeVariable(context.Background(), "temp", c.ClientID())
 	if err != nil {
 		t.Fatalf("SubscribeVariable: %v", err)
 	}
@@ -378,7 +402,7 @@ func TestSSEFramesBecomeEvents(t *testing.T) {
 func TestAnUnparsableFrameIsStillRecorded(t *testing.T) {
 	c, log, stub := newClient(t)
 
-	stream, err := c.SubscribeVariable(context.Background(), "temp")
+	stream, err := c.SubscribeVariable(context.Background(), "temp", c.ClientID())
 	if err != nil {
 		t.Fatalf("SubscribeVariable: %v", err)
 	}
@@ -406,7 +430,7 @@ func TestSubscribeReportsAMissingEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if stream, err := c.SubscribeVariable(context.Background(), "temp"); err == nil {
+	if stream, err := c.SubscribeVariable(context.Background(), "temp", c.ClientID()); err == nil {
 		stream.Close()
 		t.Error("SubscribeVariable succeeded against nothing")
 	}
@@ -415,7 +439,7 @@ func TestSubscribeReportsAMissingEndpoint(t *testing.T) {
 func TestClosingTheStreamRecordsIt(t *testing.T) {
 	c, log, _ := newClient(t)
 
-	stream, err := c.SubscribeVariable(context.Background(), "temp")
+	stream, err := c.SubscribeVariable(context.Background(), "temp", c.ClientID())
 	if err != nil {
 		t.Fatalf("SubscribeVariable: %v", err)
 	}
@@ -443,5 +467,77 @@ func TestPathHelpers(t *testing.T) {
 	// A name with a slash would otherwise change the route it hits.
 	if got, want := VariablePath("a/b"), "/v1/variables/a%2Fb"; got != want {
 		t.Errorf("VariablePath = %q, want %q", got, want)
+	}
+}
+
+// The identifier has to reach BOTH calls, carrying the same value: the daemon
+// suppresses an app's echo by matching the one on the PUT against the one on
+// the subscription, so sending it on only one of them leaves nothing to match
+// and the app is handed back its own write.
+func TestClientIDSentOnBothVariableCalls(t *testing.T) {
+	c, _, stub := newClient(t)
+	ctx := context.Background()
+
+	if c.ClientID() == NoClientID {
+		t.Fatal("a fresh client must identify itself by default")
+	}
+	stream, err := c.SubscribeVariable(ctx, "temp", c.ClientID())
+	if err != nil {
+		t.Fatalf("SubscribeVariable: %v", err)
+	}
+	defer stream.Close()
+	if err := c.PutVariable(ctx, "temp", 42.0, c.ClientID()); err != nil {
+		t.Fatalf("PutVariable: %v", err)
+	}
+
+	put, okPut := stub.seenClientID("put")
+	sse, okSSE := stub.seenClientID("sse")
+	if !okPut || !okSSE {
+		t.Fatalf("%s reached put=%v sse=%v, want both", clientIDHeader, okPut, okSSE)
+	}
+	if put != sse || put != c.ClientID() {
+		t.Errorf("put=%q sse=%q, want both %q", put, sse, c.ClientID())
+	}
+}
+
+// NoClientID must send no header at all, not an empty one: that is how a
+// client written before the header behaves, and the daemon distinguishes the
+// two -- an empty identifier never matches a writer, an absent one is simply
+// not there. A scenario asks for it with `client_id: none`.
+func TestNoClientIDSendsNoHeader(t *testing.T) {
+	c, _, stub := newClient(t)
+	ctx := context.Background()
+	c.SetClientID(ResolveClientID("none"))
+
+	stream, err := c.SubscribeVariable(ctx, "temp", c.ClientID())
+	if err != nil {
+		t.Fatalf("SubscribeVariable: %v", err)
+	}
+	defer stream.Close()
+	if err := c.PutVariable(ctx, "temp", 42.0, c.ClientID()); err != nil {
+		t.Fatalf("PutVariable: %v", err)
+	}
+
+	if v, ok := stub.seenClientID("put"); ok {
+		t.Errorf("the PUT carried %s=%q, want no header", clientIDHeader, v)
+	}
+	if v, ok := stub.seenClientID("sse"); ok {
+		t.Errorf("the subscription carried %s=%q, want no header", clientIDHeader, v)
+	}
+}
+
+// A step may act as another app without disturbing the client's own identity.
+func TestPerCallClientIDOverridesTheClientsOwn(t *testing.T) {
+	c, _, stub := newClient(t)
+	ctx := context.Background()
+
+	if err := c.PutVariable(ctx, "temp", 42.0, "app-2"); err != nil {
+		t.Fatalf("PutVariable: %v", err)
+	}
+	if v, _ := stub.seenClientID("put"); v != "app-2" {
+		t.Errorf("the PUT carried %q, want app-2", v)
+	}
+	if c.ClientID() == "app-2" {
+		t.Error("a per-call identifier must not become the client's own")
 	}
 }

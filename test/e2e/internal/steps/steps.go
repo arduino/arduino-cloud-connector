@@ -39,6 +39,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/appclient"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/harness"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/broker"
@@ -392,6 +393,17 @@ func appPost(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor
 type appVarWriteParams struct {
 	Variable string `yaml:"variable"`
 	Value    any    `yaml:"value"`
+	// ClientID acts as a different app for this one write. Absent means the
+	// scenario's own app; `none` sends no identifier at all.
+	ClientID *string `yaml:"client_id"`
+}
+
+// clientIDFor resolves a step's optional client_id against the scenario's app.
+func clientIDFor(sc *Context, override *string) string {
+	if override == nil {
+		return sc.World.App.ClientID()
+	}
+	return appclient.ResolveClientID(*override)
 }
 
 // appVarWrite is the app writing a variable, the uplink half of the app role.
@@ -405,7 +417,7 @@ func appVarWrite(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cu
 	}
 	sc.Detail = fmt.Sprintf("PUT %s=%v", p.Variable, p.Value)
 
-	if err := sc.World.App.PutVariable(ctx, p.Variable, p.Value); err != nil {
+	if err := sc.World.App.PutVariable(ctx, p.Variable, p.Value, clientIDFor(sc, p.ClientID)); err != nil {
 		return sc.Cursor, fmt.Errorf("app_var_write %s: %w", p.Variable, err)
 	}
 	return sc.Cursor, nil
@@ -413,6 +425,10 @@ func appVarWrite(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cu
 
 type appVarSubscribeParams struct {
 	Variable string `yaml:"variable"`
+	// ClientID subscribes as a different app. Absent means the scenario's own
+	// app; `none` sends no identifier, the way a client written before the
+	// header does.
+	ClientID *string `yaml:"client_id"`
 }
 
 // appVarSubscribe opens the variable's event stream. It returns only once the
@@ -430,7 +446,7 @@ func appVarSubscribe(ctx context.Context, sc *Context, node *yaml.Node) (eventlo
 	// The subscription outlives the step, so the World owns it and closes it at
 	// teardown: a leaked stream would keep the daemon writing into a reader
 	// nobody reads.
-	stream, err := sc.World.App.SubscribeVariable(context.WithoutCancel(ctx), p.Variable)
+	stream, err := sc.World.App.SubscribeVariable(context.WithoutCancel(ctx), p.Variable, clientIDFor(sc, p.ClientID))
 	if err != nil {
 		return sc.Cursor, fmt.Errorf("app_var_subscribe %s: %w", p.Variable, err)
 	}

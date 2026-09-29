@@ -9,19 +9,24 @@
 name: full-lifecycle
 strict_events: true
 
+# No X-App-Client-ID on any call, which is how a client written before the
+# header behaves -- the App Lab FE reaches the daemon over TCP and is one. It
+# keeps that path covered: the header is optional and its absence must go on
+# working, echo included. own-write-echo.yaml covers an app that does send it.
+client_id: none
+
 tolerate:
   # The daemon resends Thing.begin every 2s while it waits for Thing.update, so
   # a reply injected a few steps later legitimately leaves extra publishes
   # behind. Tolerated rather than asserted, because how many arrive depends on
   # how fast the machine running the suite is.
   - { source: mqtt, cmd: Thing.begin }
-  # The app's own write comes back on the app's own subscription: runOutbound
-  # stores the value (which fans out to SSE subscribers) BEFORE publishing it to
-  # the broker. Which of the two reaches the harness first is a race between an
-  # HTTP stream and an MQTT round trip, so claiming both in a fixed order would
-  # be flaky by construction. The MQTT publish is the fact this scenario is
-  # about and is asserted; the echo is forgiven here, narrowly -- this entry
-  # matches only the value the app wrote.
+  # This scenario's app sends no X-App-Client-ID (see client_id below), so the
+  # daemon cannot tell it apart from any other subscriber and its own write
+  # comes back on its own subscription. That is the documented behaviour for a
+  # client written before the header, not a defect, so it is tolerated here --
+  # narrowly, matching only the value the app wrote. own-write-echo.yaml
+  # asserts the opposite for an app that does identify itself.
   - { source: sse, event: update, variable: temp, value: 42 }
 
 steps:

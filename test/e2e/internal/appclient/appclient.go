@@ -21,6 +21,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +43,39 @@ const (
 	PathStatus            = "/v1/status"
 	PathProvisioningStart = "/v1/provisioning/start"
 )
+
+// clientIDHeader identifies the calling app, sent on the value PUT and on the
+// SSE subscription alike. The daemon skips the subscriptions carrying the same
+// identifier as the writer, so an app is never handed back its own write.
+//
+// Written out here rather than imported from the daemon, like every other name
+// in this file: a harness reading the daemon's own constant would keep
+// agreeing with it through a rename that broke every real app.
+const clientIDHeader = "X-App-Client-ID"
+
+// NoClientID is the identifier meaning "send no header at all". It is not a
+// degenerate case to tidy away: it is how a client written before the header
+// behaves, and the App Lab FE is one, so a scenario keeps that path covered by
+// asking for `client_id: none`.
+const NoClientID = ""
+
+// ResolveClientID maps what a scenario wrote onto the identifier to send.
+func ResolveClientID(s string) string {
+	if s == "none" {
+		return NoClientID
+	}
+	return s
+}
+
+// newClientID invents an identifier for one harness run. The daemon treats it
+// as opaque and compares it for equality only, so anything unique will do.
+func newClientID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("e2e-app-%d", time.Now().UnixNano())
+	}
+	return "e2e-app-" + hex.EncodeToString(b[:])
+}
 
 // VariablePath is PUT /v1/variables/{name}.
 func VariablePath(name string) string { return "/v1/variables/" + url.PathEscape(name) }
@@ -91,6 +126,7 @@ type Client struct {
 
 	mu         sync.Mutex
 	lastStatus string // rendered status, for change detection
+	clientID   string // sent as clientIDHeader; NoClientID sends nothing
 }
 
 // New returns a client for a daemon serving on baseURL (e.g.
@@ -103,8 +139,9 @@ func New(log *eventlog.Log, baseURL string) (*Client, error) {
 		return nil, fmt.Errorf("appclient: no base URL given")
 	}
 	return &Client{
-		log:     log,
-		baseURL: strings.TrimSuffix(baseURL, "/"),
+		log:      log,
+		baseURL:  strings.TrimSuffix(baseURL, "/"),
+		clientID: newClientID(),
 		// No global timeout on the client: the SSE stream is a long-lived
 		// response and a client-wide deadline would cut it off. Each one-shot
 		// call sets its own via the request context.
@@ -114,6 +151,22 @@ func New(log *eventlog.Log, baseURL string) (*Client, error) {
 
 // BaseURL is where the daemon is being reached.
 func (c *Client) BaseURL() string { return c.baseURL }
+
+// ClientID is the identifier this app sends by default.
+func (c *Client) ClientID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientID
+}
+
+// SetClientID replaces it, for a scenario that declares one (or declares
+// `none`). Called before the steps run; guarded because the status poller may
+// already be issuing calls.
+func (c *Client) SetClientID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clientID = id
+}
 
 // WaitReady polls the health endpoint until the daemon answers.
 //
@@ -126,7 +179,7 @@ func (c *Client) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
-		if status, _, err := c.do(ctx, http.MethodGet, PathHealth, nil, false); err == nil && status == http.StatusOK {
+		if status, _, err := c.do(ctx, http.MethodGet, PathHealth, nil, false, c.ClientID()); err == nil && status == http.StatusOK {
 			c.log.Append(eventlog.SourceApp, eventlog.KindHarnessNote, map[string]any{
 				"action": "daemon_ready",
 				"path":   PathHealth,
@@ -150,7 +203,7 @@ func (c *Client) WaitReady(ctx context.Context, timeout time.Duration) error {
 
 // Status fetches the daemon status and records it when it has changed.
 func (c *Client) Status(ctx context.Context) (Status, error) {
-	_, body, err := c.expect(ctx, http.MethodGet, PathStatus, nil, http.StatusOK)
+	_, body, err := c.expect(ctx, http.MethodGet, PathStatus, nil, http.StatusOK, c.ClientID())
 	if err != nil {
 		return Status{}, err
 	}
@@ -225,7 +278,7 @@ func (c *Client) StartStatusPoller(interval time.Duration) (stop func()) {
 
 // Identity fetches the board identity, which is where the uhwid comes from.
 func (c *Client) Identity(ctx context.Context) (Identity, error) {
-	_, body, err := c.expect(ctx, http.MethodGet, PathIdentity, nil, http.StatusOK)
+	_, body, err := c.expect(ctx, http.MethodGet, PathIdentity, nil, http.StatusOK, c.ClientID())
 	if err != nil {
 		return Identity{}, err
 	}
@@ -249,7 +302,7 @@ func (c *Client) StartProvisioning(ctx context.Context, organizationID string) e
 	if organizationID != "" {
 		body = map[string]string{"organization_id": organizationID}
 	}
-	_, _, err := c.expect(ctx, http.MethodPost, PathProvisioningStart, body, http.StatusAccepted)
+	_, _, err := c.expect(ctx, http.MethodPost, PathProvisioningStart, body, http.StatusAccepted, c.ClientID())
 	return err
 }
 
@@ -258,9 +311,11 @@ func (c *Client) StartProvisioning(ctx context.Context, organizationID string) e
 // A 409 is a real answer here, not a transport failure: the daemon refuses to
 // queue a value while no thing is assigned. It is returned as an error naming
 // the status so a scenario can tell the two apart.
-func (c *Client) PutVariable(ctx context.Context, name string, value any) error {
+// clientID is the app doing the writing: pass c.ClientID() for the harness's
+// own app, or another value to act as a second one.
+func (c *Client) PutVariable(ctx context.Context, name string, value any, clientID string) error {
 	_, _, err := c.expect(ctx, http.MethodPut, VariablePath(name),
-		map[string]any{"value": value}, http.StatusNoContent)
+		map[string]any{"value": value}, http.StatusNoContent, clientID)
 	return err
 }
 
@@ -268,9 +323,9 @@ func (c *Client) PutVariable(ctx context.Context, name string, value any) error 
 // primitive yet. wantStatus of 0 accepts any 2xx.
 func (c *Client) Post(ctx context.Context, path string, body any, wantStatus int) (int, []byte, error) {
 	if wantStatus != 0 {
-		return c.expect(ctx, http.MethodPost, path, body, wantStatus)
+		return c.expect(ctx, http.MethodPost, path, body, wantStatus, c.ClientID())
 	}
-	status, respBody, err := c.do(ctx, http.MethodPost, path, body, true)
+	status, respBody, err := c.do(ctx, http.MethodPost, path, body, true, c.ClientID())
 	if err != nil {
 		return status, respBody, err
 	}
@@ -285,6 +340,11 @@ func (c *Client) Post(ctx context.Context, path string, body any, wantStatus int
 // Stream is an open SSE subscription for one variable.
 type Stream struct {
 	Variable string
+	// ClientID is the app this stream belongs to. Every frame it carries is
+	// logged with it, which is what lets a scenario with two subscriptions on
+	// one variable say which app was meant to receive a frame -- and, more to
+	// the point, which one was meant not to.
+	ClientID string
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -296,7 +356,9 @@ type Stream struct {
 // It returns once the response headers are in, which is what makes ordering
 // meaningful: the daemon flushes them before the first frame, so a scenario
 // that subscribes and then injects a value cannot race its own subscription.
-func (c *Client) SubscribeVariable(ctx context.Context, name string) (*Stream, error) {
+// clientID is the subscribing app: values PUT with the same identifier are not
+// streamed back here.
+func (c *Client) SubscribeVariable(ctx context.Context, name string, clientID string) (*Stream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	path := VariableEventsPath(name)
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, c.baseURL+path, nil)
@@ -305,6 +367,9 @@ func (c *Client) SubscribeVariable(ctx context.Context, name string) (*Stream, e
 		return nil, fmt.Errorf("appclient: new request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	if clientID != NoClientID {
+		req.Header.Set(clientIDHeader, clientID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -323,17 +388,21 @@ func (c *Client) SubscribeVariable(ctx context.Context, name string) (*Stream, e
 		return nil, fmt.Errorf("appclient: GET %s: content type %q, want text/event-stream", path, ct)
 	}
 
-	c.log.Append(eventlog.SourceApp, eventlog.KindHarnessNote, map[string]any{
+	note := map[string]any{
 		"action":   "sse_subscribe",
 		"variable": name,
 		"path":     path,
-	}, nil)
+	}
+	if clientID != NoClientID {
+		note["client_id"] = clientID
+	}
+	c.log.Append(eventlog.SourceApp, eventlog.KindHarnessNote, note, nil)
 
-	s := &Stream{Variable: name, cancel: cancel, done: make(chan struct{})}
+	s := &Stream{Variable: name, ClientID: clientID, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
 		defer resp.Body.Close() //nolint:errcheck
-		c.pumpSSE(streamCtx, name, resp.Body)
+		c.pumpSSE(streamCtx, name, clientID, resp.Body)
 	}()
 	return s, nil
 }
@@ -350,7 +419,7 @@ func (s *Stream) Close() {
 // by hand rather than with an SSE library is deliberate -- the frame shape is
 // part of the contract with the app, and a library that tolerated a malformed
 // frame would hide exactly that.
-func (c *Client) pumpSSE(ctx context.Context, variable string, body io.Reader) {
+func (c *Client) pumpSSE(ctx context.Context, variable, clientID string, body io.Reader) {
 	scanner := bufio.NewScanner(body)
 	var eventName string
 	for scanner.Scan() {
@@ -359,7 +428,7 @@ func (c *Client) pumpSSE(ctx context.Context, variable string, body io.Reader) {
 		case strings.HasPrefix(line, "event: "):
 			eventName = strings.TrimPrefix(line, "event: ")
 		case strings.HasPrefix(line, "data: "):
-			c.appendSSEFrame(variable, eventName, strings.TrimPrefix(line, "data: "))
+			c.appendSSEFrame(variable, clientID, eventName, strings.TrimPrefix(line, "data: "))
 			eventName = ""
 		case line == "":
 			// Frame boundary.
@@ -382,7 +451,7 @@ func (c *Client) pumpSSE(ctx context.Context, variable string, body io.Reader) {
 
 // appendSSEFrame records one frame, with the payload fields flattened into
 // attributes so a step can constrain them.
-func (c *Client) appendSSEFrame(variable, eventName, data string) {
+func (c *Client) appendSSEFrame(variable, clientID, eventName, data string) {
 	attrs := map[string]any{
 		"variable": variable,
 		"event":    eventName,
@@ -395,14 +464,21 @@ func (c *Client) appendSSEFrame(variable, eventName, data string) {
 			attrs[k] = v
 		}
 	}
+	// After the payload, not before: which stream carried the frame is the
+	// harness's own fact and must not be shadowed by a field of the same name
+	// appearing in the daemon's JSON. Omitted when the stream sent no header,
+	// so `client_id: <anything>` cannot match an anonymous subscription.
+	if clientID != NoClientID {
+		attrs["client_id"] = clientID
+	}
 	c.log.Append(eventlog.SourceSSE, eventlog.KindSSEFrame, attrs, []byte(data))
 }
 
 // ── plumbing ─────────────────────────────────────────────────────────────────
 
 // expect performs a call and requires an exact status.
-func (c *Client) expect(ctx context.Context, method, path string, body any, wantStatus int) (int, []byte, error) {
-	status, respBody, err := c.do(ctx, method, path, body, true)
+func (c *Client) expect(ctx context.Context, method, path string, body any, wantStatus int, clientID string) (int, []byte, error) {
+	status, respBody, err := c.do(ctx, method, path, body, true, clientID)
 	if err != nil {
 		return status, respBody, err
 	}
@@ -415,7 +491,7 @@ func (c *Client) expect(ctx context.Context, method, path string, body any, want
 
 // do performs one call. record is false for the readiness poll, which would
 // otherwise fill the timeline with connection failures before the daemon is up.
-func (c *Client) do(ctx context.Context, method, path string, body any, record bool) (int, []byte, error) {
+func (c *Client) do(ctx context.Context, method, path string, body any, record bool, clientID string) (int, []byte, error) {
 	var reader io.Reader
 	var encoded []byte
 	if body != nil {
@@ -434,6 +510,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any, record b
 	}
 	if encoded != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if clientID != NoClientID {
+		req.Header.Set(clientIDHeader, clientID)
 	}
 
 	resp, err := c.http.Do(req)

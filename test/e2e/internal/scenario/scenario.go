@@ -25,6 +25,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/appclient"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/harness"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/provapi"
@@ -42,8 +43,14 @@ type Scenario struct {
 	// Thing.begin is the standing example: the daemon resends it with back-off,
 	// so a delayed Thing.update legitimately leaves extra publishes behind.
 	Tolerate []yaml.Node `yaml:"tolerate"`
-	Fakes    Fakes       `yaml:"fakes"`
-	Steps    []Step      `yaml:"steps"`
+	// ClientID is the identifier the scenario's app sends on its variable
+	// calls, so the daemon can avoid echoing an app its own write. Absent
+	// means one generated per run, which is what a real app does. `none`
+	// sends no header at all -- the behaviour of a client written before it,
+	// and the App Lab FE is still one, so that path stays covered.
+	ClientID *string `yaml:"client_id"`
+	Fakes    Fakes   `yaml:"fakes"`
+	Steps    []Step  `yaml:"steps"`
 
 	// Path is where it was loaded from, for an error that has to name the file.
 	Path string `yaml:"-"`
@@ -158,6 +165,9 @@ func Run(ctx context.Context, w *harness.World, sc Scenario, reg steps.Registry)
 			Status: eventlog.StepFailed,
 			Err:    err,
 		}}, tolerations(sc))
+	}
+	if sc.ClientID != nil {
+		w.App.SetClientID(appclient.ResolveClientID(*sc.ClientID))
 	}
 	if err := applyFakes(w, sc.Fakes); err != nil {
 		return w.Log.Result(sc.Name, []eventlog.StepResult{{

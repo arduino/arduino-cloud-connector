@@ -66,12 +66,12 @@ Reference for the YAML files under `scenarios/`. Each file is one end-to-end
 test: an ordered list of steps, run against the real daemon binary.
 
 - [Running the tests](#running-the-tests)
-- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `fakes`, `steps`
+- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `client_id`, `fakes`, `steps`
 - [Steps](#steps) — every step and every parameter
 - [Placeholders](#placeholders)
 - [Ordering rules](#ordering-rules)
 
-A scenario has five sections. Only `steps` is required.
+A scenario has six sections. Only `steps` is required.
 
 ```yaml
 name: full-lifecycle
@@ -193,6 +193,34 @@ Comparison works as it does in a step: numbers are compared numerically
 
 `strict_events: false` is equivalent to an entry with no keys at all, which
 matches everything.
+
+### `client_id`
+
+The identifier the scenario's app sends as `X-App-Client-ID`, on both the value
+PUT and the SSE subscription. The daemon skips the subscriptions carrying the
+same identifier as the writer, so an app is never handed back its own write --
+which is what used to make a read-modify-write app (`counter = counter + 1`)
+lose an increment.
+
+| Value | Meaning |
+|---|---|
+| absent | one generated per run, which is what a real app does |
+| `none` | send no header at all |
+| anything else | that literal, useful when the steps should read as named apps |
+
+`none` is not a degenerate case to avoid: it is how a client written before the
+header behaves, and the App Lab FE reaches the daemon over TCP and is one, so
+`full-lifecycle.yaml` declares it to keep that path covered. Such a client
+cannot be identified, so it is never excluded and **does** receive the echo of
+its own write -- correct, and tolerated there rather than asserted.
+
+```yaml
+client_id: app-1
+```
+
+A single step can act as a different app with its own `client_id`; see
+[`app_var_subscribe`](#app_var_subscribe). `own-write-echo.yaml` is the worked
+example.
 
 ### `fakes`
 
@@ -549,7 +577,12 @@ Waits for one frame on a variable stream opened by `app_var_subscribe`.
 | `value` | the value | number, string or bool |
 | `timestamp` | when the daemon stamped it | RFC 3339 string |
 | `last_value` | present and `true` on a sync frame | `true` |
+| `client_id` | the app whose stream carried the frame | string |
 | `decode_error` | set when the payload was not JSON | string |
+
+`client_id` is the harness's own record of which subscription received the
+frame, not a field the daemon sends. It is absent on a stream opened with
+`client_id: none`, so constraining it can never match an anonymous one.
 
 The **first** frame on a stream is always a sync frame, and which one depends
 on the daemon's state: `thing_unavailable` while the cloud is not steady,
@@ -706,9 +739,14 @@ which is a different failure from an unreachable daemon.
 |---|---|---|
 | `variable` | the variable name (required) | string |
 | `value` | the value to write | number, string or bool |
+| `client_id` | write as a different app | string, or `none` to send no header |
 
-The daemon answers 409 unless the cloud is `Steady`. Note that the write also
-comes back on the app's own stream as an `update` frame.
+The daemon answers 409 unless the cloud is `Steady`.
+
+The write is fanned out to every subscriber of the variable EXCEPT the ones
+carrying the writer's own `client_id` (see [`client_id`](#client_id)), so it
+does not come back on the writing app's own stream. A subscriber that sent no
+header cannot be identified and still receives it.
 
 ```yaml
 - app_var_write: { variable: temp, value: 42.0 }
@@ -730,11 +768,28 @@ scenario ends.
 | Parameter | Meaning | Values |
 |---|---|---|
 | `variable` | the variable to stream (required) | string |
+| `client_id` | subscribe as a different app | string, or `none` to send no header |
 
 ```yaml
 - app_var_subscribe: { variable: temp }
 - expect_app_event: { event: lastvalue, variable: temp, value: 21.5 }
 ```
+
+Two subscriptions on one variable, so a write by one is seen by the other and
+not by itself:
+
+```yaml
+- app_var_subscribe: { variable: temp }                      # the scenario's own app
+- app_var_subscribe: { variable: temp, client_id: app-2 }
+- app_var_write: { variable: temp, value: 42.0 }
+- expect_app_event: { event: update, variable: temp, value: 42.0, client_id: app-2 }
+# Nothing is written for the writer: an update frame carrying ITS client_id
+# would be an unclaimed significant event and strict_events fails the run.
+```
+
+Never let two subscriptions be due the same frame. Each is its own HTTP stream
+pumped by its own goroutine, so which arrives first is a race while the cursor
+only moves forward -- see [Ordering rules](#ordering-rules).
 
 ### `app_post`
 
@@ -855,7 +910,12 @@ Three things to know, because they decide where a step can go:
 2. **Do not order two events that race against each other.** A value the app
    writes is stored (reaching the SSE stream) before it is published to the
    broker, but one path is an HTTP stream and the other an MQTT round trip.
-   Assert one and put the other in `tolerate`.
+   Assert one and put the other in `tolerate`. The same applies to two
+   subscriptions due the same frame: each is its own stream pumped by its own
+   goroutine, so the daemon's fan-out order is not the arrival order. Arrange
+   the scenario so only one frame is ever in flight -- `own-write-echo.yaml`
+   has the second app subscribe only after the cloud→app leg is finished, for
+   exactly this reason.
 3. **Do not wait on a state between two protocol events.** Status polls are
    recorded only on change, so the poll that first reports `provisioned` can
    arrive *after* the MQTT connect; consuming it would skip past the connect
