@@ -94,7 +94,13 @@ func run() error {
 	defer stop()
 
 	var failed []string
+	skipped := 0
 	for _, sc := range selected {
+		if reason := sc.SkipReason(); reason != "" {
+			fmt.Printf("skipped: %s\n", reason)
+			skipped++
+			continue
+		}
 		result := runScenario(ctx, opts.daemonBin, sc, reg)
 
 		textPath, jsonPath, werr := scenario.WriteArtifacts(opts.artifacts, result)
@@ -130,7 +136,7 @@ func run() error {
 		return fmt.Errorf("%d of %d scenario(s) failed: %s",
 			len(failed), len(selected), strings.Join(failed, ", "))
 	}
-	fmt.Printf("all %d scenario(s) passed\n", len(selected))
+	fmt.Printf("all %d scenario(s) passed, %d skipped\n", len(selected)-skipped, skipped)
 	return nil
 }
 

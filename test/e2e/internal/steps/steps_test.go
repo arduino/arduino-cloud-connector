@@ -59,6 +59,12 @@ func stubDaemon(t *testing.T) (string, *[]string) {
 	})
 	mux.HandleFunc("PUT /v1/variables/{name}", func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, "put:"+r.PathValue("name"))
+		// "locked" answers the way the daemon does while the cloud is not
+		// steady, so the status assertion has something to hold against.
+		if r.PathValue("name") == "locked" {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /v1/variables/{name}/events", func(w http.ResponseWriter, r *http.Request) {
@@ -320,6 +326,119 @@ func TestAppActions(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("call %d = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// app_var_write asserts the answer: 204 unless the scenario names another, and
+// a refusal the scenario did not expect is a failure, not a pass.
+func TestAppVarWriteAssertsTheStatus(t *testing.T) {
+	w, _ := newWorld(t)
+
+	if _, _, err := run(t, w, "app_var_write", "{variable: locked, value: 1, status: 409}", 0); err != nil {
+		t.Errorf("expected 409: %v", err)
+	}
+	if _, _, err := run(t, w, "app_var_write", "{variable: locked, value: 1}", 0); err == nil {
+		t.Error("a 409 passed a write that expected the default 204")
+	}
+	if _, _, err := run(t, w, "app_var_write", "{variable: temp, value: 1, status: 409}", 0); err == nil {
+		t.Error("a 204 passed a write that expected 409")
+	}
+}
+
+// expect_any_order claims events that landed in the opposite order to the
+// entries, and leaves the cursor past the latest of them.
+func TestExpectAnyOrderMatchesRegardlessOfArrival(t *testing.T) {
+	w, _ := newWorld(t)
+	var last eventlog.Event
+	for _, id := range []string{"app-2", "app-1"} {
+		last = w.Log.Append(eventlog.SourceSSE, eventlog.KindSSEFrame, map[string]any{
+			"event": "update", "variable": "temp", "client_id": id,
+		}, nil)
+	}
+
+	sc, next, err := run(t, w, "expect_any_order", `
+- expect_app_event: { event: update, client_id: app-1, timeout: 2s }
+- expect_app_event: { event: update, client_id: app-2, timeout: 2s }
+`, 0)
+	if err != nil {
+		t.Fatalf("expect_any_order: %v", err)
+	}
+	if int(next) != last.Seq {
+		t.Errorf("cursor = %d, want %d (past the later of the two frames)", next, last.Seq)
+	}
+	if !strings.Contains(sc.Detail, "app-1") || !strings.Contains(sc.Detail, "app-2") {
+		t.Errorf("detail %q does not name both members", sc.Detail)
+	}
+}
+
+// Two members never share an event: that would assert two frames where the
+// daemon sent one. With a single matching event the second member must time
+// out, and the event stays claimed by the first.
+func TestExpectAnyOrderNeverClaimsOneEventTwice(t *testing.T) {
+	w, _ := newWorld(t)
+	only := w.Log.Append(eventlog.SourceSSE, eventlog.KindSSEFrame, map[string]any{
+		"event": "update", "variable": "temp", "client_id": "app-1",
+	}, nil)
+
+	_, _, err := run(t, w, "expect_any_order", `
+- expect_app_event: { event: update, client_id: app-1, timeout: 1s }
+- expect_app_event: { event: update, variable: temp, timeout: 1s }
+`, 0)
+	if err == nil || !strings.Contains(err.Error(), "entry 2") {
+		t.Fatalf("err = %v, want entry 2 to time out", err)
+	}
+	if by, _ := w.Log.ConsumedBy(only.Seq); by != "expect_any_order[1]/expect_app_event" {
+		t.Errorf("the frame is consumed by %q, want the first member", by)
+	}
+}
+
+// Identical entries count identical events: the anonymous-stream case, where
+// the frames cannot be told apart and how many arrived is the assertion. The
+// specific entry first, the broad one after it takes whatever is left.
+func TestExpectAnyOrderCountsIdenticalEvents(t *testing.T) {
+	w, _ := newWorld(t)
+	var frames []eventlog.Event
+	for _, attrs := range []map[string]any{
+		{"event": "update", "variable": "temp"},
+		{"event": "update", "variable": "temp", "client_id": "app-2"},
+		{"event": "update", "variable": "temp"},
+	} {
+		frames = append(frames, w.Log.Append(eventlog.SourceSSE, eventlog.KindSSEFrame, attrs, nil))
+	}
+
+	_, next, err := run(t, w, "expect_any_order", `
+- expect_app_event: { event: update, client_id: app-2, timeout: 1s }
+- expect_app_event: { event: update, variable: temp, timeout: 1s }
+- expect_app_event: { event: update, variable: temp, timeout: 1s }
+`, 0)
+	if err != nil {
+		t.Fatalf("expect_any_order: %v", err)
+	}
+	if int(next) != frames[2].Seq {
+		t.Errorf("cursor = %d, want %d", next, frames[2].Seq)
+	}
+	for _, f := range frames {
+		if _, ok := w.Log.ConsumedBy(f.Seq); !ok {
+			t.Errorf("frame %d was left unclaimed", f.Seq)
+		}
+	}
+}
+
+func TestExpectAnyOrderRejectsMalformedGroups(t *testing.T) {
+	w, _ := newWorld(t)
+	for name, y := range map[string]string{
+		"not a list":  "{event: update}",
+		"one member":  "[{expect_app_event: {event: update}}]",
+		"an action":   "[{expect_app_event: {event: update}}, {app_var_write: {variable: temp, value: 1}}]",
+		"nested":      "[{expect_app_event: {event: update}}, {expect_any_order: []}]",
+		"unknown":     "[{expect_app_event: {event: update}}, {expect_nothing: {}}]",
+		"not mapping": "[{expect_app_event: {event: update}}, expect_app_event]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := run(t, w, "expect_any_order", y, 0); err == nil {
+				t.Errorf("%s was accepted", name)
+			}
+		})
 	}
 }
 
@@ -655,7 +774,7 @@ func TestDefaultRegistryCoversTheScenarioVocabulary(t *testing.T) {
 		"expect_var_publish", "expect_app_event", "expect_tls_error", "expect_daemon_exit",
 		"get_device_identity", "get_daemon_status", "start_provisioning",
 		"app_post", "app_var_write", "app_var_subscribe",
-		"cloud_publish", "cloud_publish_var", "stop_daemon",
+		"cloud_publish", "cloud_publish_var", "stop_daemon", "expect_any_order",
 	} {
 		if _, ok := reg[name]; !ok {
 			t.Errorf("the registry has no %q", name)

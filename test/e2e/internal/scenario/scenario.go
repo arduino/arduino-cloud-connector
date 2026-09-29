@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -49,11 +51,26 @@ type Scenario struct {
 	// sends no header at all -- the behaviour of a client written before it,
 	// and the App Lab FE is still one, so that path stays covered.
 	ClientID *string `yaml:"client_id"`
-	Fakes    Fakes   `yaml:"fakes"`
-	Steps    []Step  `yaml:"steps"`
+	// SkipOnOS names the host OSes (runtime.GOOS values) the scenario cannot
+	// say anything on. It is for a scenario whose subject the harness cannot
+	// exercise there -- a graceful shutdown on a host without SIGTERM, where
+	// stop_daemon falls back to a kill -- and never for one that is merely
+	// flaky: CI runs on Linux, so a skip here must not hide a real failure.
+	SkipOnOS []string `yaml:"skip_on_os"`
+	Fakes    Fakes    `yaml:"fakes"`
+	Steps    []Step   `yaml:"steps"`
 
 	// Path is where it was loaded from, for an error that has to name the file.
 	Path string `yaml:"-"`
+}
+
+// SkipReason says why the scenario does not run on this host, or "" when it
+// does.
+func (sc Scenario) SkipReason() string {
+	if slices.Contains(sc.SkipOnOS, runtime.GOOS) {
+		return fmt.Sprintf("scenario %s declares skip_on_os: %s", sc.Name, runtime.GOOS)
+	}
+	return ""
 }
 
 // Fakes is the per-scenario fault injection.

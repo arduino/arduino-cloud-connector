@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -96,6 +97,23 @@ func TestLoadDefaultsTheNameToTheFileName(t *testing.T) {
 	}
 	if sc.Name != "reconnect" {
 		t.Errorf("name = %q, want reconnect", sc.Name)
+	}
+}
+
+// skip_on_os skips on exactly the hosts it names, and says so.
+func TestSkipOnOS(t *testing.T) {
+	path := write(t, "shutdown.yaml", "skip_on_os: ["+runtime.GOOS+"]\nsteps:\n  - stop_daemon: {}\n")
+	sc, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if reason := sc.SkipReason(); !strings.Contains(reason, runtime.GOOS) {
+		t.Errorf("SkipReason = %q, want it to name %s", reason, runtime.GOOS)
+	}
+
+	sc.SkipOnOS = []string{"plan9-but-not-this-host"}
+	if reason := sc.SkipReason(); reason != "" {
+		t.Errorf("SkipReason = %q on a host the scenario does not name", reason)
 	}
 }
 

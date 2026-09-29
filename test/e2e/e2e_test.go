@@ -70,6 +70,9 @@ func TestScenarios(t *testing.T) {
 		// four listeners, and interleaving two of those makes both timelines
 		// unreadable for no gain while there are this few of them.
 		t.Run(sc.Name, func(t *testing.T) {
+			if reason := sc.SkipReason(); reason != "" {
+				t.Skip(reason)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), scenarioTimeout)
 			defer cancel()
 

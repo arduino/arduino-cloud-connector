@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"sort"
 	"strings"
@@ -85,7 +86,7 @@ type Registry map[string]Func
 
 // Default is the vocabulary the shipped scenarios use.
 func Default() Registry {
-	return Registry{
+	reg := Registry{
 		// ── expectations ──────────────────────────────────────────────────
 		"expect_api_call":         awaitEvent(eventlog.SourceProvisioningAPI, eventlog.KindHTTPRequest, nil),
 		"expect_mqtt_connect":     awaitEvent(eventlog.SourceMQTT, eventlog.KindMQTTConnect, nil),
@@ -117,9 +118,96 @@ func Default() Registry {
 		"cloud_publish_var":   cloudPublishVar,
 		"stop_daemon":         stopDaemon,
 	}
+	// The group needs the registry it belongs to, to run the expectations it
+	// wraps, so it is added once the map exists.
+	reg["expect_any_order"] = expectAnyOrder(reg)
+	return reg
 }
 
 // ── expectations ─────────────────────────────────────────────────────────────
+
+// expectAnyOrder waits for several expectations that race against each other,
+// in whatever order they land.
+//
+// It exists for the one thing the forward-only cursor cannot say: one cause,
+// several effects on independent paths. A cloud value fanned out to three SSE
+// streams, or an app write that reaches another app's stream and the broker,
+// arrive in an order nobody controls, and writing them as consecutive steps
+// fixes an order that is a coin toss. Each member scans from the SAME cursor,
+// the group ends past the latest event any of them claimed, so everything
+// after the group is still ordered after all of it.
+//
+// Every member claims a DIFFERENT event: each takes the first match from the
+// cursor that no earlier member has taken. So two identical entries assert two
+// events, which is how identical frames on anonymous streams are counted. The
+// assignment is greedy, in entry order: when predicates overlap, write the
+// most specific entry first, or a broad one may take the event the specific
+// one needed and the group will time out waiting for a second.
+func expectAnyOrder(reg Registry) Func {
+	return func(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+		if node == nil || node.Kind != yaml.SequenceNode || len(node.Content) < 2 {
+			return sc.Cursor, fmt.Errorf("expect_any_order: needs a list of at least two expect_* steps")
+		}
+		type member struct {
+			name   string
+			params *yaml.Node
+		}
+		members := make([]member, 0, len(node.Content))
+		for i, item := range node.Content {
+			if item.Kind != yaml.MappingNode || len(item.Content) != 2 {
+				return sc.Cursor, fmt.Errorf("expect_any_order: entry %d must be a single-key mapping "+
+					"like `- expect_app_event: {client_id: app-1}`", i+1)
+			}
+			name := item.Content[0].Value
+			// Only expectations: an action inside would run at a point in time
+			// the group does not define, and a nested group would make "which
+			// cursor" unanswerable.
+			if !strings.HasPrefix(name, "expect_") || name == "expect_any_order" {
+				return sc.Cursor, fmt.Errorf("expect_any_order: entry %d is %q; only expect_* steps can be grouped", i+1, name)
+			}
+			if _, ok := reg[name]; !ok {
+				return sc.Cursor, fmt.Errorf("expect_any_order: entry %d: unknown step %q", i+1, name)
+			}
+			members = append(members, member{name: name, params: item.Content[1]})
+		}
+
+		end := sc.Cursor
+		// The cursor an expectation returns is the Seq of the event it matched.
+		claimedBy := map[eventlog.Cursor]string{}
+		details := make([]string, 0, len(members))
+		for i, m := range members {
+			sub := &Context{
+				World:  sc.World,
+				Cursor: sc.Cursor,
+				Name:   fmt.Sprintf("%s[%d]/%s", sc.Name, i+1, m.name),
+				Index:  sc.Index,
+			}
+			var next eventlog.Cursor
+			for {
+				var err error
+				next, err = reg[m.name](ctx, sub, m.params)
+				if err != nil {
+					sc.Predicate = sub.Predicate
+					sc.Detail = fmt.Sprintf("#%d %s", i+1, sub.Detail)
+					return sc.Cursor, fmt.Errorf("expect_any_order: entry %d (%s): %w", i+1, m.name, err)
+				}
+				owner, taken := claimedBy[next]
+				if !taken {
+					break
+				}
+				// An earlier entry has this event. Hand the claim back to it
+				// (the member just re-marked it) and look past it.
+				sc.World.Log.Consume(int(next), owner)
+				sub.Cursor = next
+			}
+			claimedBy[next] = sub.Name
+			end = max(end, next)
+			details = append(details, sub.Detail)
+		}
+		sc.Detail = "any order: " + strings.Join(details, " | ")
+		return end, nil
+	}
+}
 
 // awaitEvent is the one expectation primitive.
 //
@@ -396,6 +484,9 @@ type appVarWriteParams struct {
 	// ClientID acts as a different app for this one write. Absent means the
 	// scenario's own app; `none` sends no identifier at all.
 	ClientID *string `yaml:"client_id"`
+	// Status is the answer the write must get. Absent means 204; 409 is the
+	// daemon refusing a value while the cloud is not steady.
+	Status int `yaml:"status"`
 }
 
 // clientIDFor resolves a step's optional client_id against the scenario's app.
@@ -415,9 +506,16 @@ func appVarWrite(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cu
 	if p.Variable == "" {
 		return sc.Cursor, fmt.Errorf("app_var_write: variable is required")
 	}
+	want := p.Status
+	if want == 0 {
+		want = http.StatusNoContent
+	}
 	sc.Detail = fmt.Sprintf("PUT %s=%v", p.Variable, p.Value)
+	if want != http.StatusNoContent {
+		sc.Detail += fmt.Sprintf(" -> %d", want)
+	}
 
-	if err := sc.World.App.PutVariable(ctx, p.Variable, p.Value, clientIDFor(sc, p.ClientID)); err != nil {
+	if err := sc.World.App.PutVariableExpect(ctx, p.Variable, p.Value, clientIDFor(sc, p.ClientID), want); err != nil {
 		return sc.Cursor, fmt.Errorf("app_var_write %s: %w", p.Variable, err)
 	}
 	return sc.Cursor, nil

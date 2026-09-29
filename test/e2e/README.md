@@ -66,7 +66,7 @@ Reference for the YAML files under `scenarios/`. Each file is one end-to-end
 test: an ordered list of steps, run against the real daemon binary.
 
 - [Running the tests](#running-the-tests)
-- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `client_id`, `fakes`, `steps`
+- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `client_id`, `skip_on_os`, `fakes`, `steps`
 - [Steps](#steps) — every step and every parameter
 - [Placeholders](#placeholders)
 - [Ordering rules](#ordering-rules)
@@ -222,6 +222,18 @@ A single step can act as a different app with its own `client_id`; see
 [`app_var_subscribe`](#app_var_subscribe). `own-write-echo.yaml` is the worked
 example.
 
+### `skip_on_os`
+
+A list of `runtime.GOOS` values the scenario is skipped on. Only for a scenario
+whose subject the harness cannot exercise on that host -- a graceful shutdown on
+Windows, where there is no SIGTERM and `stop_daemon` falls back to a kill --
+never for one that is merely flaky there. CI runs on Linux, so nothing listed
+here hides a failure from it.
+
+```yaml
+skip_on_os: [windows]
+```
+
 ### `fakes`
 
 Fault injection, applied before the daemon starts. Today it has one key.
@@ -297,6 +309,7 @@ with a timeout.
 | [`expect_tls_error`](#expect_tls_error) | waits for the broker to refuse the client certificate |
 | [`expect_app_event`](#expect_app_event) | waits for one frame on a subscribed variable stream |
 | [`expect_daemon_exit`](#expect_daemon_exit) | waits for the daemon process to terminate |
+| [`expect_any_order`](#expect_any_order) | waits for several expectations that race, in any order |
 | [`await_daemon_state`](#await_daemon_state) | waits for a daemon state |
 | [`await_daemon_cloud_state`](#await_daemon_cloud_state) | waits for a cloud FSM state |
 | [`await_daemon_provisioning_state`](#await_daemon_provisioning_state) | waits for a provisioning state |
@@ -624,6 +637,32 @@ than letting every following expectation time out in turn.
 - expect_daemon_exit: { exit_code: 0, expected: true }
 ```
 
+### `expect_any_order`
+
+Waits for several expectations that race against each other, in whatever order
+they land: one cause with effects on independent paths -- a cloud value fanned
+out to several SSE streams, or an app write reaching another app's stream and
+the broker. Its parameter is a list of `expect_*` steps (at least two; actions
+and nested groups are rejected).
+
+Every entry scans from the same cursor and claims the first matching event no
+earlier entry has claimed, so two identical entries assert two events. The
+group ends past the latest event any entry claimed. The assignment is greedy in
+entry order: when predicates overlap, write the most specific first.
+
+```yaml
+- cloud_publish_var: { variable: temp, value: 30.0 }
+- expect_any_order:
+    - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-1 }
+    - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-2 }
+
+# a write: the other app's frame and the uplink publish, in either order
+- app_var_write: { variable: temp, value: 42.0 }
+- expect_any_order:
+    - expect_app_event: { event: update, variable: temp, value: 42.0, client_id: app-2 }
+    - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+```
+
 ### `await_daemon_state`
 
 Waits for a status poll reporting the given daemon state.
@@ -740,8 +779,10 @@ which is a different failure from an unreachable daemon.
 | `variable` | the variable name (required) | string |
 | `value` | the value to write | number, string or bool |
 | `client_id` | write as a different app | string, or `none` to send no header |
+| `status` | the HTTP status the write must get | integer, default `204` |
 
-The daemon answers 409 unless the cloud is `Steady`.
+The daemon answers 409 unless the cloud is `Steady`; assert it with
+`status: 409`. Any other answer than the expected one fails the step.
 
 The write is fanned out to every subscriber of the variable EXCEPT the ones
 carrying the writer's own `client_id` (see [`client_id`](#client_id)), so it
@@ -751,6 +792,11 @@ header cannot be identified and still receives it.
 ```yaml
 - app_var_write: { variable: temp, value: 42.0 }
 - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+```
+
+```yaml
+# refused while no thing is assigned: nothing is queued or stored
+- app_var_write: { variable: temp, value: 42.0, status: 409 }
 ```
 
 ```yaml
@@ -910,12 +956,11 @@ Three things to know, because they decide where a step can go:
 2. **Do not order two events that race against each other.** A value the app
    writes is stored (reaching the SSE stream) before it is published to the
    broker, but one path is an HTTP stream and the other an MQTT round trip.
-   Assert one and put the other in `tolerate`. The same applies to two
-   subscriptions due the same frame: each is its own stream pumped by its own
-   goroutine, so the daemon's fan-out order is not the arrival order. Arrange
-   the scenario so only one frame is ever in flight -- `own-write-echo.yaml`
-   has the second app subscribe only after the cloud→app leg is finished, for
-   exactly this reason.
+   Claim both inside one [`expect_any_order`](#expect_any_order), or assert
+   one and put the other in `tolerate`. The same applies to two subscriptions
+   due the same frame: each is its own stream pumped by its own goroutine, so
+   the daemon's fan-out order is not the arrival order -- `cloud-fan-out.yaml`
+   is the worked example.
 3. **Do not wait on a state between two protocol events.** Status polls are
    recorded only on change, so the poll that first reports `provisioned` can
    arrive *after* the MQTT connect; consuming it would skip past the connect

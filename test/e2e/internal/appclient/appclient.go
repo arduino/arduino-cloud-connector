@@ -314,8 +314,15 @@ func (c *Client) StartProvisioning(ctx context.Context, organizationID string) e
 // clientID is the app doing the writing: pass c.ClientID() for the harness's
 // own app, or another value to act as a second one.
 func (c *Client) PutVariable(ctx context.Context, name string, value any, clientID string) error {
+	return c.PutVariableExpect(ctx, name, value, clientID, http.StatusNoContent)
+}
+
+// PutVariableExpect is PutVariable with the answer the scenario expects, for
+// the write the daemon must refuse: a 409 while no thing is assigned is the
+// contract, and asserting it here is what keeps it from passing as a 204.
+func (c *Client) PutVariableExpect(ctx context.Context, name string, value any, clientID string, wantStatus int) error {
 	_, _, err := c.expect(ctx, http.MethodPut, VariablePath(name),
-		map[string]any{"value": value}, http.StatusNoContent, clientID)
+		map[string]any{"value": value}, wantStatus, clientID)
 	return err
 }
 
