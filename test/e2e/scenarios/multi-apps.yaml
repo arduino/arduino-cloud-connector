@@ -82,7 +82,4 @@ steps:
   - expect_any_order:
     # new value propagated to app 1
     - expect_app_event: { event: update, variable: temp, value: 50.0, client_id: app-1 }
-    - expect_var_publish:
-      topic: "/a/t/{thing_id}/e/o"
-      variable: temp
-      value: 50.0
+    - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 50.0 }
