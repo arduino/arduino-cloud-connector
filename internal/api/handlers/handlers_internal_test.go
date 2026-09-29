@@ -8,6 +8,8 @@ package handlers
 import (
 	"bytes"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -87,5 +89,41 @@ func TestWriteSSEReturnsWriteError(t *testing.T) {
 	err := writeSSE(errWriter{err: sentinel}, variables.EventLastValueMissing, map[string]string{"name": "temp"})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want it to wrap %v", err, sentinel)
+	}
+}
+
+// clientID is what makes the origin exclusion possible, so its edge cases are
+// worth pinning: an absent header must degrade to the pre-header behaviour
+// (every subscriber, writer included, keeps getting every frame), and an
+// over-long one must be treated as ABSENT rather than truncated — a truncated
+// id could collide with another app's and swallow a frame that app was
+// entitled to, which is a worse failure than one redundant frame.
+func TestClientIDHeader(t *testing.T) {
+	atCap := strings.Repeat("a", maxClientIDLen)
+
+	tests := []struct {
+		name   string
+		header string
+		set    bool
+		want   string
+	}{
+		{name: "absent", set: false, want: ""},
+		{name: "empty", header: "", set: true, want: ""},
+		{name: "uuid", header: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", set: true, want: "3f2504e0-4f89-41d3-9a0c-0305e82c3301"},
+		{name: "opaque non-uuid kept as-is", header: "app-1", set: true, want: "app-1"},
+		{name: "exactly at the cap", header: atCap, set: true, want: atCap},
+		{name: "over the cap is treated as absent", header: atCap + "a", set: true, want: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/v1/variables/temp/events", nil)
+			if tc.set {
+				r.Header.Set(clientIDHeader, tc.header)
+			}
+			if got := clientID(r); got != tc.want {
+				t.Errorf("clientID() length %d = %q, want %q", len(tc.header), got, tc.want)
+			}
+		})
 	}
 }

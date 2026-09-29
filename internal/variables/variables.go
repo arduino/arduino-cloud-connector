@@ -96,6 +96,14 @@ type Subscription struct {
 	wake    chan struct{} // coalesced "queue non-empty" signal (buffered 1)
 	closeCh chan struct{}
 
+	// clientID identifies the app that owns this subscription, as supplied on
+	// the SSE request (empty when the client sent none). It is set once at
+	// construction and never mutated, so reading it under the owning Registry's
+	// mu — as SetValue does, alongside pending — is safe. SetValue uses it to
+	// skip the subscriptions of the app that produced the value; see the origin
+	// exclusion documented there.
+	clientID string
+
 	mu     sync.Mutex
 	queue  []UpdateEvent
 	closed bool
@@ -108,11 +116,12 @@ type Subscription struct {
 	pending bool
 }
 
-func newSubscription() *Subscription {
+func newSubscription(clientID string) *Subscription {
 	s := &Subscription{
-		events:  make(chan UpdateEvent),
-		wake:    make(chan struct{}, 1),
-		closeCh: make(chan struct{}),
+		events:   make(chan UpdateEvent),
+		wake:     make(chan struct{}, 1),
+		closeCh:  make(chan struct{}),
+		clientID: clientID,
 	}
 	go s.pump()
 	return s
@@ -246,7 +255,22 @@ func (r *Registry) WithPrefix(prefix string) []Variable {
 // The value store and the per-subscriber enqueue happen together under the
 // registry lock, so concurrent SetValue calls for the same variable deliver to
 // all subscribers in one consistent order (the enqueue itself never blocks).
-func (r *Registry) SetValue(name string, value any, ts time.Time) {
+//
+// ORIGIN EXCLUSION. originClientID identifies the app whose write produced this
+// value; every subscription carrying the same non-empty id is skipped, so an
+// app is never handed back its own write. Only the outbound path passes a
+// non-empty id (a local PUT, through the daemon's outbound worker). Inbound
+// cloud traffic passes none and therefore still reaches every subscriber, the
+// original writer included: the cloud is not an app, and an app that wrote a
+// value must still learn if the cloud later changed it.
+//
+// Why it matters: without the exclusion the echo of an app's own PUT arrives
+// after the app has already computed its next value locally, and a CLOUD_WINS
+// variable adopts the stale echoed value — so a read-modify-write app (a
+// counter, an accumulator) silently loses an update. The echo is NOT dropped
+// for other subscribers: it is the only channel telling app2 that app1 changed
+// the variable, because the cloud does not echo a device's own write back.
+func (r *Registry) SetValue(name string, value any, ts time.Time, originClientID string) {
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
@@ -258,6 +282,9 @@ func (r *Registry) SetValue(name string, value any, ts time.Time) {
 	v.Value = value
 	v.Timestamp = ts
 	for _, sub := range r.listeners[name] {
+		if originClientID != "" && sub.clientID == originClientID {
+			continue
+		}
 		sub.enqueue(evt)
 	}
 }
@@ -346,11 +373,15 @@ func (r *Registry) ApplyLastValues(values []Variable) {
 //     subscription is marked pending — ApplyLastValues owes it a verdict.
 //   - EventLastValueMissing: no value, but a thing is assigned and its last
 //     values have already been applied, so the cloud has nothing for it.
-func (r *Registry) Subscribe(name string, cloudSteady bool) (first UpdateEvent, sub *Subscription) {
+//
+// clientID is the caller's opaque per-app identifier (empty when it sent none).
+// It is stored on the subscription so SetValue can skip it when the same app is
+// the one that produced the value — see the origin exclusion there.
+func (r *Registry) Subscribe(name string, clientID string, cloudSteady bool) (first UpdateEvent, sub *Subscription) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v := r.getOrCreate(name)
-	sub = newSubscription()
+	sub = newSubscription(clientID)
 	r.listeners[name] = append(r.listeners[name], sub)
 
 	switch {
