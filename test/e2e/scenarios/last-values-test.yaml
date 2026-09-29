@@ -1,0 +1,99 @@
+# Test for last values functionality in the cloud connector.
+# Test various scenarios:
+# 1) thing not attached initially, then attached later to test last values synchronization.
+# 2) thing change in favor of an thing without last values.
+
+name: last-values-test
+strict_events: true
+
+tolerate:
+  # The daemon resends Thing.begin every 2s while it waits for Thing.update, so
+  # a reply injected a few steps later legitimately leaves extra publishes
+  # behind. Tolerated rather than asserted, because how many arrive depends on
+  # how fast the machine running the suite is.
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── the daemon comes up unprovisioned and waits to be told ────────────────
+  # With no credentials on disk the daemon settles in Provisioning and does
+  # nothing until an app asks: that idleness is the contract App Lab relies on.
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+
+  # The uhwid is the one value only the daemon knows, and the next step needs
+  # it: a CSR subject carrying anything but this CN is the bug the fake CA
+  # reflects RDNs to catch.
+  - get_device_identity: {}
+  - start_provisioning: {}
+
+  # ── provisioning ──────────────────────────────────────────────────────────
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+
+  # ── the cloud handshake ───────────────────────────────────────────────────
+  # No state wait between provisioning and here, deliberately. Status polls are
+  # recorded on change, so the poll that first shows "provisioned" can land
+  # AFTER the connect it was meant to precede; consuming it would move the
+  # shared cursor past the connect and the next step would wait forever for an
+  # event already behind it. The connect is the better proof anyway:
+  # client_id_matches_cert_cn can only hold if the certificate was issued,
+  # activated and accepted.
+  - expect_mqtt_connect:
+      client_id_matches_cert_cn: true
+      clean_session: false
+      keepalive: 30
+      timeout: 60s
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  # Deterministic only under -tags mock, which returns a fixed {wifi, SSIDTEST1}
+  # instead of shelling out to the host's network tools.
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "" }
+  - await_daemon_cloud_state: { state: AwaitingThingID, device_id: "{device_id}" }
+  - app_var_subscribe: { variable: temp, client_id: app-1 }
+  # The app subscribes to the variable before the thing is available, so it should
+  # receive a thing_unavailable event.
+  - expect_app_event: { event: thing_unavailable, variable: temp, client_id: app-1 }
+
+
+  - cloud_publish: { cmd: Thing.update, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2" }
+  - expect_mqtt_subscribe: { topic: "/a/t/519bfb1c-1946-4e9e-a278-16a58f32b5a2/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - await_daemon_cloud_state: { state: SyncingLastValues, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2", device_id: "{device_id}", timeout: 30s }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  # After having received the last values from the cloud,
+  # the app should now have received the last value for the variable temp.
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-1 }
+  # app → cloud
+  - app_var_write: { variable: temp, value: 42.0, client_id: app-1 }
+  - expect_var_publish:
+      topic: "/a/t/519bfb1c-1946-4e9e-a278-16a58f32b5a2/e/o"
+      variable: temp
+      value: 42.0
+
+  # thing detachment
+  - cloud_publish: { cmd: Thing.detach, thing_id: "519bfb1c-1946-4e9e-a278-16a58f32b5a2" }
+  - expect_mqtt_unsubscribe: { topic: "/a/t/519bfb1c-1946-4e9e-a278-16a58f32b5a2/e/i" }
+  - await_daemon_cloud_state: { state: AwaitingThingID, device_id: "{device_id}", timeout: 30s }
+
+  # thing re-attachment
+  - cloud_publish: { cmd: Thing.update, thing_id: "06b6d05c-0988-4ebd-9b5c-1c5f2711ff38" }
+  - expect_mqtt_subscribe: { topic: "/a/t/06b6d05c-0988-4ebd-9b5c-1c5f2711ff38/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - await_daemon_cloud_state: { state: SyncingLastValues, thing_id: "06b6d05c-0988-4ebd-9b5c-1c5f2711ff38", device_id: "{device_id}", timeout: 30s }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: []
+
+  - await_daemon_cloud_state: { state: Steady, thing_id: "06b6d05c-0988-4ebd-9b5c-1c5f2711ff38", device_id: "{device_id}", timeout: 30s }
+  - app_var_subscribe: { variable: calc, client_id: app-2 }
+  - expect_app_event: { event: lastvalue_missing, variable: calc, client_id: app-2 }
+  - app_var_subscribe: { variable: temp, client_id: app-2 }
+  # Return the last available value for the variable temp even if it is not present in the attached thing
+  - expect_app_event: { event: lastvalue, variable: temp, value: 42, last_value: true, client_id: app-2 }

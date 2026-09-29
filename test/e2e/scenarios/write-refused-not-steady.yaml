@@ -1,0 +1,70 @@
+# A write the daemon cannot deliver is refused, and leaves no trace.
+#
+# While the cloud is not Steady (no thing assigned, or the thing was detached)
+# PUT /v1/variables/{name} answers 409 "thing_unavailable" and the value is NOT
+# queued. Two things must hold, and this scenario asserts both:
+#
+#   1. nothing reaches the broker: strict_events is on and nothing tolerates a
+#      publish on /e/o, so a refused value that leaked out fails the run;
+#   2. nothing reaches the registry: a refused value stored anyway would be
+#      replayed to the next subscriber as a bogus "last value". The subscribe
+#      after each refusal proves the cache still holds what it held before.
+name: write-refused-not-steady
+strict_events: true
+client_id: app-1
+
+tolerate:
+  # The daemon resends Thing.begin every 2s while it waits for Thing.update, and
+  # this scenario deliberately keeps it waiting.
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── provisioned and connected, but no thing yet ───────────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  # No thing_id constraint: the poller omits an empty thing_id, so `thing_id: ""`
+  # could never match.
+  - await_daemon_cloud_state: { state: AwaitingThingID, device_id: "{device_id}", timeout: 30s }
+
+  # ── refusal 1: no thing assigned ──────────────────────────────────────────
+  - app_var_write: { variable: temp, value: 42.0, status: 409 }
+
+  # ── attach a thing whose last values do NOT include temp ──────────────────
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # The refused 42 must not have become temp's last value: the board has none,
+  # and the cloud announced none, so the verdict is lastvalue_missing.
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue_missing, variable: temp, client_id: app-1 }
+
+  # ── Steady: the same write is now accepted ───────────────────────────────
+  # app-1 is the only subscriber and the writer, so no frame is due: the
+  # publish is the one event this write may produce.
+  - app_var_write: { variable: temp, value: 42.0 }
+  - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+
+  # ── refusal 2: the thing was detached ─────────────────────────────────────
+  - cloud_publish: { cmd: Thing.detach, thing_id: "{thing_id}" }
+  - expect_mqtt_unsubscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - await_daemon_cloud_state: { state: AwaitingThingID, device_id: "{device_id}", timeout: 30s }
+  - app_var_write: { variable: temp, value: 50.0, status: 409 }
+
+  # The cache is the board's value and survives a detach, so a new app still
+  # gets 42 -- and not the refused 50.
+  - app_var_subscribe: { variable: temp, client_id: app-2 }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 42.0, last_value: true, client_id: app-2 }

@@ -1,0 +1,66 @@
+# The Provisioning API fails transiently, and the daemon rides it out.
+#
+# Every failure below is inside the 10-minute provisioning window, so each one
+# must cost a retry and nothing else: the attempt resumes, the same board
+# token is sent again, and the board ends up connected exactly as on the happy
+# path. What the scenario rules out:
+#
+#   - giving up on a transient error (no retry = the next occurrence never
+#     comes and the step times out);
+#   - moving on to provision/complete with a certificate it could not parse
+#     (the "malformed" answer: 200, but a body the daemon cannot use);
+#   - reconnecting before activation (no MQTT connect may appear until
+#     provision/complete has answered ok -- the cursor enforces the order).
+#
+# Budget: the back-off is 2s, doubling, per endpoint, and cannot be shortened
+# from here. csr pays 2s + 4s, complete 2s: about 8s on top of the happy path.
+name: provisioning-api-errors
+strict_events: true
+
+fakes:
+  provisioning_api:
+    csr:
+      - { respond: status, status: 503 }
+      - { respond: malformed }
+      - { respond: issue_cert }
+    complete:
+      - { respond: status, status: 500 }
+      - { respond: ok }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+
+  # ── csr: 503, then a body it cannot parse, then a certificate ────────────
+  - expect_api_call: { endpoint: provision/csr, occurrence: 1, respond: status, status: 503, auth_present: true, timeout: 30s }
+  - expect_api_call: { endpoint: provision/csr, occurrence: 2, respond: malformed, auth_present: true, timeout: 30s }
+  - expect_api_call:
+      endpoint: provision/csr
+      occurrence: 3
+      respond: issue_cert
+      auth_present: true
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+
+  # ── complete: 500, then activated ─────────────────────────────────────────
+  - expect_api_call: { endpoint: provision/complete, occurrence: 1, respond: status, status: 500, auth_present: true, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, occurrence: 2, respond: ok, auth_present: true, timeout: 30s }
+
+  # ── and from here it is the happy path ───────────────────────────────────
+  # The connect is the proof the retried attempt produced a working
+  # certificate: the CN can only match if the one issued at occurrence 3 is
+  # the one presented.
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, clean_session: false, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }

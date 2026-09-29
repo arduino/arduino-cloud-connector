@@ -1,0 +1,55 @@
+# SIGTERM from Steady is a clean exit.
+#
+# systemd stops the service with SIGTERM. The daemon must close its broker
+# session (a DISCONNECT, not a dropped socket the broker only notices at the
+# keepalive), keep the session resumable (expire: false, so a restart finds its
+# subscriptions and in-flight QoS 1 messages), and exit 0 on its own before
+# stop_daemon's timeout -- a daemon that hangs gets SIGKILLed by systemd and
+# loses whatever it had queued.
+#
+# Skipped on Windows: there is no SIGTERM, stop_daemon falls back to a kill,
+# and the graceful path this scenario is about is never exercised. CI runs it
+# on Linux.
+name: graceful-shutdown
+strict_events: true
+client_id: app-1
+skip_on_os: [windows]
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+  # The daemon going away closes the app's SSE stream; that is the expected
+  # end of the stream, not traffic to assert on.
+  - { source: sse, kind: harness_note, action: sse_closed, variable: temp }
+
+steps:
+  # ── get to Steady with an app attached ────────────────────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-1 }
+
+  # ── SIGTERM ───────────────────────────────────────────────────────────────
+  - stop_daemon: { timeout: 20s }
+  # The DISCONNECT is sent before the process exits, but the broker and the
+  # process supervisor record them on different goroutines.
+  - expect_any_order:
+      - expect_mqtt_disconnect: { client_id: "{device_id}", expire: false }
+      - expect_daemon_exit: { exit_code: 0, expected: true }
