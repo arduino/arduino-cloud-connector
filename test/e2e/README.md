@@ -264,8 +264,8 @@ The two endpoint keys are `csr` and `complete`. Each entry takes:
 | `ok` | 200 with an empty body — the default for `complete` |
 | `status` | the `status` given, for retry scenarios |
 | `malformed` | 200 with a body the daemon cannot parse: the transport succeeded, the payload did not |
-| `bad_signature` | 200, well formed, signed by a key that is **not** the CA. The daemon stores the certificate and only the broker later refuses it |
-| `hang` | accepts the request and never answers, so the daemon's own timeout ends it |
+| `bad_signature` | 200, well formed, signed by a key that is **not** the CA. The daemon stores the certificate and only the broker later refuses it — see `provisioning-bad-signature.yaml` |
+| `hang` | accepts the request and never answers, so the daemon's own timeout ends it — 10s, so a `hang` costs about 12s with the back-off; see `provisioning-api-hang.yaml` |
 
 Because every request is an event, retries are directly assertable with
 `occurrence`. Budget the timeouts: the daemon's provisioning back-off is 2s and
