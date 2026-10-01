@@ -111,8 +111,9 @@ lists exactly what you did not claim.
 ### `tolerate`
 
 A list of predicates describing events that are correct but that no step
-claims. Only consulted when `strict_events: true`; entries are ignored
-otherwise.
+claims. Only consulted when `strict_events: true`, but always checked when the
+file loads: an entry that is not a mapping, or an empty one (`- {}` would
+forgive every event), is an error naming the line.
 
 **How an entry matches.** An event is forgiven when **every** key in the entry
 matches it. So fewer keys means broader: `{ source: mqtt }` forgives all MQTT

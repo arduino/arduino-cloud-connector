@@ -44,7 +44,9 @@ type Scenario struct {
 	// Tolerate lists traffic that is correct but unclaimed. The retried
 	// Thing.begin is the standing example: the daemon resends it with back-off,
 	// so a delayed Thing.update legitimately leaves extra publishes behind.
-	Tolerate []yaml.Node `yaml:"tolerate"`
+	// Validated at Load even with strict_events off, so a broken entry is
+	// found when the file is written and not when strict is turned on.
+	Tolerate Tolerations `yaml:"tolerate"`
 	// ClientID is the identifier the scenario's app sends on its variable
 	// calls, so the daemon can avoid echoing an app its own write. Absent
 	// means one generated per run, which is what a real app does. `none`
@@ -96,6 +98,46 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 	}
 	s.Name = node.Content[0].Value
 	s.Params = *node.Content[1]
+	return nil
+}
+
+// Tolerance is one tolerate entry: a mapping whose every key constrains the
+// event, exactly as an expectation's parameters do.
+type Tolerance struct {
+	Params map[string]any
+}
+
+// Tolerations is the tolerate list.
+type Tolerations []Tolerance
+
+// UnmarshalYAML rejects any entry that is not a non-empty mapping. Every
+// failure mode is silent otherwise: an entry that cannot become a predicate
+// forgives nothing and the report blames the events it should have covered; a
+// null one (`- ` alone) is dropped from the slice by yaml.v3 before an
+// element-level hook would see it, which is why the check sits on the list;
+// and an empty one has no constraints, so it matches every event and turns
+// strict_events off without saying so.
+func (ts *Tolerations) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("line %d: tolerate must be a list of mappings", node.Line)
+	}
+	out := make(Tolerations, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item.Kind != yaml.MappingNode {
+			return fmt.Errorf("line %d: a tolerate entry must be a mapping like "+
+				"`- { source: mqtt, cmd: Thing.begin }`", item.Line)
+		}
+		params := map[string]any{}
+		if err := item.Decode(&params); err != nil {
+			return fmt.Errorf("line %d: tolerate entry: %w", item.Line, err)
+		}
+		if len(params) == 0 {
+			return fmt.Errorf("line %d: an empty tolerate entry would forgive every event; "+
+				"set strict_events: false instead", item.Line)
+		}
+		out = append(out, Tolerance{Params: params})
+	}
+	*ts = out
 	return nil
 }
 
@@ -255,16 +297,10 @@ func tolerations(sc Scenario) []eventlog.Predicate {
 	if !sc.StrictEvents {
 		return []eventlog.Predicate{{Label: "strict_events is off"}}
 	}
+	// Every entry is a non-empty mapping by now: Load refuses anything else.
 	out := make([]eventlog.Predicate, 0, len(sc.Tolerate))
-	for i := range sc.Tolerate {
-		params := map[string]any{}
-		if err := sc.Tolerate[i].Decode(&params); err != nil {
-			// A malformed tolerate entry must not silently forgive nothing (or
-			// everything): it becomes a predicate that matches nothing, and the
-			// unconsumed events it should have covered then fail the run.
-			continue
-		}
-		out = append(out, steps.BuildPredicate(nil, params, nil))
+	for _, t := range sc.Tolerate {
+		out = append(out, steps.BuildPredicate(nil, t.Params, nil))
 	}
 	return out
 }

@@ -379,6 +379,64 @@ steps:
 	}
 }
 
+// A tolerate entry that cannot become a predicate is refused at Load, naming the
+// entry, rather than dropped: dropped, it forgave nothing and the report blamed
+// the events it should have covered. strict_events is off in every case on
+// purpose -- the entries must be checked even when they are not consulted.
+func TestLoadRejectsMalformedTolerateEntries(t *testing.T) {
+	cases := []struct {
+		name, entry, want string
+	}{
+		{"scalar", "  - Thing.begin\n", "line 3: a tolerate entry must be a mapping"},
+		{"sequence", "  - [mqtt, Thing.begin]\n", "line 3: a tolerate entry must be a mapping"},
+		// The empty ones are the dangerous pair: no constraints matches every
+		// event, which would switch the strict sweep off without saying so.
+		{"empty mapping", "  - {}\n", "line 3: an empty tolerate entry would forgive every event"},
+		// yaml.v3 drops a null element from a slice outright, so this one
+		// only fails because the check is on the list rather than the entry.
+		{"null", "  -\n", "line 3: a tolerate entry must be a mapping"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "name: broken\ntolerate:\n" + tc.entry + "steps:\n  - expect_mqtt_publish: {}\n"
+			_, err := Load(write(t, "broken.yaml", body))
+			if err == nil {
+				t.Fatal("Load accepted a malformed tolerate entry")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A valid entry becomes exactly the predicate it describes: every key a
+// constraint, source on the event field and the rest on attributes.
+func TestTolerateEntryBecomesItsPredicate(t *testing.T) {
+	sc, err := Load(write(t, "ok.yaml", `
+strict_events: true
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+steps:
+  - expect_mqtt_publish: {}
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	preds := tolerations(sc)
+	if len(preds) != 1 {
+		t.Fatalf("got %d predicates, want 1", len(preds))
+	}
+	got := map[string]any{}
+	for _, c := range preds[0].Constraints {
+		got[c.Field] = c.Want
+	}
+	want := map[string]any{"source": "mqtt", "attrs.cmd": "Thing.begin"}
+	if len(got) != len(want) || got["source"] != want["source"] || got["attrs.cmd"] != want["attrs.cmd"] {
+		t.Errorf("constraints = %v, want %v", got, want)
+	}
+}
+
 // Without strict_events the sweep is off, so a scenario can be written before
 // its tolerate list is understood.
 func TestNonStrictScenarioIgnoresUnconsumedTraffic(t *testing.T) {
