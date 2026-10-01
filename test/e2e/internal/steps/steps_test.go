@@ -272,6 +272,31 @@ func TestCloudPublish(t *testing.T) {
 	}
 }
 
+// With no daemon connected there is nothing to drop, and the step must fail
+// naming the id it looked for -- {device_id} by default -- rather than pass and
+// leave the next step waiting for a reconnect that cannot come. The drop itself
+// is covered against a real client in the broker tests.
+func TestCloudDropConnection(t *testing.T) {
+	w, _ := newWorld(t)
+
+	_, _, err := run(t, w, "cloud_drop_connection", "{}", 0)
+	if err == nil {
+		t.Fatal("dropping a connection that does not exist succeeded")
+	}
+	if !strings.Contains(err.Error(), "9f1c2d3e-4567-89ab-cdef-0123456789ab") {
+		t.Errorf("error = %q, want it to name the default {device_id}", err)
+	}
+
+	if _, _, err := run(t, w, "cloud_drop_connection", "{client_id: other}", 0); err == nil ||
+		!strings.Contains(err.Error(), `"other"`) {
+		t.Errorf("client_id was not honoured: %v", err)
+	}
+	if _, _, err := run(t, w, "cloud_drop_connection", "{clientid: other}", 0); err == nil ||
+		!strings.Contains(err.Error(), "clientid") {
+		t.Errorf("a misspelled parameter was not refused: %v", err)
+	}
+}
+
 func TestCloudPublishVar(t *testing.T) {
 	w, _ := newWorld(t)
 
@@ -774,7 +799,7 @@ func TestDefaultRegistryCoversTheScenarioVocabulary(t *testing.T) {
 		"expect_var_publish", "expect_app_event", "expect_tls_error", "expect_daemon_exit",
 		"get_device_identity", "get_daemon_status", "start_provisioning",
 		"app_post", "app_var_write", "app_var_subscribe",
-		"cloud_publish", "cloud_publish_var", "stop_daemon", "expect_any_order",
+		"cloud_publish", "cloud_publish_var", "cloud_drop_connection", "stop_daemon", "expect_any_order",
 	} {
 		if _, ok := reg[name]; !ok {
 			t.Errorf("the registry has no %q", name)

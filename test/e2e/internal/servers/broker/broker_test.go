@@ -558,6 +558,100 @@ func TestDisconnectIsRecorded(t *testing.T) {
 	}
 }
 
+// connectWithLost is connect with a connection-lost handler, which is how the
+// daemon learns of a drop: its FSM reconnects on that callback alone.
+func connectWithLost(t *testing.T, f fixture, cert tls.Certificate) (paho.Client, <-chan error, bool) {
+	t.Helper()
+	lost := make(chan error, 1)
+	opts := paho.NewClientOptions().
+		AddBroker(f.srv.URL()).
+		SetClientID(testDeviceID).
+		SetTLSConfig(clientTLS(f.ca, cert)).
+		SetCleanSession(false).
+		SetAutoReconnect(false).
+		SetKeepAlive(30 * time.Second).
+		SetConnectTimeout(awaitBudget).
+		SetConnectionLostHandler(func(_ paho.Client, err error) { lost <- err })
+
+	client := paho.NewClient(opts)
+	token := client.Connect()
+	if !token.WaitTimeout(awaitBudget) {
+		t.Fatal("CONNECT timed out")
+	}
+	if err := token.Error(); err != nil {
+		t.Fatalf("CONNECT failed: %v", err)
+	}
+	t.Cleanup(func() { client.Disconnect(250) })
+	return client, lost, token.(*paho.ConnectToken).SessionPresent()
+}
+
+// A drop is what a broker restart looks like from the device: the connection
+// goes with no DISCONNECT packet, the client is told through its lost handler,
+// and the session it asked to keep is still there when it comes back.
+func TestDropClientClosesTheConnectionAndKeepsTheSession(t *testing.T) {
+	f := newFixture(t)
+	cert := newDeviceCert(t, f.ca, false)
+	_, lost, _ := connectWithLost(t, f, cert)
+	_, cursor := await(t, f.log, 0, pred("mqtt CONNECT", eventlog.Eq("kind", string(eventlog.KindMQTTConnect))))
+
+	if err := f.srv.DropClient(testDeviceID); err != nil {
+		t.Fatalf("DropClient: %v", err)
+	}
+
+	// The note comes first, so a failure timeline shows the cause before the
+	// effect, and it is not significant: no scenario has to claim it.
+	note, cursor := await(t, f.log, cursor, pred("drop note",
+		eventlog.Eq("kind", string(eventlog.KindHarnessNote)),
+		eventlog.Eq("attrs.action", "drop_client"),
+		eventlog.Eq("attrs.client_id", testDeviceID),
+	))
+	if note.Significant() {
+		t.Error("the drop note is significant; every scenario that drops would have to tolerate it")
+	}
+	await(t, f.log, cursor, pred("mqtt DISCONNECT after the note",
+		eventlog.Eq("kind", string(eventlog.KindMQTTDisconnect)),
+		eventlog.Eq("attrs.client_id", testDeviceID),
+		eventlog.Eq("attrs.expire", false),
+	))
+
+	select {
+	case <-lost:
+	case <-time.After(awaitBudget):
+		t.Fatal("the client was never told its connection was lost")
+	}
+
+	// Coming back under the same id finds the session: SessionPresent is the
+	// broker saying so in the CONNACK.
+	_, _, sessionPresent := connectWithLost(t, f, cert)
+	if !sessionPresent {
+		t.Error("the session did not survive the drop; a real broker keeps a clean_session false session")
+	}
+}
+
+// Dropping a client that is not connected is a scenario bug, and must say so
+// rather than pass as a drop that happened: the reconnect it was meant to
+// trigger would then be waited for and never come.
+func TestDropClientRefusesAClientThatIsNotConnected(t *testing.T) {
+	f := newFixture(t)
+	if err := f.srv.DropClient(testDeviceID); err == nil {
+		t.Error("dropping a client that never connected succeeded")
+	}
+
+	client := connect(t, f, newDeviceCert(t, f.ca, false))
+	client.Disconnect(250)
+	await(t, f.log, 0, pred("mqtt DISCONNECT", eventlog.Eq("kind", string(eventlog.KindMQTTDisconnect))))
+	// The session outlives the connection, so the client is still in mochi's
+	// table: this is the case presence alone would get wrong.
+	if err := f.srv.DropClient(testDeviceID); err == nil {
+		t.Error("dropping a client that had already disconnected succeeded")
+	}
+	for _, ev := range f.log.Events() {
+		if ev.Kind == eventlog.KindHarnessNote {
+			t.Errorf("a refused drop left a note on the timeline: %v", ev)
+		}
+	}
+}
+
 // The URL is what goes into the daemon's environment, so its shape is part of
 // the contract with the rest of the harness.
 func TestURLAndAddr(t *testing.T) {

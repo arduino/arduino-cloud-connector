@@ -139,7 +139,7 @@ their attributes are documented.
 | `mqtt` | `mqtt_publish` | **yes** | see [`expect_mqtt_publish`](#expect_mqtt_publish) |
 | `mqtt` | `mqtt_tls_error` | **yes** | see [`expect_tls_error`](#expect_tls_error) |
 | `mqtt` | `mqtt_keepalive` | no | `client_id` |
-| `mqtt` | `harness_note` | no | the harness's own downlink injections, from `cloud_publish` and `cloud_publish_var` |
+| `mqtt` | `harness_note` | no | the harness's own downlink injections, from `cloud_publish` and `cloud_publish_var`; `action: drop_client` with `client_id`, from `cloud_drop_connection` |
 | `sse` | `sse_frame` | **yes** | see [`expect_app_event`](#expect_app_event) |
 | `sse` | `harness_note` | **yes** | `action: sse_closed` with `variable` and possibly `error`, or `note: unrecognised SSE line` with `line` |
 | `daemon_process` | `process_exit` | **yes** | see [`expect_daemon_exit`](#expect_daemon_exit) |
@@ -323,6 +323,7 @@ with a timeout.
 | [`app_post`](#app_post) | POSTs to any REST endpoint (escape hatch) |
 | [`cloud_publish`](#cloud_publish) | sends a command as the cloud |
 | [`cloud_publish_var`](#cloud_publish_var) | changes a property value as the cloud |
+| [`cloud_drop_connection`](#cloud_drop_connection) | drops the daemon's broker connection, to exercise the reconnect |
 | [`stop_daemon`](#stop_daemon) | shuts the daemon down and waits for it |
 
 ### Parameters are validators
@@ -912,6 +913,33 @@ Give either `variable` + `value` or `values`.
       - { name: temp, value: 30.0 }
       - { name: humidity, value: 61 }
 ```
+
+### `cloud_drop_connection`
+
+Closes the daemon's broker connection from the broker side, with no
+DISCONNECT packet — what a broker restart or a lost network path looks like to
+the board. It is the only way into the reconnect path: nothing the daemon does
+on its own leaves Steady and comes back.
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `client_id` | the connection to drop | string, default `{device_id}` |
+
+The session is kept (the daemon connects with `clean_session: false`, and a
+real broker keeps it), so the disconnect it causes has `expire: false`. The
+step does not wait for that disconnect: follow it with
+[`expect_mqtt_disconnect`](#expect_mqtt_disconnect). Dropping a client that is
+not connected is an error, rather than a drop that silently never happened.
+
+```yaml
+- cloud_drop_connection: {}
+- expect_mqtt_disconnect: { client_id: "{device_id}", expire: false }
+- await_daemon_cloud_state: { state: Reconnecting, timeout: 15s }
+- expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 30s }
+```
+
+`reconnect-after-drop.yaml` is the worked example, including why the
+`LastValues.update` after the reconnect carries no values.
 
 ### `stop_daemon`
 

@@ -108,15 +108,16 @@ func Default() Registry {
 			map[string]string{"state": "provisioning"}),
 
 		// ── actions ───────────────────────────────────────────────────────
-		"get_device_identity": getDeviceIdentity,
-		"get_daemon_status":   getDaemonStatus,
-		"start_provisioning":  startProvisioning,
-		"app_post":            appPost,
-		"app_var_write":       appVarWrite,
-		"app_var_subscribe":   appVarSubscribe,
-		"cloud_publish":       cloudPublish,
-		"cloud_publish_var":   cloudPublishVar,
-		"stop_daemon":         stopDaemon,
+		"get_device_identity":   getDeviceIdentity,
+		"get_daemon_status":     getDaemonStatus,
+		"start_provisioning":    startProvisioning,
+		"app_post":              appPost,
+		"app_var_write":         appVarWrite,
+		"app_var_subscribe":     appVarSubscribe,
+		"cloud_publish":         cloudPublish,
+		"cloud_publish_var":     cloudPublishVar,
+		"cloud_drop_connection": cloudDropConnection,
+		"stop_daemon":           stopDaemon,
 	}
 	// The group needs the registry it belongs to, to run the expectations it
 	// wraps, so it is added once the map exists.
@@ -639,6 +640,35 @@ func cloudPublishVar(ctx context.Context, sc *Context, node *yaml.Node) (eventlo
 
 	if err := sc.World.Broker.PublishProperty(thingID, payload); err != nil {
 		return sc.Cursor, fmt.Errorf("cloud_publish_var: %w", err)
+	}
+	return sc.Cursor, nil
+}
+
+type cloudDropConnectionParams struct {
+	// ClientID names the connection to drop. Absent means {device_id}, which
+	// is the id the daemon connects under.
+	ClientID string `yaml:"client_id"`
+}
+
+// cloudDropConnection closes the daemon's broker connection from the broker
+// side, which is what a broker restart or a lost network path looks like to
+// the device. It is the only way into the reconnect path: nothing the daemon
+// does on its own leaves Steady and comes back.
+//
+// It does not wait for the disconnect. That is an observation, and belongs to
+// the expect_mqtt_disconnect that follows.
+func cloudDropConnection(ctx context.Context, sc *Context, node *yaml.Node) (eventlog.Cursor, error) {
+	var p cloudDropConnectionParams
+	if err := decodeInto(node, &p); err != nil {
+		return sc.Cursor, err
+	}
+	clientID := p.ClientID
+	if clientID == "" {
+		clientID = sc.World.Vars.MustGet("device_id")
+	}
+	sc.Detail = "drop " + clientID
+	if err := sc.World.Broker.DropClient(clientID); err != nil {
+		return sc.Cursor, fmt.Errorf("cloud_drop_connection: %w", err)
 	}
 	return sc.Cursor, nil
 }

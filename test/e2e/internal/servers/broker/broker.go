@@ -27,14 +27,16 @@
 // Connects, disconnects, subscribes, unsubscribes, publishes (decoded through
 // internal/wire) and refused handshakes are all appended to the shared log,
 // because an observation that is not in the log cannot be asserted on and
-// cannot appear on a failure timeline. Injections the harness makes itself are
-// recorded as harness notes rather than as MQTT traffic, so a step waiting for
-// a device publish can never match the harness's own downlink.
+// cannot appear on a failure timeline. Injections the harness makes itself --
+// downlink publishes and dropped connections -- are recorded as harness notes
+// rather than as MQTT traffic, so a step waiting for a device publish can never
+// match the harness's own downlink.
 package broker
 
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -264,6 +266,35 @@ func (s *Server) PublishProperty(thingID string, payload []byte) error {
 // wants to pin that behaviour needs to say which one it is testing.
 func (s *Server) Publish(topic string, payload []byte, qos byte) error {
 	return s.publish(topic, payload, qos)
+}
+
+// errDropped is the stop cause DropClient gives mochi.
+var errDropped = errors.New("broker: connection dropped by the harness")
+
+// DropClient closes a connected client's network connection, as a broker that
+// restarts or a NAT that forgets the flow would: no DISCONNECT packet, the TCP
+// connection just goes. It is the only way to exercise the daemon's reconnect
+// path, which nothing the daemon does on its own can trigger.
+//
+// The session is left alone. The daemon connects with clean_session false, and
+// a real broker keeps that session across a dropped connection, so expiring it
+// here would test a broker the daemon never meets.
+//
+// The drop is recorded as a harness note BEFORE the connection is closed, so
+// on the timeline the cause always precedes the mqtt_disconnect it produces.
+func (s *Server) DropClient(clientID string) error {
+	cl, ok := s.mqtt.Clients.Get(clientID)
+	// A clean_session false client stays in the table after it disconnects,
+	// so presence alone does not mean connected.
+	if !ok || cl.Closed() {
+		return fmt.Errorf("broker: no connected client %q", clientID)
+	}
+	s.log.Append(eventlog.SourceMQTT, eventlog.KindHarnessNote, map[string]any{
+		"action":    "drop_client",
+		"client_id": clientID,
+	}, nil)
+	cl.Stop(errDropped)
+	return nil
 }
 
 func (s *Server) publish(topic string, payload []byte, qos byte) error {
