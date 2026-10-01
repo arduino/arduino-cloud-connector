@@ -1,0 +1,96 @@
+# BACKWARD COMPATIBILITY: apps that send no X-App-Client-ID.
+#
+# The origin exclusion (an app is not handed back its own write) needs the
+# writer to identify itself. Clients written before the X-App-Client-ID header
+# existed cannot, and the App Lab FE is still one of them. For those the daemon
+# keeps the behaviour they were built against:
+#
+#   - an anonymous writer DOES receive the echo of its own write, and so does
+#     every other anonymous subscriber of that variable -- the daemon cannot
+#     tell them apart, so it excludes none of them;
+#   - anonymous and identified apps interoperate: each hears the other's
+#     writes, and the identified writer alone is spared its own echo.
+#
+# This scenario pins that contract. If the anonymous echo ever disappears, a
+# pre-header client stops seeing its own writes confirmed and this run fails;
+# if it is dropped on purpose, this file is what has to change, deliberately.
+#
+# Anonymous streams carry no client_id in the log, so two of them cannot be
+# told apart by a predicate. They are therefore kept on their own variable
+# (humidity), where every frame that write produces is identical and the count
+# is what is asserted.
+name: legacy-client-no-id
+strict_events: true
+client_id: none
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── get to Steady with a thing and a known last value ─────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # ── an anonymous app alone: it hears its own write ────────────────────────
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true }
+  - app_var_write: { variable: temp, value: 42.0 }
+  # The echo on the writer's own stream is the backward-compatible behaviour
+  # under test; the publish races it on another path.
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 42.0 }
+      - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+
+  # ── an identified app joins ───────────────────────────────────────────────
+  - app_var_subscribe: { variable: temp, client_id: app-2 }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 42.0, last_value: true, client_id: app-2 }
+
+  # The anonymous app writes: BOTH streams get it, the writer's included.
+  - app_var_write: { variable: temp, value: 50.0 }
+  - expect_any_order:
+      # Specific entry first: "no client_id" cannot be written as a constraint,
+      # so the anonymous echo is the broad entry that takes whatever frame the
+      # app-2 one left.
+      - expect_app_event: { event: update, variable: temp, value: 50.0, client_id: app-2 }
+      - expect_app_event: { event: update, variable: temp, value: 50.0 }
+      - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 50.0 }
+
+  # The identified app writes: the anonymous app hears it, app-2 does not hear
+  # itself (strict_events would flag an update carrying client_id=app-2).
+  - app_var_write: { variable: temp, value: 60.0, client_id: app-2 }
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 60.0 }
+      - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 60.0 }
+
+  # ── two anonymous apps on one variable ────────────────────────────────────
+  # Both are subscribed before any value exists, so each first frame is the
+  # same lastvalue_missing, and a write from either one reaches both.
+  - app_var_subscribe: { variable: humidity }
+  - expect_app_event: { event: lastvalue_missing, variable: humidity }
+  - app_var_subscribe: { variable: humidity }
+  - expect_app_event: { event: lastvalue_missing, variable: humidity }
+  - app_var_write: { variable: humidity, value: 70.0 }
+  # Two identical frames, one per stream (the writer's included), and
+  # strict_events rules out a third.
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: humidity, value: 70.0 }
+      - expect_app_event: { event: update, variable: humidity, value: 70.0 }
+      - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: humidity, value: 70.0 }

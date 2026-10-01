@@ -1,0 +1,59 @@
+# The Provisioning API accepts the CSR and never answers, and the daemon gets
+# out of it on its own.
+#
+# A hung call is a different failure from an error status: no answer means the
+# only thing that ends it is the daemon's own per-call timeout (10s,
+# requestTimeout in internal/provisioning-api). Without that timeout the
+# attempt would sit on the first call for the whole 10-minute provisioning
+# window. What the scenario rules out:
+#
+#   - no timeout at all: occurrence 2 never comes and the step times out;
+#   - treating the timeout as fatal instead of transient: same symptom;
+#   - a retried attempt that is not a clean one: the certificate from
+#     occurrence 2 must be the one the broker is presented, which the connect
+#     checks through client_id_matches_cert_cn.
+#
+# Budget: the 10s timeout plus the first 2s back-off, about 12s on top of the
+# happy path. Neither can be shortened from here.
+name: provisioning-api-hang
+strict_events: true
+
+fakes:
+  provisioning_api:
+    csr:
+      - { respond: hang }
+      # then the queue is empty and the fake falls back to issue_cert
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+
+  # ── csr: no answer, then a certificate ────────────────────────────────────
+  # The event is recorded on arrival, so the hung call is on the timeline even
+  # though it is never answered.
+  - expect_api_call: { endpoint: provision/csr, occurrence: 1, respond: hang, auth_present: true, timeout: 30s }
+  # 30s covers the 10s timeout and the 2s back-off with room for a slow host.
+  - expect_api_call:
+      endpoint: provision/csr
+      occurrence: 2
+      respond: issue_cert
+      auth_present: true
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, occurrence: 1, respond: ok, auth_present: true, timeout: 30s }
+
+  # ── and from here it is the happy path ───────────────────────────────────
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, clean_session: false, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }

@@ -1,0 +1,69 @@
+# The Provisioning API answers with a certificate the broker does not trust,
+# and the daemon keeps knocking with it.
+#
+# bad_signature is a well-formed 200 signed by a key that is not the CA. The
+# daemon cannot tell -- it holds no CA key, it only reconstructs the
+# certificate -- so provisioning completes, and the failure surfaces one hop
+# later as a refused TLS handshake. That is the real-world shape of a
+# certificate that is wrong for the broker (historically: a CSR subject
+# carrying more than the CN).
+#
+# THIS PINS CURRENT BEHAVIOUR, decided on 2026-10-01: the daemon treats a
+# refused handshake like any failed connect -- Reconnecting with back-off,
+# forever, with the same certificate -- and never reprovisions on its own.
+# If that policy changes (e.g. reprovision after N refusals), this scenario is
+# the one to rewrite, not to tolerate around. What it asserts:
+#
+#   - the certificate presented is the one issued (cert_cn is the assigned
+#     device id), so the broker refuses the right thing for the right reason;
+#   - the daemon retries rather than crashing or stopping: a SECOND refusal;
+#   - it never reprovisions: strict_events is on and nothing tolerates a
+#     provisioning_api event, so a fresh provision/csr would fail the run.
+#     (Status polls are not significant, so that check is the only one that
+#     would catch it; see the state wait below for why it cannot help here.)
+#   - nothing gets through: nothing tolerates an mqtt_connect either, so a
+#     broker that accepted the certificate would fail the run.
+name: provisioning-bad-signature
+strict_events: true
+
+fakes:
+  provisioning_api:
+    csr:
+      - { respond: bad_signature }
+
+tolerate:
+  # The back-off keeps retrying for as long as the scenario runs, so refusals
+  # past the two asserted ones are expected; how many depends on the machine.
+  - { source: mqtt, kind: mqtt_tls_error }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+
+  # ── provisioning succeeds, as far as the daemon can tell ──────────────────
+  - expect_api_call:
+      endpoint: provision/csr
+      occurrence: 1
+      respond: bad_signature
+      status: 200
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, occurrence: 1, respond: ok, timeout: 30s }
+
+  # BEFORE the refusals, not after, and it has to be. Polls are recorded on
+  # change only, and a refused handshake keeps Connecting for milliseconds, so
+  # to the 200ms poller the state reads Reconnecting without a break from here
+  # on: no later poll is ever recorded. This one is the 1s initial back-off,
+  # which always ends before the first connect attempt.
+  - await_daemon_cloud_state:
+      state: Reconnecting
+      provisioning: provisioned
+      device_id: "{device_id}"
+      timeout: 30s
+
+  # ── the broker refuses it, twice ──────────────────────────────────────────
+  - expect_tls_error: { cert_cn: "{device_id}", timeout: 60s }
+  # The second one is the retry, after the back-off has grown.
+  - expect_tls_error: { cert_cn: "{device_id}", timeout: 30s }

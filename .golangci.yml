@@ -1,0 +1,20 @@
+version: "2"
+
+# `default: standard` is exactly what golangci-lint runs with no config at all,
+# so adding this file does not change the existing lint baseline -- it only
+# adds the depguard rule below.
+linters:
+  default: standard
+  enable:
+    - depguard
+  settings:
+    depguard:
+      rules:
+        # The E2E harness (test/e2e) is a separate Go module and must never be
+        # linked into the daemon. Without a `require` on that module the import
+        # would not compile anyway; this states the intent and gives whoever
+        # tries it a reason instead of a resolution error.
+        no-test-harness:
+          deny:
+            - pkg: github.com/arduino/arduino-cloud-connector/test/e2e
+              desc: the E2E harness is test-only and a separate module; production code must not import it

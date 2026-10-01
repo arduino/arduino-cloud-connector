@@ -11,6 +11,7 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 path = [
   "HANDOFF.md",
   "docs/**",
+  "test/e2e/README.md",
 ]
 SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
 SPDX-License-Identifier = "GPL-3.0-or-later"
@@ -35,6 +36,21 @@ path = [
   "go.sum",
   "README.md",
   "internal/api/docs/**",
+]
+SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# E2E test harness (test/e2e is a separate Go module): tool-generated and
+# configuration files, which carry no comment header. Mirrors how the root
+# go.mod / go.sum / .golangci.yml are handled above. Note go.sum CANNOT carry
+# one at all -- its format is one record per line and any comment makes the go
+# command reject it with "malformed go.sum".
+[[annotations]]
+path = [
+  "test/e2e/go.mod",
+  "test/e2e/go.sum",
+  "test/e2e/.golangci.yml",
+  "test/e2e/scenarios/**",
 ]
 SPDX-FileCopyrightText = "Arduino s.r.l. and/or its affiliated companies"
 SPDX-License-Identifier = "GPL-3.0-or-later"
