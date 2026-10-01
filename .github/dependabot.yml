@@ -7,19 +7,11 @@
 # DO NOT EDIT MANUALLY. Your changes will be overwritten.
 # ------------------------------------------------------------------------------
 version: 2
-registries:
-  bcmi-labs-github-actions:
-    type: git
-    url: https://github.com
-    username: x-access-token
-    password: "${{secrets.ARDUINOBOT_TOKEN}}"
 
 updates:
   # Maintain dependencies for gomod
   - package-ecosystem: "gomod"
     directory: "/"
-    registries:
-      - bcmi-labs-github-actions
     schedule:
       interval: "weekly" # or "daily", "monthly"
     open-pull-requests-limit: 10
