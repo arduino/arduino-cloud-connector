@@ -14,7 +14,6 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"go.bug.st/cleanup"
 
 	"github.com/arduino/arduino-cloud-connector/cmd/arduino-cloud-connector/daemon"
 	"github.com/arduino/arduino-cloud-connector/cmd/arduino-cloud-connector/version"
@@ -55,12 +54,15 @@ func main() {
 
 	ctx := context.Background()
 
-	// SIGINT (Ctrl-C) — interactive runs.
-	ctx, _ = cleanup.InterruptableContext(ctx)
+	// SIGINT (Ctrl-C) — interactive runs. stopInterrupt runs as soon as ctx is
+	// cancelled, restoring the default disposition so a second Ctrl-C kills a
+	// process stuck in shutdown.
+	ctx, stopInterrupt := signal.NotifyContext(ctx, os.Interrupt)
+	context.AfterFunc(ctx, stopInterrupt)
 
 	// SIGTERM — what systemd sends on `systemctl stop`/`restart`, and the only
-	// way the daemon is ever stopped on a board. The helper above registers
-	// os.Interrupt only, so without this the root context is never cancelled:
+	// way the daemon is ever stopped on a board. It gets its own context because
+	// without it the root context is never cancelled:
 	// the process is killed outright and every graceful-shutdown path hanging
 	// off ctx (daemon FSM handlers, Cloud FSM teardown, srv.Shutdown) is dead
 	// code in production. stop() restores the default disposition on return.
