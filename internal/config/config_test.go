@@ -17,6 +17,7 @@ var allEnvKeys = []string{
 	"ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL",
 	"ARDUINO_CLOUD_CONNECTOR__PORT",
 	"ARDUINO_CLOUD_CONNECTOR__SOCKET",
+	"ARDUINO_CLOUD_CONNECTOR__NTP_PROBE_HOST",
 }
 
 func clearEnv(t *testing.T) {
@@ -52,6 +53,9 @@ func TestNewFromEnvDefaults(t *testing.T) {
 	if cfg.LogLevel != defaultLogLevel {
 		t.Errorf("LogLevel: got %q want %q", cfg.LogLevel, defaultLogLevel)
 	}
+	if cfg.NTPProbeHost != defaultNTPProbeHost {
+		t.Errorf("NTPProbeHost: got %q want %q", cfg.NTPProbeHost, defaultNTPProbeHost)
+	}
 	// Empty => caller falls back to system roots (RootCAs nil).
 	if cfg.MQTTCAFile != "" {
 		t.Errorf("MQTTCAFile: got %q want empty (system roots)", cfg.MQTTCAFile)
@@ -67,6 +71,7 @@ func TestNewFromEnvOverrides(t *testing.T) {
 	t.Setenv("ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL", "debug")
 	t.Setenv("ARDUINO_CLOUD_CONNECTOR__PORT", "9000")
 	t.Setenv("ARDUINO_CLOUD_CONNECTOR__SOCKET", "/tmp/custom.sock")
+	t.Setenv("ARDUINO_CLOUD_CONNECTOR__NTP_PROBE_HOST", "127.0.0.1:18123")
 
 	cfg, err := NewFromEnv()
 	if err != nil {
@@ -94,6 +99,9 @@ func TestNewFromEnvOverrides(t *testing.T) {
 	}
 	if cfg.Port != 9000 {
 		t.Errorf("Port: got %d want 9000", cfg.Port)
+	}
+	if cfg.NTPProbeHost != "127.0.0.1:18123" {
+		t.Errorf("NTPProbeHost: got %q want 127.0.0.1:18123", cfg.NTPProbeHost)
 	}
 }
 

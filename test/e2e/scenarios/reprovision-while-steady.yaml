@@ -1,0 +1,78 @@
+# Reprovisioning a board that is already connected and Steady.
+#
+# POST /v1/provisioning/start from Run stops the Cloud FSM, wipes the old
+# credentials, rotates the cloud key and runs a fresh CSR attempt. The board
+# must come back through the whole handshake with the NEW certificate, and the
+# apps already subscribed must keep working across it.
+#
+# The fake Provisioning API assigns the same device id to every CSR, so the
+# topics do not move; get_daemon_status relearns the id anyway, which is what
+# a scenario must do after any second provisioning.
+name: reprovision-while-steady
+strict_events: true
+client_id: app-1
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── first provisioning, to Steady ─────────────────────────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      occurrence: 1
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, occurrence: 1, timeout: 30s }
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-1 }
+
+  # ── reprovision from Steady ──────────────────────────────────────────────
+  - start_provisioning: {}
+  # The Cloud FSM is stopped gracefully: it leaves the thing's topic, then
+  # closes the session, all before the new certificate is requested.
+  - expect_mqtt_unsubscribe: { topic: "/a/t/{thing_id}/e/i", timeout: 30s }
+  - expect_mqtt_disconnect: { timeout: 30s }
+  - expect_api_call:
+      endpoint: provision/csr
+      occurrence: 2
+      csr_subject: "CN={uhwid}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, occurrence: 2, timeout: 30s }
+  - get_daemon_status: { require: [device_id] }
+
+  # ── the whole handshake again, with the new certificate ──────────────────
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  # The cloud announces nothing this time. app-1 already knows temp and is not
+  # pending, so ApplyLastValues owes it no frame -- strict_events holds it to
+  # that. (Announcing a value instead would send app-1 a lastvalue frame
+  # BEFORE the FSM reaches Steady, and a frame and a status poll cannot be
+  # ordered against each other.)
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # ── the stream opened before the reprovision still works ────────────────
+  - cloud_publish_var: { variable: temp, value: 30.0 }
+  - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-1 }
+  - app_var_write: { variable: temp, value: 42.0 }
+  - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }

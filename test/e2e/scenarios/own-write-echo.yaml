@@ -1,0 +1,102 @@
+# The daemon must not hand an app back its own write, and must still hand it to
+# everyone else.
+#
+# Why this scenario exists: an app that reads a variable, computes from it and
+# writes it back (counter = counter + 1) used to lose an increment. Its own PUT
+# came back on its own subscription after it had already computed the next
+# value, and a CLOUD_WINS variable adopted the stale echo. The daemon now skips
+# the subscriptions carrying the same X-App-Client-ID as the writer.
+#
+# The negative half is asserted WITHOUT a dedicated primitive. strict_events is
+# on and nothing tolerates an `update` on temp, so if the echo came back to the
+# writer it would sit in the log unclaimed and fail the run -- which is how the
+# bug was caught in the first place.
+#
+# ORDERING RULE, learned the hard way: never let two subscriptions be due the
+# same frame. Each one is its own HTTP stream pumped by its own goroutine, so
+# which arrives first is a race, while the scenario cursor only moves forward --
+# a fixed order across streams is flaky by construction. Every stage below is
+# therefore arranged so exactly one frame is in flight: the second app
+# subscribes only after the cloud→app leg is done, and the header-less case
+# lives in full-lifecycle rather than adding a third stream here.
+name: own-write-echo
+strict_events: true
+
+# The writer's identity, written out rather than generated so the steps read as
+# two distinct apps.
+client_id: app-1
+
+tolerate:
+  # The daemon resends Thing.begin every 2s while it waits for Thing.update, so
+  # a reply injected a few steps later legitimately leaves extra publishes
+  # behind. Tolerated rather than asserted, because how many arrive depends on
+  # how fast the machine running the suite is.
+  - { source: mqtt, cmd: Thing.begin }
+  # The uplink half of the write. runOutbound stores the value -- which fans it
+  # out to the SSE subscribers -- BEFORE publishing it to the broker, so which
+  # of the two reaches the harness first is a race between an HTTP stream and
+  # an MQTT round trip: claiming both in a fixed order would be flaky by
+  # construction. This scenario is about the SSE fan-out, so that is the half
+  # it claims; thing-change.yaml asserts the publish for the same write, so the
+  # value reaching the cloud is not left unproven.
+  - { source: mqtt, variable: temp, value: 42 }
+
+steps:
+  # ── get to Steady with a thing and a known last value ─────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect:
+      client_id_matches_cert_cn: true
+      clean_session: false
+      keepalive: 30
+      timeout: 60s
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  - await_daemon_cloud_state:
+      state: Steady
+      thing_id: "{thing_id}"
+      device_id: "{device_id}"
+      timeout: 30s
+
+  # ── app-1 alone: inbound cloud traffic is never excluded ──────────────────
+  # Subscribing after Steady is what makes the first frame deterministic.
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-1 }
+
+  # app-1 is about to become the writer, and it still receives a value that
+  # came from the CLOUD. This is the over-correction guard: an exclusion that
+  # also covered inbound traffic would leave an app blind to the cloud
+  # changing a variable it once wrote.
+  - cloud_publish_var: { variable: temp, value: 30.0 }
+  - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-1 }
+
+  # ── app-2 joins, then app-1 writes ────────────────────────────────────────
+  # It syncs against 30.0, the value the cloud just set.
+  - app_var_subscribe: { variable: temp, client_id: app-2 }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 30.0, last_value: true, client_id: app-2 }
+
+  - app_var_write: { variable: temp, value: 42.0 }
+
+  # app-2 hears it. This is the only frame the write may produce: the cloud
+  # does not echo a device's own write back, so this stream is the only way
+  # app-2 can learn app-1 changed the variable.
+  - expect_app_event: { event: update, variable: temp, value: 42.0, client_id: app-2 }
+
+  # And app-1 does not hear it. Nothing is written here on purpose: an `update`
+  # frame carrying client_id=app-1 would be an unclaimed significant event, and
+  # strict_events fails the run on it.

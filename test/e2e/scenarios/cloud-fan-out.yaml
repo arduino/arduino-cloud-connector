@@ -1,0 +1,85 @@
+# A value from the cloud reaches every app subscribed to that variable, and
+# only those.
+#
+# Three apps follow temp, a fourth follows humidity. Inbound cloud traffic is
+# never subject to the origin exclusion, so every temp subscriber gets every
+# cloud temp update -- including one that last wrote temp itself -- and the
+# humidity app gets none of them (strict_events: an update frame on its stream
+# would be unclaimed).
+#
+# The frames of one fan-out land on independent streams in an order nobody
+# controls, hence expect_any_order.
+name: cloud-fan-out
+strict_events: true
+client_id: app-1
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── get to Steady with a thing and a known last value ─────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }, { name: humidity, value: 40.0 }]
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # ── four subscribers, one at a time so each first frame is unambiguous ───
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-1 }
+  - app_var_subscribe: { variable: temp, client_id: app-2 }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-2 }
+  - app_var_subscribe: { variable: temp, client_id: app-3 }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true, client_id: app-3 }
+  - app_var_subscribe: { variable: humidity, client_id: app-4 }
+  - expect_app_event: { event: lastvalue, variable: humidity, value: 40.0, last_value: true, client_id: app-4 }
+
+  # ── the cloud sets temp: all three temp apps, not the humidity one ───────
+  - cloud_publish_var: { variable: temp, value: 30.0 }
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-1 }
+      - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-2 }
+      - expect_app_event: { event: update, variable: temp, value: 30.0, client_id: app-3 }
+
+  # ── the cloud sets humidity: only app-4 ───────────────────────────────────
+  - cloud_publish_var: { variable: humidity, value: 55.0 }
+  - expect_app_event: { event: update, variable: humidity, value: 55.0, client_id: app-4 }
+
+  # ── one SenML message carrying both: each stream gets only its own ───────
+  - cloud_publish_var:
+      values: [{ name: temp, value: 31.0 }, { name: humidity, value: 56.0 }]
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 31.0, client_id: app-1 }
+      - expect_app_event: { event: update, variable: temp, value: 31.0, client_id: app-2 }
+      - expect_app_event: { event: update, variable: temp, value: 31.0, client_id: app-3 }
+      - expect_app_event: { event: update, variable: humidity, value: 56.0, client_id: app-4 }
+
+  # ── an app writes, then the cloud overwrites ──────────────────────────────
+  # app-1's write reaches the other two temp apps and the broker, not app-1.
+  - app_var_write: { variable: temp, value: 42.0 }
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 42.0, client_id: app-2 }
+      - expect_app_event: { event: update, variable: temp, value: 42.0, client_id: app-3 }
+      - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
+  # The exclusion is for the app's own write only: the next cloud value reaches
+  # app-1 again, like everyone else.
+  - cloud_publish_var: { variable: temp, value: 33.0 }
+  - expect_any_order:
+      - expect_app_event: { event: update, variable: temp, value: 33.0, client_id: app-1 }
+      - expect_app_event: { event: update, variable: temp, value: 33.0, client_id: app-2 }
+      - expect_app_event: { event: update, variable: temp, value: 33.0, client_id: app-3 }

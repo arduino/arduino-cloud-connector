@@ -1,0 +1,99 @@
+# The broker drops a Steady daemon's connection, and the daemon comes back on
+# its own.
+#
+# A drop is what a broker restart or a lost network path looks like from the
+# board: no DISCONNECT, the TCP connection just goes. Nothing the daemon does
+# by itself leaves Steady and returns, so cloud_drop_connection is the only way
+# into this path. What the scenario asserts:
+#
+#   - the daemon notices (Paho's connection-lost callback -> Reconnecting) and
+#     reconnects under the same identity and certificate, keeping its session;
+#   - it repeats the WHOLE handshake: the FSM forgets the thing id on the way
+#     back, so it must ask with Thing.begin again and wait for Thing.update
+#     before it resubscribes the property topic;
+#   - both directions work over the NEW connection, not just the connect;
+#   - the app is told nothing. Its subscription survives the drop and the
+#     daemon owes it no frame: strict_events is on and nothing tolerates an SSE
+#     frame, so a spurious thing_unavailable or a re-announced last value would
+#     sit unclaimed and fail the run.
+#
+# The second LastValues.update carries no values on purpose. A value for temp
+# would send the app a lastvalue frame that races the Steady status poll --
+# two independent paths the forward-only cursor cannot order -- and with
+# nothing announced, the subscriber (not pending: it already knows the board
+# value) is correctly sent nothing, which is the negative half above.
+name: reconnect-after-drop
+strict_events: true
+
+tolerate:
+  # The daemon resends Thing.begin every 2s while it waits for Thing.update, on
+  # both connections. How many arrive depends on the machine, so they are
+  # tolerated rather than counted.
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  # ── provision and reach Steady, as in full-lifecycle ──────────────────────
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call:
+      endpoint: provision/csr
+      csr_subject: "CN={uhwid}"
+      device_id: "{device_id}"
+      timeout: 30s
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+
+  - expect_mqtt_connect: { client_id_matches_cert_cn: true, clean_session: false, timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish:
+      cmd: LastValues.update
+      values: [{ name: temp, value: 21.5 }]
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # The app subscribes while Steady, so its first frame is deterministic, and
+  # keeps the stream open across everything that follows.
+  - app_var_subscribe: { variable: temp }
+  - expect_app_event: { event: lastvalue, variable: temp, value: 21.5, last_value: true }
+
+  # ── the drop ──────────────────────────────────────────────────────────────
+  - cloud_drop_connection: {}
+  # expire: false is the broker keeping the clean_session false session.
+  - expect_mqtt_disconnect: { client_id: "{device_id}", expire: false }
+  # Reconnecting lasts at least the 1s base back-off, so the 200ms status poll
+  # cannot miss it, and it ends before the connect below: the order is safe.
+  - await_daemon_cloud_state: { state: Reconnecting, timeout: 15s }
+
+  # ── the whole handshake again ─────────────────────────────────────────────
+  - expect_mqtt_connect: { client_id: "{device_id}", client_id_matches_cert_cn: true, clean_session: false, timeout: 30s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig, network_type: wifi, ssid: SSIDTEST1 }
+  # Thing.begin always carries an empty thing_id, so it proves nothing about
+  # what the FSM remembers. The order does: the property subscription must come
+  # AFTER the cloud's Thing.update, which a daemon resubscribing a remembered
+  # id on connect would not wait for.
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", device_id: "{device_id}", timeout: 30s }
+
+  # ── both directions over the new connection ───────────────────────────────
+  # cloud → app: only reaches the app if the property topic was resubscribed.
+  - cloud_publish_var: { variable: temp, value: 30.0 }
+  - expect_app_event: { event: update, variable: temp, value: 30.0 }
+
+  # app → cloud: the writer's own stream is skipped (it identifies itself), so
+  # the publish is the only effect and the order is deterministic.
+  - app_var_write: { variable: temp, value: 42.0 }
+  - expect_var_publish:
+      topic: "/a/t/{thing_id}/e/o"
+      variable: temp
+      value: 42.0
