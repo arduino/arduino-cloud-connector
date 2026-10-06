@@ -6,8 +6,11 @@ if [ "$1" = "configure" ]; then
 	update-ca-certificates --fresh
 fi
 
+# Enable unconditionally: it only creates symlinks, so it also works when the
+# package is installed into an image at build time (no systemd running).
+systemctl enable arduino-cloud-connector
+
 if [ -d /run/systemd/system ]; then
 	systemctl daemon-reload || true
-	systemctl enable arduino-cloud-connector
-	systemctl restart arduino-cloud-connector || systemctl start arduino-cloud-connector
+	systemctl restart arduino-cloud-connector || true
 fi
