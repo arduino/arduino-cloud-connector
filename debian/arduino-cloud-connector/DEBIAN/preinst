@@ -2,12 +2,24 @@
 
 set -e
 
+ARDUINO_HOME="/home/arduino"
+
 # Path to the data directory.
-DATA_DIR="/home/arduino/.local/share/arduino-cloud-connector"
+DATA_DIR="$ARDUINO_HOME/.local/share/arduino-cloud-connector"
+
+# dpkg runs this as root, so a plain `mkdir -p` would leave the missing
+# parents root-owned and other programs running as arduino could no longer
+# write to them. Create each level as arduino, and fix parents left
+# root-owned by older versions of this script.
+for d in "$ARDUINO_HOME/.local" "$ARDUINO_HOME/.local/share"; do
+    if [ ! -d "$d" ]; then
+        install -d -o arduino -g arduino -m 755 "$d"
+    elif [ "$(stat -c %U "$d")" = "root" ]; then
+        chown arduino:arduino "$d"
+    fi
+done
 
 # Check if the directory does NOT exist yet (First-time install)
 if [ ! -d "$DATA_DIR" ]; then
-    mkdir -p "$DATA_DIR"
-    chown -R arduino:arduino "$DATA_DIR"
-    chmod -R 700 "$DATA_DIR"
+    install -d -o arduino -g arduino -m 700 "$DATA_DIR"
 fi
