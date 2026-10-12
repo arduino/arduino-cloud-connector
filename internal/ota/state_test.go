@@ -23,9 +23,11 @@ var everySentinel = []error{
 	downloader.ErrTooLarge, downloader.ErrNoSpace, downloader.ErrBadSize,
 	downloader.ErrTransfer, downloader.ErrDigestMismatch, downloader.ErrTimeout,
 	downloader.ErrOpenFile, downloader.ErrWriteFile,
-	appinstaller.ErrUnavailable, appinstaller.ErrFailed,
+	appinstaller.ErrUnavailable, appinstaller.ErrFailed, appinstaller.ErrNoSpace,
 	appinstaller.ErrArchiveRejected, appinstaller.ErrInvalidAppYaml,
-	appinstaller.ErrNotCompatible, appinstaller.ErrRunFailed,
+	appinstaller.ErrNotCompatible, appinstaller.ErrAlreadyExists,
+	appinstaller.ErrExtraction, appinstaller.ErrResourceNoSpace,
+	appinstaller.ErrResourceDownload,
 	errInstallStalled,
 }
 
@@ -56,7 +58,7 @@ func TestDecodeError(t *testing.T) {
 		{"open file", downloader.ErrOpenFile, ErrNoOtaStorage},
 		{"write file", downloader.ErrWriteFile, ErrWriteFile},
 
-		// Handover to the installing service. The four specific verdicts must win over
+		// Handover to the installing service. The specific verdicts must win over
 		// the generic one they wrap — that ordering IS the difference between telling
 		// the operator "app.yaml does not validate" and telling them "install failed".
 		{"installer unavailable", appinstaller.ErrUnavailable, ErrInstallerUnavailable},
@@ -64,7 +66,11 @@ func TestDecodeError(t *testing.T) {
 		{"archive rejected", appinstaller.ErrArchiveRejected, ErrArchiveRejected},
 		{"invalid app.yaml", appinstaller.ErrInvalidAppYaml, ErrInvalidAppYaml},
 		{"not compatible", appinstaller.ErrNotCompatible, ErrAppNotCompatible},
-		{"app does not run", appinstaller.ErrRunFailed, ErrAppRunFailed},
+		{"installer out of space", appinstaller.ErrNoSpace, ErrNoDiskSpace},
+		{"already exists", appinstaller.ErrAlreadyExists, ErrAppAlreadyExists},
+		{"extraction", appinstaller.ErrExtraction, ErrExtraction},
+		{"resources: no space", appinstaller.ErrResourceNoSpace, ErrResourceNoDiskSpace},
+		{"resources: download", appinstaller.ErrResourceDownload, ErrResourceDownload},
 
 		// Raised here.
 		{"install stalled", errInstallStalled, ErrInstallTimeout},
@@ -139,10 +145,18 @@ func TestEveryMappedCodeHasAName(t *testing.T) {
 // exists to prevent, and the way it degrades silently if a new sentinel is added
 // without a case in decodeError.
 func TestEverySentinelMapsToADistinctCode(t *testing.T) {
-	// ErrFailed is the one legitimate overlap: it is both a sentinel and the fallback
-	// for the install phase, so it is checked by TestDecodeError instead.
+	// ErrFailed is not an overlap: it is both a sentinel and the fallback for the
+	// install phase, so it is checked by TestDecodeError instead.
+	//
+	// The one legitimate overlap is "disk full": RFC-14 §5.10 gives the bundle a
+	// single -40 whether the daemon or arduino-app-cli ran out of room, so the two
+	// sentinels share it by design. Listed here, so any other duplicate still fails.
+	shared := map[error]bool{appinstaller.ErrNoSpace: true}
 	seen := map[Error]error{}
 	for _, s := range everySentinel {
+		if shared[s] {
+			continue
+		}
 		code := decodeError(s, ErrDeployInterrupted)
 		if code == ErrDeployInterrupted {
 			t.Errorf("%v is not recognised by decodeError", s)
@@ -218,9 +232,12 @@ func TestErrorCodesMatchRFC14(t *testing.T) {
 		ErrBundleTooLarge:       {-45, "AppBundleTooLarge"},
 		ErrInstallFailed:        {-46, "AppInstallationFailed"},
 		ErrInstallTimeout:       {-47, "AppInstallationTimeout"},
-		ErrAppRunFailed:         {-48, "AppRunFailed"},
-		ErrDeployInterrupted:    {-49, "DeployInterrupted"},
-		ErrDeployInProgress:     {-50, "DeployAlreadyInProgress"},
+		ErrDeployInterrupted:    {-48, "DeployInterrupted"},
+		ErrDeployInProgress:     {-49, "DeployAlreadyInProgress"},
+		ErrAppAlreadyExists:     {-50, "AppAlreadyExists"},
+		ErrExtraction:           {-51, "ExtractionError"},
+		ErrResourceNoDiskSpace:  {-52, "AdditionalResourceDownloadErrorNoDiskSpace"},
+		ErrResourceDownload:     {-53, "AdditionalResourceDownloadError"},
 	}
 
 	for _, table := range []map[Error]struct {

@@ -105,7 +105,7 @@ func (s State) reportable() bool { return s >= StateOtaAvailable }
 // it means here. The Cloud renders these ten with App-deploy wording chosen per job
 // type — a non-writable download dir must not reach the operator as "No OTA storage".
 //
-// Codes -40…-50 are new and specific to an App deploy. -26…-39 are deliberately left
+// Codes -40…-53 are new and specific to an App deploy. -26…-39 are deliberately left
 // free: ota::OTAError already reaches -25, the same team owns both enums and both grow
 // at the tail, so the App range starts far enough away that neither can walk into the
 // other.
@@ -151,7 +151,8 @@ const (
 
 	// ── App-deploy specific codes ────────────────────────────────────────────
 
-	// ErrNoDiskSpace: not enough free disk space for the bundle.
+	// ErrNoDiskSpace: not enough free disk space for the bundle — either here, before
+	// the download, or in arduino-app-cli while it copies the bundle it was handed.
 	ErrNoDiskSpace Error = -40
 	// ErrInstallerUnavailable: arduino-app-cli cannot be reached, or its stream
 	// closed without emitting a terminal event.
@@ -171,19 +172,26 @@ const (
 	// ErrInstallFailed: arduino-app-cli reported a terminal install failure, and
 	// the fallback for anything unclassified in the install phase.
 	ErrInstallFailed Error = -46
-	// ErrInstallTimeout: no event from arduino-app-cli for InstallTimeout. The
-	// watchdog spans the install and the wait for the running verdict, and every
-	// event received resets it.
+	// ErrInstallTimeout: no progress from arduino-app-cli for InstallTimeout. The
+	// watchdog spans the install and the download of the resources it prepares, and
+	// only a progress event resets it.
 	ErrInstallTimeout Error = -47
-	// ErrAppRunFailed: arduino-app-cli reports the App does not stay up. A deploy
-	// succeeds only if the App ends up running, so this fails the job whatever the
-	// board does next.
-	ErrAppRunFailed Error = -48
 	// ErrDeployInterrupted: a daemon restart (crash, upgrade or reboot) interrupted
 	// the deploy and it could not be resumed automatically.
-	ErrDeployInterrupted Error = -49
+	ErrDeployInterrupted Error = -48
 	// ErrDeployInProgress: a second job arrived while one was already in flight.
-	ErrDeployInProgress Error = -50
+	ErrDeployInProgress Error = -49
+	// ErrAppAlreadyExists: arduino-app-cli already has a release of the same name
+	// installed.
+	ErrAppAlreadyExists Error = -50
+	// ErrExtraction: arduino-app-cli failed to extract the bundle onto its disk.
+	ErrExtraction Error = -51
+	// ErrResourceNoDiskSpace: the App is installed, but there is no disk space left
+	// to download the additional resources it needs to run (containers, AI models).
+	ErrResourceNoDiskSpace Error = -52
+	// ErrResourceDownload: the App is installed, but downloading the additional
+	// resources it needs to run (containers, AI models) failed.
+	ErrResourceDownload Error = -53
 )
 
 // String returns the RFC-14 §5.10 name of the code, which is also the C++
@@ -229,12 +237,18 @@ func (e Error) String() string {
 		return "AppInstallationFailed"
 	case ErrInstallTimeout:
 		return "AppInstallationTimeout"
-	case ErrAppRunFailed:
-		return "AppRunFailed"
 	case ErrDeployInterrupted:
 		return "DeployInterrupted"
 	case ErrDeployInProgress:
 		return "DeployAlreadyInProgress"
+	case ErrAppAlreadyExists:
+		return "AppAlreadyExists"
+	case ErrExtraction:
+		return "ExtractionError"
+	case ErrResourceNoDiskSpace:
+		return "AdditionalResourceDownloadErrorNoDiskSpace"
+	case ErrResourceDownload:
+		return "AdditionalResourceDownloadError"
 	default:
 		return "Unknown"
 	}
@@ -303,19 +317,30 @@ func decodeError(err error, fallback Error) Error {
 	case errors.Is(err, downloader.ErrWriteFile):
 		return ErrWriteFile
 
-	// Handover to the installing service. The last four are verdicts only
-	// arduino-app-cli can give, and they exist so that "app-cli said no" reaches the
-	// operator as a reason rather than as a generic install failure.
+	// Handover to the installing service. Every case after the first is a verdict
+	// only arduino-app-cli can give, and they exist so that "app-cli said no" reaches
+	// the operator as a reason rather than as a generic install failure. All of them
+	// wrap ErrFailed, so they must be matched before it.
 	case errors.Is(err, appinstaller.ErrUnavailable):
 		return ErrInstallerUnavailable
+	case errors.Is(err, appinstaller.ErrNoSpace):
+		// The same code as downloader.ErrNoSpace on purpose: RFC-14 §5.10 has one
+		// "disk full" reason for the bundle, whichever process ran out of room.
+		return ErrNoDiskSpace
 	case errors.Is(err, appinstaller.ErrArchiveRejected):
 		return ErrArchiveRejected
 	case errors.Is(err, appinstaller.ErrInvalidAppYaml):
 		return ErrInvalidAppYaml
 	case errors.Is(err, appinstaller.ErrNotCompatible):
 		return ErrAppNotCompatible
-	case errors.Is(err, appinstaller.ErrRunFailed):
-		return ErrAppRunFailed
+	case errors.Is(err, appinstaller.ErrAlreadyExists):
+		return ErrAppAlreadyExists
+	case errors.Is(err, appinstaller.ErrExtraction):
+		return ErrExtraction
+	case errors.Is(err, appinstaller.ErrResourceNoSpace):
+		return ErrResourceNoDiskSpace
+	case errors.Is(err, appinstaller.ErrResourceDownload):
+		return ErrResourceDownload
 	case errors.Is(err, appinstaller.ErrFailed):
 		return ErrInstallFailed
 

@@ -500,7 +500,7 @@ func TestOTAFSMMapsStorageFailuresToWireCodes(t *testing.T) {
 	}
 }
 
-// TestOTAFSMRefusesASecondJobWhileOneIsDeploying covers RFC-14 §5.10 -50.
+// TestOTAFSMRefusesASecondJobWhileOneIsDeploying covers RFC-14 §5.10 -49.
 //
 // The refusal has to name the REFUSED job. Keying it by the running one would use the
 // Cloud's own success channel to fail the deploy that is at that moment downloading
@@ -542,7 +542,7 @@ func TestOTAFSMRefusesASecondJobWhileOneIsDeploying(t *testing.T) {
 
 // The deploy slot must be given back when a job ends, whichever way it ended.
 //
-// This is the failure mode the -50 refusal introduces: hold the slot one job too long
+// This is the failure mode the -49 refusal introduces: hold the slot one job too long
 // and the board refuses every deploy for the rest of its uptime, telling the Cloud each
 // time that a deploy is already running when none is. Both outcomes are exercised —
 // success and failure release through different paths.
@@ -591,7 +591,7 @@ func TestOTAFSMAcceptsAJobAfterThePreviousOneEnds(t *testing.T) {
 }
 
 // A redelivery of the job already running is not a second job. MQTT can redeliver, and
-// the Cloud can repeat itself; answering that with -50 would fail the running deploy
+// the Cloud can repeat itself; answering that with -49 would fail the running deploy
 // using its own id.
 func TestOTAFSMIgnoresARedeliveryOfTheRunningJob(t *testing.T) {
 	content := []byte("bundle delivered twice")
@@ -619,7 +619,7 @@ func TestOTAFSMIgnoresARedeliveryOfTheRunningJob(t *testing.T) {
 	waitFor(t, "the deploy to confirm", func() bool { return pub.hasDigest(final) })
 }
 
-// TestOTAFSMReportsAnUnresumableDeploy covers RFC-14 §5.10 -49.
+// TestOTAFSMReportsAnUnresumableDeploy covers RFC-14 §5.10 -48.
 //
 // The Cloud does not resend OTAUpdateCmd after a crash, so a record that lost the URL
 // describes a deploy that can never be continued. The Cloud is still holding that job
@@ -691,7 +691,7 @@ func TestOTAFSMHoldsTheFailureUntilTheBrokerIsUp(t *testing.T) {
 
 // Holding rather than waiting is what keeps the process usable during an outage. The
 // version that waited for the broker inside Fail kept the deploy slot claimed, so a job
-// arriving meanwhile was refused with -50 — a refusal that could not be published
+// arriving meanwhile was refused with -49 — a refusal that could not be published
 // either, leaving that job neither run nor answered.
 func TestOTAFSMAcceptsAJobWhileAFailureIsStillHeld(t *testing.T) {
 	content := []byte("the bundle of the second job")

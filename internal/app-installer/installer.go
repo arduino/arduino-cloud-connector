@@ -100,25 +100,25 @@ type Request struct {
 type ProgressFunc func(percent int32)
 
 // Failure sentinels. Every failure this package reports is one of these: either no
-// installer could be reached at all, or the install did not end with the App running.
+// installer could be reached at all, or the install did not complete.
 //
 // # Why the failure is typed rather than just "it failed"
 //
 // Each of these reaches the operator as a different Arduino IoT Cloud error code
-// (RFC-14 §5.10 -41…-48, mapped in internal/ota.decodeError), and that is the whole
-// reason the distinctions exist: "the archive is malformed", "app.yaml does not
-// validate", "this App does not fit this board" and "it installed but does not stay
-// up" are four different things for the person looking at a failed deploy, and only
+// (RFC-14 §5.10, mapped in internal/ota.decodeError), and that is the whole reason the
+// distinctions exist: "the archive is malformed", "app.yaml does not validate", "this
+// App does not fit this board" and "it installed but its containers could not be
+// downloaded" are different things for the person looking at a failed deploy, and only
 // arduino-app-cli is in a position to tell them apart.
 //
-// That makes them a requirement on the deploy stream, not just a Go detail: every
-// stream must end in exactly one terminal outcome — running (success), or one of the
-// specific failures below. If the handover degrades to "non-zero exit", four codes
-// collapse back into ErrFailed and the operator is told nothing useful.
+// That makes them a requirement on the install stream, not just a Go detail: every
+// stream must end in exactly one terminal outcome — done (success), or one of the
+// specific failures below. If the handover degrades to "non-zero exit", the specific
+// codes collapse back into ErrFailed and the operator is told nothing useful.
 //
-// The four specific verdicts wrap ErrFailed, so a caller that only wants to know
-// whether the install succeeded still matches with errors.Is(err, ErrFailed) — which
-// also makes ErrFailed the right fallback for an install failure nobody classified.
+// The specific verdicts wrap ErrFailed, so a caller that only wants to know whether
+// the install succeeded still matches with errors.Is(err, ErrFailed) — which also
+// makes ErrFailed the right fallback for an install failure nobody classified.
 var (
 	// ErrUnavailable: the installing service could not be reached, so the install
 	// never started — or its stream closed without a terminal event, which is the
@@ -137,10 +137,20 @@ var (
 	// ErrNotCompatible: the App does not fit this board — the installed bricks
 	// version, the hardware, or a runtime too old to deploy it.
 	ErrNotCompatible = fmt.Errorf("%w: app not compatible with this board", ErrFailed)
-	// ErrRunFailed: the App was installed but does not stay up. A deploy succeeds
-	// only if the App ends up running, so this is a failure however the board
-	// recovers afterwards.
-	ErrRunFailed = fmt.Errorf("%w: app does not stay running", ErrFailed)
+	// ErrNoSpace: the installer ran out of disk space while taking the bundle in.
+	ErrNoSpace = fmt.Errorf("%w: no disk space for the bundle", ErrFailed)
+	// ErrAlreadyExists: a release of the same name is already installed.
+	ErrAlreadyExists = fmt.Errorf("%w: app already installed", ErrFailed)
+	// ErrExtraction: the bundle could not be extracted onto the board's disk.
+	ErrExtraction = fmt.Errorf("%w: extraction failed", ErrFailed)
+
+	// The two below happen AFTER the App is installed, while downloading the
+	// containers and models it needs to run: the release stays on the board.
+
+	// ErrResourceNoSpace: no disk space left for the App's additional resources.
+	ErrResourceNoSpace = fmt.Errorf("%w: no disk space for the app resources", ErrFailed)
+	// ErrResourceDownload: downloading the App's additional resources failed.
+	ErrResourceDownload = fmt.Errorf("%w: app resources download failed", ErrFailed)
 )
 
 // Func adapts a function to Installer, for tests and for wiring a trivial

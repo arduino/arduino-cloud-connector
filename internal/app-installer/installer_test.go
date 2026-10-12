@@ -54,7 +54,7 @@ func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
 	}
 }
 
-// The four specific verdicts refine ErrFailed rather than replacing it, so both
+// The specific verdicts refine ErrFailed rather than replacing it, so both
 // questions a caller can ask keep working: "did the install succeed?" and "what
 // exactly did arduino-app-cli object to?".
 //
@@ -63,10 +63,14 @@ func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
 // phase's fallback instead of being reported as an install failure at all.
 func TestSpecificVerdictsRefineErrFailed(t *testing.T) {
 	verdicts := map[string]error{
-		"archive rejected": ErrArchiveRejected,
-		"invalid app.yaml": ErrInvalidAppYaml,
-		"not compatible":   ErrNotCompatible,
-		"does not run":     ErrRunFailed,
+		"no space":            ErrNoSpace,
+		"archive rejected":    ErrArchiveRejected,
+		"invalid app.yaml":    ErrInvalidAppYaml,
+		"not compatible":      ErrNotCompatible,
+		"already exists":      ErrAlreadyExists,
+		"extraction":          ErrExtraction,
+		"resources: no space": ErrResourceNoSpace,
+		"resources: download": ErrResourceDownload,
 	}
 	for name, verdict := range verdicts {
 		t.Run(name, func(t *testing.T) {

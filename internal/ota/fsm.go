@@ -34,7 +34,7 @@
 //     asked for (RFC-14 §5.1). An App deploy never reboots the board, so unlike the
 //     MCU flow there is no Reboot state in the path.
 //   - A job arriving while another is in flight is refused on the spot with
-//     OTAProgressCmd(8, -50), keyed by the refused job. That one is published by
+//     OTAProgressCmd(8, -49), keyed by the refused job. That one is published by
 //     Deliver rather than by the state machine — see there for why.
 //
 // Of the three, only the failure is held when the broker is down (see the outbox
@@ -181,7 +181,7 @@ type OTAFSM struct {
 	snapshot Snapshot
 	// reportLastSec/reportCounter make progress timestamps strictly increasing
 	// even within the same second, mirroring OTACloudProcessInterface::reportStatus.
-	// Under mu, not run-goroutine-private: Deliver publishes the -50 rejection from
+	// Under mu, not run-goroutine-private: Deliver publishes the -49 rejection from
 	// the caller's goroutine and needs a timestamp too.
 	reportLastSec uint64
 	reportCounter uint64
@@ -249,7 +249,7 @@ func (f *OTAFSM) Snapshot() Snapshot {
 // Cloud FSM's event loop, which must never stall behind a download.
 //
 // A job that arrives while another deploy is in flight is refused here rather than
-// queued, and answered on the spot with ErrDeployInProgress (RFC-14 §5.10 -50).
+// queued, and answered on the spot with ErrDeployInProgress (RFC-14 §5.10 -49).
 // Queueing it would be worse than useless: it would start minutes or hours later, for
 // a job the Cloud has long since timed out, while the Cloud heard nothing at all in
 // the meantime. The C++ reference simply ignores the command outside Idle, which has
@@ -422,7 +422,7 @@ type stateFn func(ctx context.Context) stateFn
 // internal/downloader resumes the transfer from its own state.
 //
 // When the record names a job but cannot be continued, the deploy is closed with
-// ErrDeployInterrupted (RFC-14 §5.10 -49) instead: the Cloud is still holding that job
+// ErrDeployInterrupted (RFC-14 §5.10 -48) instead: the Cloud is still holding that job
 // open, and a reason it can render beats a silent timeout. A record too damaged to
 // yield even a job id gets no message at all — there is nothing to key one to.
 func (f *OTAFSM) runResume(ctx context.Context) stateFn {
@@ -447,7 +447,7 @@ func (f *OTAFSM) runResume(ctx context.Context) stateFn {
 
 	slog.Info("ota: interrupted deploy found, resuming", "job_id", job.IDHex())
 	// The recovered job holds the deploy slot exactly like a freshly delivered one
-	// would, so a job arriving now is refused with -50 instead of queueing up behind it.
+	// would, so a job arriving now is refused with -49 instead of queueing up behind it.
 	f.busy.Store(true)
 	f.job = job
 	return f.runStartOTA
@@ -903,7 +903,7 @@ func (f *OTAFSM) publish(cmd any) error {
 // reports inside the same second stay strictly ordered for the Cloud. Same
 // scheme as OTACloudProcessInterface::reportStatus.
 //
-// Locked because Deliver publishes the -50 refusal from the caller's goroutine while
+// Locked because Deliver publishes the -49 refusal from the caller's goroutine while
 // the run goroutine may be reporting progress: two goroutines, one counter.
 func (f *OTAFSM) reportTimestamp() uint64 {
 	sec := uint64(f.now().Unix())
