@@ -9,9 +9,9 @@
 // The split of responsibilities is the point of the package: internal/ota owns the
 // deploy protocol — the state machine, the Cloud messages and the wire error codes —
 // while everything about talking to the installing service lives here. The
-// production implementation is an arduino-app-cli client (RFC-14 §5.4/§5.5): a POST
-// that starts the install, and a stream that reports it. That endpoint does not
-// exist yet, so for now the only implementations are Unavailable and test doubles.
+// production implementation is AppCLI, an arduino-app-cli client (RFC-14 §5.4, §6.1):
+// one request that uploads the bundle and starts the install, answered by a stream
+// that reports it.
 //
 // It has no notion of an OTA job, a state machine or a wire code. Callers hand it a
 // path and a digest; it hands back progress and a typed error. Mapping those errors
@@ -22,11 +22,9 @@
 //
 // Install is not a plain request/response call, and the shape of the real
 // implementation is worth stating up front: it starts a job in another process and
-// then follows it, which means holding a Server-Sent Events stream open for minutes,
-// and very likely re-subscribing to an install already in progress when that stream
-// drops. That is the same class of problem internal/downloader solves for the
-// transfer, and the reason this is a package rather than a function on the state
-// machine: reconnection and idempotency are real code with state of their own.
+// then follows it, which means holding a Server-Sent Events stream open for minutes.
+// arduino-app-cli offers no way to re-attach to an install whose stream dropped, so a
+// dropped stream is a failed install (ErrUnavailable), not something to retry.
 //
 // None of that shows from the outside. Install blocks until the install is finished,
 // exactly like Download does. The contract that makes that safe is documented on
@@ -46,8 +44,9 @@ type Installer interface {
 	// or ctx has been cancelled.
 	//
 	// onProgress reports an install percentage (0–100) and must be called
-	// monotonically: the caller forwards each value straight to the Cloud, which
-	// renders it as deploy progress.
+	// monotonically. It may repeat a value, and an implementation should call it on
+	// every progress report the service makes: the caller forwards each call to the
+	// Cloud, and counts it as a sign of life for its stall watchdog.
 	//
 	// # Concurrency contract — required, not advisory
 	//
@@ -74,10 +73,9 @@ type Installer interface {
 	Install(ctx context.Context, req Request, onProgress ProgressFunc) error
 }
 
-// Request is the handover payload for arduino-app-cli's POST /v1/apps/deploy
-// (RFC-14 §5.4). Only a path is handed over — the daemon never opens the archive,
-// so path-traversal and zip-bomb defence stay entirely inside arduino-app-cli,
-// which already implements both (RFC-14 §5.9).
+// Request describes the bundle to install. The daemon never opens the archive, so
+// path-traversal and zip-bomb defence stay entirely inside arduino-app-cli, which
+// already implements both (RFC-14 §5.9).
 //
 // # Why there is no App identity in here
 //
@@ -91,9 +89,10 @@ type Installer interface {
 // anyway — can read it directly.
 type Request struct {
 	// BundlePath is the absolute path of the verified archive.
-	BundlePath string `json:"bundle_path"`
-	// SHA256 is the hex digest arduino-app-cli re-verifies before unpacking.
-	SHA256 string `json:"sha256"`
+	BundlePath string
+	// SHA256 is the hex digest the archive was verified against. arduino-app-cli's
+	// install endpoint takes no digest today, so AppCLI does not send it.
+	SHA256 string
 }
 
 // ProgressFunc reports install progress as a percentage (0–100). It must not block.
@@ -161,15 +160,15 @@ func (f Func) Install(ctx context.Context, req Request, onProgress ProgressFunc)
 	return f(ctx, req, onProgress)
 }
 
-// Unavailable is the placeholder used until the arduino-app-cli endpoint ships. It
-// fails every install with ErrUnavailable, which the Cloud renders as a failed
-// deploy — the honest outcome, and far better than reporting success for an App that
-// was downloaded but never installed.
+// Unavailable fails every install with ErrUnavailable, which the Cloud renders as a
+// failed deploy — the honest outcome for a process wired without an installer, and
+// far better than reporting success for an App that was downloaded but never
+// installed.
 func Unavailable() Installer {
 	return Func(func(_ context.Context, req Request, _ ProgressFunc) error {
 		slog.Error("appinstaller: no installer wired — bundle downloaded but cannot be installed",
 			"bundle", req.BundlePath,
-			"detail", "arduino-app-cli POST /v1/apps/deploy (RFC-14 §5.4) is not implemented yet")
-		return fmt.Errorf("%w: arduino-app-cli deploy endpoint not implemented yet", ErrUnavailable)
+			"detail", "no arduino-app-cli client configured")
+		return fmt.Errorf("%w: no installer configured", ErrUnavailable)
 	})
 }

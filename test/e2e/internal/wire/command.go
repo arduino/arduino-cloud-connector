@@ -241,7 +241,7 @@ func decodeOTAProgress(items []any, cmd *Command) error {
 	if err != nil {
 		return err
 	}
-	state, err := intAt(items, 1, "state")
+	state, err := simpleAt(items, 1, "state")
 	if err != nil {
 		return err
 	}
@@ -254,7 +254,7 @@ func decodeOTAProgress(items []any, cmd *Command) error {
 		return err
 	}
 	cmd.Fields["id"] = hex.EncodeToString(id)
-	cmd.Fields["state"] = state
+	cmd.Fields["state"] = int64(state)
 	cmd.Fields["state_data"] = stateData
 	cmd.Fields["timestamp"] = timestamp
 	return nil
@@ -348,6 +348,21 @@ func bytesAt(items []any, i int, field string) ([]byte, error) {
 		return nil, fmt.Errorf("wire: %s is %T, want a byte string", field, v)
 	}
 	return b, nil
+}
+
+// simpleAt reads a CBOR simple value. An integer is refused on purpose: the C++
+// library sends the OTA state as a simple value, and a daemon that sent an integer
+// instead would be speaking a dialect no firmware speaks.
+func simpleAt(items []any, i int, field string) (Simple, error) {
+	v, err := itemAt(items, i, field)
+	if err != nil {
+		return 0, err
+	}
+	s, ok := v.(Simple)
+	if !ok {
+		return 0, fmt.Errorf("wire: %s is %T, want a CBOR simple value", field, v)
+	}
+	return s, nil
 }
 
 func intAt(items []any, i int, field string) (int64, error) {

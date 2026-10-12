@@ -21,7 +21,7 @@ const (
 	defaultMQTTCAFile      = "" // empty means use system roots
 	defaultLogLevel        = "info"
 	defaultNTPProbeHost    = "time.arduino.cc:123"
-	defaultAppCLIURL       = "http://127.0.0.1:8080"
+	defaultAppCLIURL       = "http://127.0.0.1:8800"
 	defaultAppDownloadDir  = "/var/lib/arduino-cloud-connector/app-download"
 	// defaultMaxBundleSize is 4 GiB. RFC-14 §5.6 tabulates 200 MiB, but App Lab
 	// Apps that ship AI models or container layers are expected to exceed 2 GB,
@@ -98,7 +98,8 @@ type Config struct {
 	// AppCLIURL is the base URL of the local arduino-app-cli daemon, which owns
 	// unpacking and activating a downloaded App bundle (RFC-14 §5.4). Always a
 	// loopback address: the same trust boundary as every other app-cli endpoint.
-	// Env: ARDUINO_CLOUD_CONNECTOR__APP_CLI_URL. Default: http://127.0.0.1:8080.
+	// Env: ARDUINO_CLOUD_CONNECTOR__APP_CLI_URL. Default: http://127.0.0.1:8800,
+	// the port arduino-app-cli listens on.
 	AppCLIURL string
 
 	// AppDownloadDir is where App bundles are downloaded to and where the

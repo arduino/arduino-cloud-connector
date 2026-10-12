@@ -210,10 +210,9 @@ func New(cfg config.Config, ks *keystore.Keystore, reg *variables.Registry, clie
 	// FSM uses for the broker, so the storage client needs the keystore — hence it
 	// is wired here and not in newFSM, which tests use without one. The downloader
 	// owns the transfer (resume, verification); the storage client owns the HTTP.
-	// Until arduino-app-cli exposes its deploy endpoint the installer stub fails the
-	// job explicitly rather than claiming a success it cannot deliver (RFC-14 §5.4).
+	// arduino-app-cli installs the verified bundle (RFC-14 §5.4).
 	dl := downloader.New(cfg, storageapi.NewClient(cfg, ks))
-	f.ota = ota.New(cfg, deviceID, client, dl, appinstaller.Unavailable())
+	f.ota = ota.New(cfg, deviceID, client, dl, appinstaller.NewAppCLI(cfg.AppCLIURL))
 	return f, nil
 }
 

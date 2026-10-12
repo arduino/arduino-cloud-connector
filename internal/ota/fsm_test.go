@@ -11,9 +11,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -448,7 +452,7 @@ func TestOTAFSMNeverConfirmsAFailedDeploy(t *testing.T) {
 
 func TestOTAFSMReportsUnavailableInstaller(t *testing.T) {
 	// The wiring shipped today: the bundle downloads, then the deploy fails honestly
-	// because arduino-app-cli has no deploy endpoint yet.
+	// because no installer is reachable.
 	content := []byte("bundle v5")
 	f, pub, _ := newTestFSM(t, &downloadertest.FakeDownloader{Content: content}, appinstaller.Unavailable())
 	stop := runFSM(t, f)
@@ -782,7 +786,7 @@ func TestOTAFSMHeldFailureIsNotOvertakenByANewerJob(t *testing.T) {
 func TestOutboxDropsTheOldestWhenFull(t *testing.T) {
 	f := &OTAFSM{now: time.Now}
 	for i := range outboxLimit + 2 {
-		f.hold(command.OTAProgressCmd{ID: [16]byte{byte(i)}, State: uint8(StateFail)})
+		f.hold(command.OTAProgressCmd{ID: [16]byte{byte(i)}, State: command.OTAState(StateFail)})
 	}
 	if len(f.outbox) != outboxLimit {
 		t.Fatalf("outbox holds %d, want the cap of %d", len(f.outbox), outboxLimit)
@@ -1033,6 +1037,109 @@ func TestOTAFSMInstallProgressResetsStallTimer(t *testing.T) {
 	for _, s := range pub.progressStates() {
 		if s[0] == 8 {
 			t.Errorf("a steadily-reporting install was failed: %v", pub.progressStates())
+		}
+	}
+}
+
+// arduino-app-cli repeats a percentage many times during an image pull. Each repeat
+// keeps the install alive for the watchdog AND is published: it is how the Cloud keeps
+// hearing from a board whose percentage is not moving.
+func TestOTAFSMInstallRepeatsResetTheWatchdogAndAreRepublished(t *testing.T) {
+	content := []byte("bundle v8")
+	final := sha256.Sum256(content)
+
+	// 25 repeated for well past installTimeout: only the repeats keep it alive.
+	values := []int32{0, 25, 25, 25, 25, 25, 25, 50, 50, 100}
+	inst := appinstaller.Func(func(ctx context.Context, _ appinstaller.Request, onProgress appinstaller.ProgressFunc) error {
+		for _, v := range values {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(15 * time.Millisecond):
+			}
+			onProgress(v)
+		}
+		return nil
+	})
+
+	f, pub, _ := newTestFSM(t, &downloadertest.FakeDownloader{Content: content}, inst)
+	f.installTimeout = 40 * time.Millisecond // < the 90ms spent on 25, > each 15ms gap
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	f.Deliver(updateCmd(final))
+	waitFor(t, "the success OTABegin", func() bool { return pub.hasDigest(final) })
+
+	var flash []int64
+	for _, s := range pub.progressStates() {
+		switch s[0] {
+		case int64(StateFlashOTA):
+			flash = append(flash, s[1])
+		case int64(StateFail):
+			t.Errorf("an install that kept reporting was failed: %v", pub.progressStates())
+		}
+	}
+	// The first 0 is the entry into FlashOTA, the rest one per call.
+	if want := []int64{0, 0, 25, 25, 25, 25, 25, 25, 50, 50, 100}; !slices.Equal(flash, want) {
+		t.Errorf("FlashOTA reports: got %v want %v", flash, want)
+	}
+}
+
+// The two progress phases the Cloud renders, end to end through the real
+// arduino-app-cli client: Fetch carries the downloaded byte count (OTAProgress(5,
+// bytes)), FlashOTA the install percentage arduino-app-cli streams (OTAProgress(6,
+// percent)) — truncated to an integer, one report per progress event, repeats
+// included, and every report keyed by the job.
+func TestOTAFSMReportsDownloadBytesThenInstallPercent(t *testing.T) {
+	content := []byte("bundle v9")
+	final := sha256.Sum256(content)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, _, err := r.FormFile("file"); err != nil {
+			t.Errorf("no bundle uploaded: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Written out by hand, as arduino-app-cli's render/sse.go writes it.
+		_, _ = io.WriteString(w, "event: heartbeat\n\n"+
+			"event: progress\ndata: {\"name\":\"containers\",\"progress\":0}\n\n"+
+			"event: progress\ndata: {\"name\":\"Pulling image 1/1 (img)\",\"progress\":25}\n\n"+
+			"event: progress\ndata: {\"name\":\"Pulling image 1/1 (img)\",\"progress\":25}\n\n"+
+			"event: progress\ndata: {\"name\":\"Pulling image 1/1 (img)\",\"progress\":50}\n\n"+
+			"event: progress\ndata: {\"name\":\"models\",\"progress\":66.66667}\n\n"+
+			"event: progress\ndata: {\"name\":\"\",\"progress\":100}\n\n"+
+			"event: done\ndata: {\"id\":\"x\",\"name\":\"a\",\"release\":\"a-1\",\"target\":\"unoq\"}\n\n"+
+			"event: error\ndata: {\"code\":\"SERVER_CLOSED\"}\n\n"+
+			"event: close\ndata: \"Stream closed by server\"\n\n")
+	}))
+	defer srv.Close()
+
+	dl := &downloadertest.FakeDownloader{Content: content, Progress: []downloadertest.Progress{
+		{Written: 3, Total: 9}, {Written: 6, Total: 9}, {Written: 9, Total: 9},
+	}}
+	f, pub, _ := newTestFSM(t, dl, appinstaller.NewAppCLI(srv.URL))
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	jobID := [16]byte{9, 9, 9}
+	f.Deliver(updateCmdWithID(jobID, final))
+	waitFor(t, "the success OTABegin", func() bool { return pub.hasDigest(final) })
+
+	want := [][2]int64{
+		{3, 0}, {4, 0}, // accepted, started
+		{5, 0}, {5, 3}, {5, 6}, {5, 9}, // Fetch: entered, then bytes downloaded
+		{6, 0},                                               // FlashOTA: entered
+		{6, 0}, {6, 25}, {6, 25}, {6, 50}, {6, 66}, {6, 100}, // then one per progress event
+	}
+	if got := pub.progressStates(); !slices.Equal(got, want) {
+		t.Errorf("OTAProgress sequence:\n got %v\nwant %v", got, want)
+	}
+	for _, c := range pub.all() {
+		if p, ok := c.Inner().(command.OTAProgressCmd); ok && p.ID != jobID {
+			t.Errorf("progress %d/%d keyed by %x, want the job %x", p.State, p.StateData, p.ID, jobID)
 		}
 	}
 }

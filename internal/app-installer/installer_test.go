@@ -7,34 +7,9 @@ package appinstaller
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 )
-
-func TestRequestWireShape(t *testing.T) {
-	// The handover body is this package's contract with arduino-app-cli: exactly two
-	// fields, with exactly these names. A field silently reappearing — cloud_app_id
-	// and name were both in an RFC draft — or being renamed fails here rather than at
-	// app-cli, which would only notice at deploy time on a real board.
-	blob, err := json.Marshal(Request{BundlePath: "/var/lib/x/job.zip", SHA256: "deadbeef"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var fields map[string]any
-	if err := json.Unmarshal(blob, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if len(fields) != 2 {
-		t.Errorf("handover body has %d fields, want 2: %s", len(fields), blob)
-	}
-	for _, key := range []string{"bundle_path", "sha256"} {
-		if _, ok := fields[key]; !ok {
-			t.Errorf("handover body is missing %q: %s", key, blob)
-		}
-	}
-}
 
 func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
 	// The placeholder must fail in a way the caller can classify, because that is what

@@ -216,8 +216,8 @@ type OTAFSM struct {
 }
 
 // New builds the App-deploy process. storage fetches bundles (see
-// internal/downloader, which drives internal/storage-api for the bytes); inst may
-// be appinstaller.Unavailable() until the arduino-app-cli endpoint exists.
+// internal/downloader, which drives internal/storage-api for the bytes); inst
+// installs them (appinstaller.AppCLI in production).
 func New(cfg config.Config, deviceID string, pub Publisher, storage downloader.Downloader, inst appinstaller.Installer) *OTAFSM {
 	return &OTAFSM{
 		deviceID:       deviceID,
@@ -307,7 +307,7 @@ func (f *OTAFSM) rejectBusy(id [16]byte) {
 	}
 	cmd := command.OTAProgressCmd{
 		ID:        id,
-		State:     uint8(StateFail),
+		State:     command.OTAState(StateFail),
 		StateData: int32(ErrDeployInProgress),
 		Timestamp: f.reportTimestamp(),
 	}
@@ -758,6 +758,10 @@ func (f *OTAFSM) install(ctx context.Context, req appinstaller.Request) error {
 	// onProgress runs on this goroutine — appinstaller.Installer requires the
 	// callback to be pumped from Install's own frame — so the report path keeps its
 	// single-goroutine ownership of job and reporting state.
+	//
+	// Every call resets the watchdog and is published, repeats included: an image pull
+	// reports the same percentage many times over, and each report is also what tells
+	// the Cloud the board is still at work, so none is held back.
 	err := f.inst.Install(ictx, req, func(percent int32) {
 		select {
 		case beat <- struct{}{}:
@@ -860,7 +864,7 @@ func (f *OTAFSM) report(state State, stateData int32) {
 	}
 	cmd := command.OTAProgressCmd{
 		ID:        f.job.ID,
-		State:     uint8(state),
+		State:     command.OTAState(state),
 		StateData: stateData,
 		Timestamp: f.reportTimestamp(),
 	}

@@ -23,6 +23,8 @@
 // the cloud can dispatch the message to the correct handler.
 package command
 
+import "fmt"
+
 // ThingID is the opaque UUID string that the Arduino IoT Cloud assigns to a
 // "thing" (a logical grouping of variables). It arrives from the cloud via
 // ThingUpdateCmd and is used as a topic identifier for property subscriptions.
@@ -115,9 +117,41 @@ type OTAUpdateCmd struct {
 type OTAProgressCmd struct {
 	_         struct{} `cbor:",toarray"`
 	ID        [16]byte
-	State     uint8
+	State     OTAState
 	StateData int32
 	Timestamp uint64
+}
+
+// OTAState is the phase carried by OTAProgressCmd. On the wire it is a CBOR simple
+// value (major type 7), not an integer: the C++ library encodes it with
+// cbor_encode_simple_value (src/cbor/IoTCloudMessageEncoder.cpp), so state 5 is the
+// single byte E5 where a uint8 would give 05. It is encoded the same way here so the
+// Cloud receives from this daemon exactly the bytes it receives from a firmware OTA.
+//
+// Only the one-byte form exists for it: 0…19 are the unassigned simple values, and
+// 20…23 already mean false, true, null and undefined, so a state from 20 up cannot be
+// sent as a simple value at all and is refused rather than turned into a boolean. The
+// OTA states stop at 8.
+type OTAState uint8
+
+// maxOTAState is the largest state the one-byte simple-value form can carry.
+const maxOTAState = 19
+
+// MarshalCBOR implements cbor.Marshaler.
+func (s OTAState) MarshalCBOR() ([]byte, error) {
+	if s > maxOTAState {
+		return nil, fmt.Errorf("command: OTA state %d cannot be encoded as a CBOR simple value", s)
+	}
+	return []byte{0xe0 | byte(s)}, nil
+}
+
+// UnmarshalCBOR implements cbor.Unmarshaler.
+func (s *OTAState) UnmarshalCBOR(data []byte) error {
+	if len(data) != 1 || data[0]&0xe0 != 0xe0 || data[0]&0x1f > maxOTAState {
+		return fmt.Errorf("command: OTA state is not a one-byte CBOR simple value: % x", data)
+	}
+	*s = OTAState(data[0] & 0x1f)
+	return nil
 }
 
 // TimezoneRequestCmd (tag 0x10800, Up) requests timezone info from the cloud.
