@@ -304,6 +304,10 @@ func TestCommandTagNumbers(t *testing.T) {
 		CmdTimezoneUpdate:   0x10900,
 		CmdThingDetach:      0x11000,
 		CmdDeviceNetConfig:  0x11100,
+		// RFC-16 §3: family 0x0130, counting in the low byte.
+		CmdAppsList:           0x13000,
+		CmdAppCommand:         0x13001,
+		CmdAppCommandResponse: 0x13002,
 	}
 	if len(commandNames) != len(want) {
 		t.Fatalf("the harness knows %d commands, the table lists %d", len(commandNames), len(want))

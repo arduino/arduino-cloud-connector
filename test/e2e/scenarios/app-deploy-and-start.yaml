@@ -1,0 +1,81 @@
+# The base App flow: the cloud deploys an App over OTA, the board installs it,
+# then the cloud starts it. The board has a thing attached and is Steady.
+#
+# What it pins, end to end through the real daemon:
+#
+#   - the deploy reports every RFC-14 state it passes through, in order, for
+#     the job the cloud named: OtaAvailable, StartOTA, Fetch, FlashOTA;
+#   - the bundle is downloaded from storage with the device certificate;
+#   - arduino-app-cli receives exactly the bundle the cloud announced (the fake
+#     resolves the uploaded digest back to `app1`), with prepare=true;
+#   - every install progress arduino-app-cli streams is forwarded, and the
+#     deploy ends with OTA.begin carrying the installed digest -- no start;
+#   - a start with no parameter lists the Apps first (to stop any running
+#     one), then starts the App, forwards its progress and answers ok with no
+#     details.
+#
+# Two pairs race and are grouped: the state report entering Fetch against the
+# storage request it precedes, and the one entering FlashOTA against the
+# install request. The daemon publishes the report and then makes the call,
+# but the two travel on different connections, so the timeline can hold them
+# in either order.
+name: app-deploy-and-start
+strict_events: true
+
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+  app_cli:
+    install:
+      - { respond: ok, progress: [0, 50, 100] }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── the deploy ─────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call:
+          bundle: app1
+          occurrence: 1
+          status: 206
+          client_cert_cn: "{device_id}"
+          client_cert_valid: true
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call:
+          endpoint: install
+          occurrence: 1
+          prepare: "true"
+          bundle: app1
+          outcome: installed
+  # The install's own progress, every one forwarded.
+  - expect_ota_progress: { id: job1, state: FlashOTA, state_data: [0, 50, 100] }
+  - expect_ota_begin: { bundle: app1 }
+
+  # ── the start ──────────────────────────────────────────────────────────────
+  - cloud_app_start: { app: "app1:0.1.0", op_id: op1 }
+  - expect_app_cli_call: { endpoint: list, occurrence: 1, apps: 1 }
+  - expect_app_cli_call: { endpoint: start, app: "app1:0.1.0", outcome: started }
+  - expect_app_command_response: { op_id: op1, status: progress, details: [0, 100] }
+  - expect_app_command_response: { op_id: op1, status: ok }
