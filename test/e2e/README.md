@@ -66,12 +66,12 @@ Reference for the YAML files under `scenarios/`. Each file is one end-to-end
 test: an ordered list of steps, run against the real daemon binary.
 
 - [Running the tests](#running-the-tests)
-- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `client_id`, `skip_on_os`, `fakes`, `steps`
+- [File structure](#file-structure) — `name`, `strict_events`, `tolerate`, `client_id`, `skip_on_os`, `install_timeout`, `fakes`, `steps`
 - [Steps](#steps) — every step and every parameter
 - [Placeholders](#placeholders)
 - [Ordering rules](#ordering-rules)
 
-A scenario has six sections. Only `steps` is required.
+A scenario has eight sections. Only `steps` is required.
 
 ```yaml
 name: full-lifecycle
@@ -132,6 +132,10 @@ their attributes are documented.
 |---|---|---|---|
 | `provisioning_api` | `http_request` | **yes** | see [`expect_api_call`](#expect_api_call) |
 | `provisioning_api` | `harness_note` | **yes** | `error` — the fake API's own HTTP server failed. A harness bug, not the daemon's |
+| `storage` | `http_request` | **yes** | see [`expect_storage_call`](#expect_storage_call) |
+| `storage` | `harness_note` | **yes** | `error` — the fake storage's own server failed. A harness bug |
+| `app_cli` | `http_request` | **yes** | see [`expect_app_cli_call`](#expect_app_cli_call) |
+| `app_cli` | `harness_note` | **yes** | `error` — the fake arduino-app-cli's own server failed. A harness bug |
 | `mqtt` | `mqtt_connect` | **yes** | see [`expect_mqtt_connect`](#expect_mqtt_connect) |
 | `mqtt` | `mqtt_disconnect` | **yes** | see [`expect_mqtt_disconnect`](#expect_mqtt_disconnect) |
 | `mqtt` | `mqtt_subscribe` | **yes** | see [`expect_mqtt_subscribe`](#expect_mqtt_subscribe) |
@@ -152,9 +156,10 @@ their attributes are documented.
 Every source has exactly the kinds listed above and no others. Note two
 asymmetries that catch people out:
 
-- **`harness_note` is significant on `provisioning_api` and `sse`, but not on
-  `mqtt`, `app` or `daemon_process`.** Significance is decided per source: all
-  `sse` and all `provisioning_api` events count, whatever their kind. So
+- **`harness_note` is significant on `provisioning_api`, `storage`, `app_cli`
+  and `sse`, but not on `mqtt`, `app` or `daemon_process`.** Significance is
+  decided per source: all `sse`, `provisioning_api`, `storage` and `app_cli`
+  events count, whatever their kind. So
   closing a variable stream mid-scenario produces a significant
   `sse`/`harness_note` that needs claiming or tolerating.
 - **`mqtt_ack` is declared in the event log but never emitted.** Using it in an
@@ -235,12 +240,33 @@ here hides a failure from it.
 skip_on_os: [windows]
 ```
 
+### `install_timeout`
+
+The daemon's stall watchdog on arduino-app-cli
+(`ARDUINO_CLOUD_CONNECTOR__INSTALL_TIMEOUT`): how long an install, a start or a
+stop may go without a progress event before the daemon gives up on it — `-47`
+for an install, `-3` for a lifecycle command. A duration. Absent leaves the
+daemon's default, 10 minutes, which no scenario wants to wait for: set it only
+in a scenario that waits for the watchdog to fire, and budget the step timeouts
+around it.
+
+It is a top-level key and not a step because it is part of the daemon's
+environment, fixed when the process starts.
+
+```yaml
+install_timeout: 3s
+```
+
 ### `fakes`
 
-Fault injection, applied before the daemon starts. Today it has one key.
+Fault injection and fake state, applied before the first step runs. Three
+keys: [`provisioning_api`](#provisioning_api), [`storage`](#storage) and
+[`app_cli`](#app_cli).
 
-`provisioning_api` holds a queue of responses per endpoint. Each request pops
-the next; an exhausted queue falls back to the happy default.
+#### `provisioning_api`
+
+A queue of responses per endpoint. Each request pops the next; an exhausted
+queue falls back to the happy default.
 
 ```yaml
 fakes:
@@ -270,6 +296,108 @@ The two endpoint keys are `csr` and `complete`. Each entry takes:
 Because every request is an event, retries are directly assertable with
 `occurrence`. Budget the timeouts: the daemon's provisioning back-off is 2s and
 cannot be shortened from here, so two 503s cost about six seconds.
+
+#### `storage`
+
+The App bundles the cloud can deploy, by name. The fake storage is HTTPS, with a
+certificate from the harness CA (the daemon pins storage to the same root as
+the broker), serves byte ranges, and records which client certificate the
+daemon presented without requiring one.
+
+A bundle is a block of deterministic bytes, not an archive: the daemon never
+opens it, it only checks the digest and hands it to
+arduino-app-cli. `app` is the App id the bundle stands for — the fake
+arduino-app-cli resolves the digest of what it receives back to the bundle,
+and installs that App.
+
+```yaml
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+    big:
+      app: "big:2.0.0"
+      size: 100000
+      responses: [{ respond: status, status: 503 }]
+```
+
+| Attribute | Meaning | Values |
+|---|---|---|
+| `app` | the App id arduino-app-cli installs from these bytes | string |
+| `size` | the bundle length | bytes, default 4096 — one ranged request and no intermediate download progress, so the `OTA.progress` sequence is fixed |
+| `responses` | a queue of answers, one per request; an exhausted queue serves the bundle | see below |
+
+| `respond` | Answer |
+|---|---|
+| `ok` | the requested range, 206 with `Content-Range` (200 without a `Range`) — the default |
+| `status` | the `status` given, no body. 4xx is final for the daemon (`-14`); 5xx, 408 and 429 are retried with its back-off, 2s doubling |
+| `corrupt` | the right headers and the right length, every byte flipped: the transfer succeeds and the digest check fails (`-6`) |
+| `hang` | accepts the request and never answers |
+
+Each entry also takes `delay` (a duration). A bundle name that is not declared
+answers 404 with `respond: unknown`.
+
+#### `app_cli`
+
+The fake arduino-app-cli: the Apps already on the board, then a queue of
+answers per endpoint — `install`, `start`, `stop`, `list` and `default`.
+
+```yaml
+fakes:
+  app_cli:
+    apps:
+      - { id: "old:1.0.0", status: running, default: true }
+    install:
+      - { respond: error, code: bad_request, message: "AppYamlInvalid: missing name" }
+      - { respond: ok, progress: [0, 50, 100] }
+    start:
+      - { respond: hang }
+```
+
+Its wire format is read off arduino-app-cli's own source (`render/sse.go` and
+`internal/api/handlers`), not off the daemon's client: every stream ends with
+`error {"code":"SERVER_CLOSED"}` + `close`, success included; install ends in
+`done`; start and stop have no `done`, so their success is the closing pair
+with no error before it; a refusal before the stream is an HTTP status with
+`{"details": "..."}`.
+
+**`apps`** — what is installed before the first step. Each entry: `id` (used
+verbatim, as the daemon uses the cloud's `name:version`), `status` (one of
+arduino-app-cli's: `uninitialized`, `starting`, `running`, `stopping`,
+`stopped`, `failed`; default `stopped`), `default` (at most one).
+
+**`respond: ok` is decided by that state**, as arduino-app-cli would decide it,
+and changes it:
+
+| Endpoint | `ok` does |
+|---|---|
+| `install` | installs the bundle's `app`, stopped, and streams `progress` then `done`. Refused with `app_already_exists` if the App exists, and with `bad_request` `AppArchiveRejected: …` if the bytes are not a declared bundle — both before any progress |
+| `start` | starts the App. Refused with `INTERNAL_SERVER_ERROR` `AnotherAppRunning: …` if any App (the target included) is running or starting; 500 `unable to find the app` if it does not exist |
+| `stop` | stops it, idempotently. 500 if it does not exist |
+| `list` | `GET /v1/apps`: `{"apps": [...]}` with every App |
+| `default` | `PATCH /v1/apps/{id}`: makes it the only default. 500 if it does not exist |
+
+Every other answer is a fault, and changes nothing:
+
+| `respond` | Answer |
+|---|---|
+| `ok` | as above — the default |
+| `error` | the `progress`, then `error {code, message}`, then the closing pair. Stream endpoints only. `code` defaults to `INTERNAL_SERVER_ERROR` |
+| `status` | the HTTP `status` with `{"details": details}`, before any stream |
+| `drop` | a stream: the `progress`, then the end of the response with no closing pair. A plain call (`list`, `default`): the connection is closed with no response. The daemon reads both as arduino-app-cli going away (`-41`) |
+| `hang` | never finishes. With `progress`, the headers and the progress go out first — a pull that hangs part way; without, not even the headers do. Pair with [`install_timeout`](#install_timeout) |
+
+| Attribute | Meaning | Values |
+|---|---|---|
+| `respond` | see above | |
+| `progress` | percentages streamed before the outcome. An `ok` with none streams the default: `[0, 100]` for install and start, `[100]` for stop | list of numbers |
+| `code`, `message` | the error event, for `error` | strings |
+| `status`, `details` | the refusal, for `status` | integer, string |
+| `delay` | wait before answering | duration |
+
+**The error messages are where the `"<Prefix>: <text>"` format lives**
+(RFC-14 §6.1, RFC-16 §5 — proposed to the app-cli team, not yet accepted): a
+scenario writes `message: "AppYamlInvalid: …"` itself, so if the format changes
+the scenarios are the place to change, together with the daemon's mapping.
 
 ### `steps`
 
@@ -311,6 +439,11 @@ with a timeout.
 | [`expect_app_event`](#expect_app_event) | waits for one frame on a subscribed variable stream |
 | [`expect_daemon_exit`](#expect_daemon_exit) | waits for the daemon process to terminate |
 | [`expect_any_order`](#expect_any_order) | waits for several expectations that race, in any order |
+| [`expect_storage_call`](#expect_storage_call) | waits for a bundle download request to the fake storage |
+| [`expect_app_cli_call`](#expect_app_cli_call) | waits for a request to the fake arduino-app-cli |
+| [`expect_ota_progress`](#expect_ota_progress) | waits for one or a run of `OTA.progress` reports of a deploy job |
+| [`expect_ota_begin`](#expect_ota_begin) | waits for the board's confirmation of an installed bundle |
+| [`expect_app_command_response`](#expect_app_command_response) | waits for one or a run of responses to a lifecycle command |
 | [`await_daemon_state`](#await_daemon_state) | waits for a daemon state |
 | [`await_daemon_cloud_state`](#await_daemon_cloud_state) | waits for a cloud FSM state |
 | [`await_daemon_provisioning_state`](#await_daemon_provisioning_state) | waits for a provisioning state |
@@ -324,6 +457,8 @@ with a timeout.
 | [`cloud_publish`](#cloud_publish) | sends a command as the cloud |
 | [`cloud_publish_var`](#cloud_publish_var) | changes a property value as the cloud |
 | [`cloud_drop_connection`](#cloud_drop_connection) | drops the daemon's broker connection, to exercise the reconnect |
+| [`cloud_ota`](#cloud_ota) | starts an App deploy as the cloud (`OTA.update`) |
+| [`cloud_app_start`, `cloud_app_stop`, `cloud_app_set_default`, `cloud_app_delete`](#cloud_app_start-cloud_app_stop-cloud_app_set_default-cloud_app_delete) | sends a lifecycle command as the cloud (`App.command`) |
 | [`stop_daemon`](#stop_daemon) | shuts the daemon down and waits for it |
 
 ### Parameters are validators
@@ -665,6 +800,141 @@ entry order: when predicates overlap, write the most specific first.
     - expect_var_publish: { topic: "/a/t/{thing_id}/e/o", variable: temp, value: 42.0 }
 ```
 
+### `expect_storage_call`
+
+Waits for a request to the fake storage. See [`fakes: storage`](#storage).
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `bundle` | the bundle name in the URL | string |
+| `occurrence` | 1-based request count for that bundle — a chunk retry is the next one | integer |
+| `method` | HTTP method | `GET` |
+| `range` | the `Range` header the daemon sent | e.g. `"bytes=0-67108863"` |
+| `respond` | the answer the fake decided | `ok`, `status`, `corrupt`, `hang`, `unknown` |
+| `status` | the HTTP status returned | integer — 206 for a range |
+| `client_cert_cn` | the CN of the client certificate presented, `""` if none | e.g. `"{device_id}"` |
+| `client_cert_valid` | whether it chains to the harness CA | `true`, `false` |
+
+```yaml
+# the download, authenticated with the device certificate
+- expect_storage_call:
+    bundle: app1
+    status: 206
+    client_cert_cn: "{device_id}"
+    client_cert_valid: true
+
+# a 503 is retried: the second request is the one served
+- expect_storage_call: { bundle: app1, respond: status, status: 503 }
+- expect_storage_call: { bundle: app1, respond: ok, status: 206, timeout: 20s }
+```
+
+### `expect_app_cli_call`
+
+Waits for a request to the fake arduino-app-cli. See [`fakes: app_cli`](#app_cli).
+The event is recorded on arrival, with the answer already decided, so its
+`outcome` says what the fake did.
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `endpoint` | which endpoint | `install`, `start`, `stop`, `list`, `default`, `unknown` |
+| `occurrence` | 1-based call count for that endpoint | integer |
+| `method`, `path` | the request | strings |
+| `app` | the App id in the path. `start`, `stop`, `default` | string |
+| `respond` | the directive that answered | `ok`, `error`, `status`, `drop`, `hang` |
+| `outcome` | what an `ok` decided | `installed`, `app_already_exists`, `archive_unknown`, `started`, `another_app_running`, `stopped`, `listed`, `default_set`, `unknown_app` |
+| `bundle` | the declared bundle the upload resolved to, `""` if none. `install` | string |
+| `bundle_sha256`, `bundle_size`, `filename` | the uploaded multipart `file`. `install` | strings, integer |
+| `installed_app` | the App the bytes stand for. `install` | string |
+| `prepare` | the `prepare` query parameter. `install` | `"true"` — the daemon must ask for it |
+| `apps` | how many Apps the list returned. `list` | integer |
+| `fields` | the JSON fields sent, sorted and comma-separated. `default` | `default` — nothing else is allowed on a release |
+| `default` | the `default` value sent. `default` | `true`, `false` |
+
+```yaml
+# the bundle the cloud announced, and nothing else, reached arduino-app-cli
+- expect_app_cli_call: { endpoint: install, bundle: app1, prepare: "true", outcome: installed }
+
+# a start that first stops the running App
+- expect_app_cli_call: { endpoint: list }
+- expect_app_cli_call: { endpoint: stop, app: "old:1.0.0", outcome: stopped }
+- expect_app_cli_call: { endpoint: start, app: "app1:0.1.0", outcome: started }
+```
+
+### `expect_ota_progress`
+
+Waits for `OTA.progress` reports of one deploy job. The job is named by the
+word the scenario gave [`cloud_ota`](#cloud_ota), the state by its RFC-14 name.
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `id` | the job (required) | the `id` given to `cloud_ota` |
+| `state` | the state reported (required) | `OtaAvailable`, `StartOTA`, `Fetch`, `FlashOTA`, `Fail` (also `Resume`, `OtaBegin`, `Idle`, `Reboot`), or the number |
+| `state_data` | one value, or a list | see below |
+| `timeout` | per report | duration, default 15s |
+
+**A list is a run of consecutive reports**, each consumed in order: `state_data:
+[0, 50, 100]` is three reports, and a missing, extra or reordered one fails the
+step (an extra one is left unclaimed, which `strict_events` catches). Absent
+matches any value.
+
+What `state_data` holds depends on the state: `0` on entering a state, the
+bytes written so far during `Fetch` (only every 10s, so never with the default
+bundle size), the percentage arduino-app-cli streamed during `FlashOTA`, and the
+negative error code (RFC-14 §5.10) in `Fail`.
+
+```yaml
+# a deploy that installs: each state on entry, then every install progress
+- expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+- expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+- expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+- expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+- expect_ota_progress: { id: job1, state: FlashOTA, state_data: [0, 50, 100] }
+
+# and one that does not
+- expect_ota_progress: { id: job2, state: Fail, state_data: -43 }
+```
+
+The report on entering `Fetch` races the storage request it precedes, and the
+one entering `FlashOTA` races the install request: see the
+[ordering rules](#ordering-rules).
+
+### `expect_ota_begin`
+
+Waits for `OTA.begin`, the board's confirmation that a deploy installed: it
+carries the digest of the bundle. A successful deploy ends here, **without** a
+start (RFC-14 v7).
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `bundle` | the bundle installed | a name under `fakes: storage` |
+| `sha256` | the digest instead, 64 hex digits | string |
+
+```yaml
+- expect_ota_begin: { bundle: app1 }
+```
+
+### `expect_app_command_response`
+
+Waits for `App.commandResponse` messages of one lifecycle command (RFC-16 §3).
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `op_id` | the operation (required) | the `op_id` the command carried |
+| `status` | which response (required) | `progress`, `ok`, `fail` |
+| `details` | the percentage of a `progress`, the error code of a `fail` — one value or a list, as in `expect_ota_progress` | required for `progress` and `fail`, **refused** for `ok` |
+
+**`ok` asserts the absence of details by itself**: RFC-16's success is
+`[op_id, 0]` and nothing more, so the step also requires `elements: 2`.
+
+```yaml
+# a start: its progress, then the bare success
+- expect_app_command_response: { op_id: op1, status: progress, details: [0, 100] }
+- expect_app_command_response: { op_id: op1, status: ok }
+
+# refused while another App runs
+- expect_app_command_response: { op_id: op3, status: fail, details: -2 }
+```
+
 ### `await_daemon_state`
 
 Waits for a status poll reporting the given daemon state.
@@ -941,6 +1211,50 @@ not connected is an error, rather than a drop that silently never happened.
 `reconnect-after-drop.yaml` is the worked example, including why the
 `LastValues.update` after the reconnect carries no values.
 
+### `cloud_ota`
+
+Starts an App deploy, as the cloud does: `OTA.update` with the job id, the
+bundle's URL on the fake storage, an all-zero "currently installed" digest and
+the bundle's digest.
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `id` | the job (required). Any word: the step derives a 16-byte id from it, and the expectations derive the same one. 32 hex digits are taken verbatim | string |
+| `bundle` | the bundle to deploy | a name under `fakes: storage` |
+| `url` | replaces the bundle's URL | string, e.g. `http://…` to be refused with `-9` |
+| `sha256` | replaces the bundle's digest | 64 hex digits — a digest the bundle does not have fails with `-6` |
+
+Give a `bundle`, or both `url` and `sha256`.
+
+```yaml
+- cloud_ota: { id: job1, bundle: app1 }
+
+# the cloud announces a digest the bytes do not have
+- cloud_ota: { id: job2, bundle: app1, sha256: "0000000000000000000000000000000000000000000000000000000000000001" }
+```
+
+### `cloud_app_start`, `cloud_app_stop`, `cloud_app_set_default`, `cloud_app_delete`
+
+Send `App.command` (RFC-16 §3), one step per command.
+
+| Parameter | Meaning | Values |
+|---|---|---|
+| `app` | the App (required), used verbatim as arduino-app-cli's id | string, e.g. `"app1:0.1.0"` |
+| `op_id` | the operation id (required), echoed by every response | string |
+| `parameter` | the optional fourth element | integer |
+
+For a start, `parameter` absent or `1` stops every running App first (the
+target included, which is then restarted); `0` refuses with `-2` if another
+App runs. Any other value is refused with `-3`. Stop, set-default and delete
+ignore it. Delete is not supported by the daemon yet and is answered `-3`.
+
+```yaml
+- cloud_app_start: { app: "app1:0.1.0", op_id: op1 }
+- cloud_app_start: { app: "old:1.0.0", op_id: op2, parameter: 0 }
+- cloud_app_stop: { app: "app1:0.1.0", op_id: op3 }
+- cloud_app_set_default: { app: "app1:0.1.0", op_id: op4 }
+```
+
 ### `stop_daemon`
 
 Shuts the daemon down and waits for it to go. This is what announces the exit,
@@ -969,7 +1283,7 @@ unknown key is an **error**, never left in place as text.
 |---|---|
 | `device_id` | the start — the identity the fake Provisioning API will assign |
 | `thing_id` | the start |
-| `api_url`, `broker_url`, `ntp_addr`, `daemon_url`, `data_dir` | the start |
+| `api_url`, `broker_url`, `ntp_addr`, `daemon_url`, `data_dir`, `app_cli_url` | the start |
 | `uhwid` | after `get_device_identity` |
 | `organization_id` | after `start_provisioning` with one, or `get_daemon_status` |
 
@@ -989,7 +1303,12 @@ Three things to know, because they decide where a step can go:
    one and put the other in `tolerate`. The same applies to two subscriptions
    due the same frame: each is its own stream pumped by its own goroutine, so
    the daemon's fan-out order is not the arrival order -- `cloud-fan-out.yaml`
-   is the worked example.
+   is the worked example. A deploy has two of these: the daemon reports
+   entering `Fetch` and then calls storage, reports entering `FlashOTA` and
+   then calls arduino-app-cli, and in both pairs the report travels over MQTT
+   and the call over HTTP -- `app-deploy-and-start.yaml` groups them. What
+   comes back from a fake (an install's progress, a start's responses) is
+   caused by the call, so it is always after it and needs no group.
 3. **Do not wait on a state between two protocol events.** Status polls are
    recorded only on change, so the poll that first reports `provisioned` can
    arrive *after* the MQTT connect; consuming it would skip past the connect

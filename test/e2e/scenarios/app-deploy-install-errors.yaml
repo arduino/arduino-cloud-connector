@@ -1,0 +1,210 @@
+# Install failures reported by arduino-app-cli, each one propagated to the cloud
+# as its RFC-14 §5.10 code (v7 numbering). One deploy per case, in sequence on
+# the same board: every job downloads the bundle, hands it over, and ends in
+# Fail with the code -- and the next job is accepted, which proves a failed
+# deploy releases the command slot.
+#
+# The error messages use the "<Prefix>: <text>" format proposed to the app-cli
+# team (RFC-14 §6.1) and NOT yet accepted: if it changes, these messages are the
+# place to change, and the daemon's mapping with them.
+#
+#   job1  AppArchiveRejected                          -42
+#   job2  AppYamlInvalid                              -43
+#   job3  AppNotCompatible                            -44
+#   job4  ExtractionError                             -51
+#   job5  NoDiskSpace, after some progress            -40  (progress forwarded first)
+#   job6  AdditionalResourceDownloadErrorNoDiskSpace  -52  (the longer prefix wins)
+#   job7  AdditionalResourceDownloadError             -53
+#   job8  bad_request with no prefix                  -46  (the install's generic code)
+#   job9  HTTP 404 before the stream                  -44  (an app-cli too old for the endpoint)
+#   job10 HTTP 500 before the stream, no prefix       -41
+#   job11 installed                                   OTA.begin
+#   job12 the same App again                          -50  (app_already_exists, decided by the fake's state)
+name: app-deploy-install-errors
+strict_events: true
+
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+  app_cli:
+    install:
+      - { respond: error, code: bad_request, message: "AppArchiveRejected: zip: not a valid zip file" }
+      - { respond: error, code: bad_request, message: "AppYamlInvalid: app.yaml: missing field name" }
+      - { respond: error, code: bad_request, message: "AppNotCompatible: the app requires board unoq-2" }
+      - { respond: error, message: "ExtractionError: unexpected EOF" }
+      - { respond: error, progress: [0, 20], message: "NoDiskSpace: not enough disk space to pull the docker image" }
+      - { respond: error, progress: [50], message: "AdditionalResourceDownloadErrorNoDiskSpace: model yolo" }
+      - { respond: error, progress: [50], message: "AdditionalResourceDownloadError: model yolo: 404" }
+      - { respond: error, code: bad_request, message: "something went wrong" }
+      - { respond: status, status: 404, details: "404 page not found" }
+      - { respond: status, status: 500, details: "internal server error" }
+      - { respond: ok }
+      - { respond: ok }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── job1 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job1, state: Fail, state_data: -42 }
+
+  # ── job2 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job2, bundle: app1 }
+  - expect_ota_progress: { id: job2, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job2, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job2, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job2, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job2, state: Fail, state_data: -43 }
+
+  # ── job3 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job3, bundle: app1 }
+  - expect_ota_progress: { id: job3, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job3, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job3, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job3, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job3, state: Fail, state_data: -44 }
+
+  # ── job4 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job4, bundle: app1 }
+  - expect_ota_progress: { id: job4, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job4, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job4, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job4, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job4, state: Fail, state_data: -51 }
+
+  # ── job5 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job5, bundle: app1 }
+  - expect_ota_progress: { id: job5, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job5, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job5, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job5, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job5, state: FlashOTA, state_data: [0, 20] }
+  - expect_ota_progress: { id: job5, state: Fail, state_data: -40 }
+
+  # ── job6 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job6, bundle: app1 }
+  - expect_ota_progress: { id: job6, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job6, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job6, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job6, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job6, state: FlashOTA, state_data: 50 }
+  - expect_ota_progress: { id: job6, state: Fail, state_data: -52 }
+
+  # ── job7 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job7, bundle: app1 }
+  - expect_ota_progress: { id: job7, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job7, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job7, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job7, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job7, state: FlashOTA, state_data: 50 }
+  - expect_ota_progress: { id: job7, state: Fail, state_data: -53 }
+
+  # ── job8 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job8, bundle: app1 }
+  - expect_ota_progress: { id: job8, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job8, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job8, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job8, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
+  - expect_ota_progress: { id: job8, state: Fail, state_data: -46 }
+
+  # ── job9 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job9, bundle: app1 }
+  - expect_ota_progress: { id: job9, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job9, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job9, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job9, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: status }
+  - expect_ota_progress: { id: job9, state: Fail, state_data: -44 }
+
+  # ── job10 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job10, bundle: app1 }
+  - expect_ota_progress: { id: job10, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job10, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job10, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job10, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: status }
+  - expect_ota_progress: { id: job10, state: Fail, state_data: -41 }
+
+  # ── job11 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job11, bundle: app1 }
+  - expect_ota_progress: { id: job11, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job11, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job11, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job11, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: ok }
+  - expect_ota_progress: { id: job11, state: FlashOTA, state_data: [0, 100] }
+  - expect_ota_begin: { bundle: app1 }
+
+  # ── job12 ───────────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job12, bundle: app1 }
+  - expect_ota_progress: { id: job12, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job12, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job12, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job12, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: ok }
+  - expect_ota_progress: { id: job12, state: Fail, state_data: -50 }
