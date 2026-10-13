@@ -22,7 +22,9 @@ import (
 	"testing"
 	"time"
 
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
+	"github.com/arduino/arduino-cloud-connector/internal/cmdslot"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader/downloadertest"
@@ -156,7 +158,7 @@ func newTestFSM(t *testing.T, storage downloader.Downloader, inst appinstaller.I
 		InstallTimeout:  5 * time.Second,
 	}
 	pub := &fakePublisher{}
-	return New(cfg, "device-1", pub, storage, inst), pub, cfg
+	return New(cfg, "device-1", pub, storage, inst, nil), pub, cfg
 }
 
 const testBundleURL = "https://api2.arduino.cc/apps/owner/app-uuid/bundle.zip"
@@ -423,7 +425,7 @@ func TestOTAFSMNeverConfirmsAFailedDeploy(t *testing.T) {
 	final := sha256.Sum256(content)
 
 	inst := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error {
-		return fmt.Errorf("%w: unpack failed", appinstaller.ErrFailed)
+		return fmt.Errorf("%w: unpack failed", appcli.ErrFailed)
 	})
 	f, pub, _ := newTestFSM(t, &downloadertest.FakeDownloader{Content: content}, inst)
 	stop := runFSM(t, f)
@@ -544,6 +546,35 @@ func TestOTAFSMRefusesASecondJobWhileOneIsDeploying(t *testing.T) {
 	}
 }
 
+// The slot is the board's, not the deploy's: while an App lifecycle command holds it
+// a deploy is refused with -49 exactly as a second deploy would be, and is accepted
+// once the command gives it back.
+func TestOTAFSMRefusesAJobWhileALifecycleCommandHoldsTheSlot(t *testing.T) {
+	content := []byte("a bundle")
+	final := sha256.Sum256(content)
+	slot := &cmdslot.Slot{}
+	slot.TryAcquire("app-command:op-1")
+
+	ok := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error { return nil })
+	_, pub, cfg := newTestFSM(t, nil, nil)
+	f := New(cfg, "device-1", pub, &downloadertest.FakeDownloader{Content: content}, ok, slot)
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	refused := updateCmdWithID([16]byte{7}, final)
+	f.Deliver(refused)
+	waitFor(t, "the refusal", func() bool { return len(pub.failReports()) == 1 })
+	if got := pub.failReports()[0]; got.code != ErrDeployInProgress || got.jobID != hex.EncodeToString(refused.ID[:]) {
+		t.Errorf("refusal: got %+v, want %s for job %x", got, ErrDeployInProgress, refused.ID)
+	}
+
+	slot.Release("app-command:op-1")
+	f.Deliver(updateCmd(final))
+	waitFor(t, "the deploy once the slot is free", func() bool { return pub.hasDigest(final) })
+}
+
 // The deploy slot must be given back when a job ends, whichever way it ended.
 //
 // This is the failure mode the -49 refusal introduces: hold the slot one job too long
@@ -556,7 +587,7 @@ func TestOTAFSMAcceptsAJobAfterThePreviousOneEnds(t *testing.T) {
 		firstErr error
 	}{
 		{"after a successful deploy", nil},
-		{"after a failed deploy", fmt.Errorf("%w: unpack", appinstaller.ErrFailed)},
+		{"after a failed deploy", fmt.Errorf("%w: unpack", appcli.ErrFailed)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := []byte("bundle for " + tc.name)
@@ -693,6 +724,41 @@ func TestOTAFSMHoldsTheFailureUntilTheBrokerIsUp(t *testing.T) {
 	waitFor(t, "the held failure report", func() bool { return pub.hasFailCode(ErrDownload) })
 }
 
+// The install confirmation is held like a failure: it is the one message that closes
+// a successful deploy, and the broker dropping during the install must not turn that
+// deploy into a Cloud-side timeout. It is still sent exactly once.
+func TestOTAFSMHoldsTheConfirmationUntilTheBrokerIsUp(t *testing.T) {
+	content := []byte("a bundle installed during an outage")
+	final := sha256.Sum256(content)
+
+	installing, finish := make(chan struct{}), make(chan struct{})
+	f, pub, _ := newTestFSM(t, &downloadertest.FakeDownloader{Content: content},
+		blockingInstaller(installing, finish))
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	f.Deliver(updateCmd(final))
+	<-installing
+	f.SetConnected(false) // the broker drops mid-install
+	close(finish)
+
+	waitFor(t, "a return to Idle with the confirmation held", func() bool {
+		return f.Snapshot().State == StateIdle && f.Snapshot().JobID == ""
+	})
+	if n := len(pub.begins()); n != 0 {
+		t.Fatalf("confirmed %d times with the broker down", n)
+	}
+
+	f.SetConnected(true)
+	waitFor(t, "the held confirmation", func() bool { return pub.hasDigest(final) })
+	time.Sleep(20 * time.Millisecond)
+	if n := len(pub.begins()); n != 1 {
+		t.Errorf("confirmed %d times, want exactly 1", n)
+	}
+}
+
 // Holding rather than waiting is what keeps the process usable during an outage. The
 // version that waited for the broker inside Fail kept the deploy slot claimed, so a job
 // arriving meanwhile was refused with -49 — a refusal that could not be published
@@ -792,7 +858,8 @@ func TestOutboxDropsTheOldestWhenFull(t *testing.T) {
 		t.Fatalf("outbox holds %d, want the cap of %d", len(f.outbox), outboxLimit)
 	}
 	// Two were dropped, so the survivors start at 2 and are still in order.
-	for i, cmd := range f.outbox {
+	for i, held := range f.outbox {
+		cmd := held.(command.OTAProgressCmd)
 		if want := byte(i + 2); cmd.ID[0] != want {
 			t.Errorf("outbox[%d] is job %d, want %d", i, cmd.ID[0], want)
 		}
@@ -1118,7 +1185,7 @@ func TestOTAFSMReportsDownloadBytesThenInstallPercent(t *testing.T) {
 	dl := &downloadertest.FakeDownloader{Content: content, Progress: []downloadertest.Progress{
 		{Written: 3, Total: 9}, {Written: 6, Total: 9}, {Written: 9, Total: 9},
 	}}
-	f, pub, _ := newTestFSM(t, dl, appinstaller.NewAppCLI(srv.URL))
+	f, pub, _ := newTestFSM(t, dl, appinstaller.AppCLI(appcli.New(srv.URL)))
 	stop := runFSM(t, f)
 	defer stop()
 	f.SetConnected(true)

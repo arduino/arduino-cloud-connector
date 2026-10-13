@@ -37,8 +37,8 @@
 //     OTAProgressCmd(8, -49), keyed by the refused job. That one is published by
 //     Deliver rather than by the state machine — see there for why.
 //
-// Of the three, only the failure is held when the broker is down (see the outbox
-// field); the other two are published or dropped.
+// The failure and the confirmation are held when the broker is down (see the outbox
+// field) and sent when it returns; the refusal is published or dropped.
 //
 // Every one of them is keyed by a job id, which is also why a job that cannot be
 // named produces no message at all: there would be nothing for the Cloud to attach it
@@ -108,6 +108,7 @@ import (
 	"time"
 
 	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
+	"github.com/arduino/arduino-cloud-connector/internal/cmdslot"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt/command"
@@ -170,12 +171,13 @@ type OTAFSM struct {
 	// blocks and a signal is not lost when nobody is listening yet.
 	connUp chan struct{}
 
-	// busy claims the single deploy slot. Deliver takes it before queueing a job and
-	// only the end of that job releases it, so a second OTAUpdateCmd arriving in
-	// between is answered with ErrDeployInProgress rather than queued behind a deploy
-	// the Cloud stopped waiting for minutes ago. Resume takes it too, for the job it
-	// recovers from disk.
-	busy atomic.Bool
+	// slot is the board's single command slot, shared with the App lifecycle
+	// commands (see internal/cmdslot). Deliver takes it before queueing a job and
+	// only the end of that job releases it, so any command arriving in between — a
+	// second OTAUpdateCmd or a lifecycle command — is refused rather than queued
+	// behind a deploy the Cloud stopped waiting for minutes ago. Resume takes it too,
+	// for the job it recovers from disk.
+	slot *cmdslot.Slot
 
 	mu       sync.RWMutex
 	snapshot Snapshot
@@ -194,32 +196,40 @@ type OTAFSM struct {
 	failCause   error
 	clampWarned bool
 
-	// outbox holds terminal reports composed while the broker was down, to be sent
-	// when it comes back.
+	// outbox holds terminal messages composed while the broker was down, to be sent
+	// when it comes back: the Fail report (OTAProgressCmd) and the install
+	// confirmation (OTABeginCmd).
 	//
 	// Only terminal ones. A progress report lost in a disconnected gap costs nothing —
-	// the next one carries the same cumulative byte count — but the Fail report is sent
-	// once and is what closes the Cloud job with a reason, so dropping it leaves the
-	// job open until the Cloud's own timeout, with nothing to show the operator. The
-	// case that makes this necessary rather than nice is ErrDeployInterrupted: it is
-	// decided in Resume, milliseconds after start-up, when the broker is essentially
-	// never connected yet.
+	// the next one carries the same cumulative byte count — but each of these is sent
+	// once and is what closes the Cloud job, so dropping it leaves the job open until
+	// the Cloud's own timeout: a failure with nothing to show the operator, or a
+	// successful deploy reported as failed. The case that makes this necessary rather
+	// than nice is ErrDeployInterrupted: it is decided in Resume, milliseconds after
+	// start-up, when the broker is essentially never connected yet.
 	//
 	// Holding rather than waiting for the broker is the point. The state machine
 	// returns to Idle at once, so a job arriving during the outage is accepted like any
 	// other — whereas parking in Fail until the broker returned would keep the deploy
 	// slot claimed and answer that job with ErrDeployInProgress, a refusal that could
 	// not be published either.
-	outbox []command.OTAProgressCmd
+	outbox []any
 
 	now func() time.Time
 }
 
 // New builds the App-deploy process. storage fetches bundles (see
 // internal/downloader, which drives internal/storage-api for the bytes); inst
-// installs them (appinstaller.AppCLI in production).
-func New(cfg config.Config, deviceID string, pub Publisher, storage downloader.Downloader, inst appinstaller.Installer) *OTAFSM {
+// installs them (appinstaller.AppCLI in production). slot is the command slot shared
+// with the other Cloud commands; nil gives the process one of its own.
+func New(cfg config.Config, deviceID string, pub Publisher, storage downloader.Downloader,
+	inst appinstaller.Installer, slot *cmdslot.Slot,
+) *OTAFSM {
+	if slot == nil {
+		slot = &cmdslot.Slot{}
+	}
 	return &OTAFSM{
+		slot:           slot,
 		deviceID:       deviceID,
 		pub:            pub,
 		storage:        storage,
@@ -257,7 +267,7 @@ func (f *OTAFSM) Snapshot() Snapshot {
 func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 	jobID := hex.EncodeToString(cmd.ID[:])
 
-	if !f.busy.CompareAndSwap(false, true) {
+	if !f.slot.TryAcquire(slotHolder) {
 		// The slot is taken, and two very different things look like this.
 		if jobID == f.Snapshot().JobID {
 			// The same job again — an MQTT redelivery, or the Cloud repeating itself.
@@ -267,8 +277,8 @@ func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 				"job_id", jobID)
 			return
 		}
-		slog.Warn("ota: a deploy is already in flight, refusing the new job",
-			"job_id", jobID, "in_flight", f.Snapshot().JobID)
+		slog.Warn("ota: another command is in flight, refusing the new job",
+			"job_id", jobID, "in_flight", f.slot.Holder())
 		f.rejectBusy(cmd.ID)
 		return
 	}
@@ -279,7 +289,7 @@ func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 		// Unreachable while the slot admits one job at a time. Releasing it matters
 		// anyway: a slot claimed for a command that was never queued would refuse
 		// every future deploy.
-		f.busy.Store(false)
+		f.releaseSlot()
 		slog.Warn("ota: event queue full, dropping OTAUpdateCmd",
 			"job_id", jobID, "state", f.Snapshot().State)
 	}
@@ -288,7 +298,11 @@ func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 // releaseSlot lets the next job in. Called when a deploy is over — successfully or
 // not — and never before its cleanup, so a job accepted right afterwards cannot find
 // the previous one's bundle or record still on disk.
-func (f *OTAFSM) releaseSlot() { f.busy.Store(false) }
+func (f *OTAFSM) releaseSlot() { f.slot.Release(slotHolder) }
+
+// slotHolder names the deploy in the shared command slot. One deploy runs at a time,
+// so the name needs no job id.
+const slotHolder = "ota"
 
 // rejectBusy answers a refused job with OTAProgressCmd(Fail, ErrDeployInProgress),
 // keyed by the REFUSED job's id so the Cloud closes that job and leaves the running
@@ -358,17 +372,31 @@ func (f *OTAFSM) isConnected() bool { return f.connected.Load() }
 // the board.
 const outboxLimit = 4
 
-// hold puts a report that could not be published where the next connection will find
-// it. See the outbox field for why only terminal reports get this treatment.
-func (f *OTAFSM) hold(cmd command.OTAProgressCmd) {
+// hold puts a terminal message that could not be published where the next connection
+// will find it: an OTAProgressCmd(Fail) or an OTABeginCmd. See the outbox field for
+// why only terminal messages get this treatment.
+func (f *OTAFSM) hold(cmd any) {
 	if len(f.outbox) >= outboxLimit {
-		slog.Warn("ota: outbox full, dropping the oldest held report",
-			"job_id", hex.EncodeToString(f.outbox[0].ID[:]), "limit", outboxLimit)
+		slog.Warn("ota: outbox full, dropping the oldest held message",
+			append(describeHeld(f.outbox[0]), "limit", outboxLimit)...)
 		f.outbox = f.outbox[1:]
 	}
 	f.outbox = append(f.outbox, cmd)
-	slog.Info("ota: broker down, holding the failure report until it reconnects",
-		"job_id", hex.EncodeToString(cmd.ID[:]), "code", Error(cmd.StateData), "held", len(f.outbox))
+	slog.Info("ota: broker down, holding the message until it reconnects",
+		append(describeHeld(cmd), "held", len(f.outbox))...)
+}
+
+// describeHeld returns log attributes naming a held message, never its payload
+// beyond what identifies it.
+func describeHeld(cmd any) []any {
+	switch c := cmd.(type) {
+	case command.OTAProgressCmd:
+		return []any{"message", "failure", "job_id", hex.EncodeToString(c.ID[:]), "code", Error(c.StateData)}
+	case command.OTABeginCmd:
+		return []any{"message", "install confirmation", "sha256", hex.EncodeToString(c.SHA256[:])}
+	default:
+		return []any{"message", fmt.Sprintf("%T", cmd)}
+	}
 }
 
 // flushOutbox sends everything held, oldest first.
@@ -388,12 +416,11 @@ func (f *OTAFSM) flushOutbox() {
 		if err := f.publish(cmd); err != nil {
 			// Not re-held: failing to publish while connected is a different problem
 			// from having nowhere to publish, and one this loop cannot fix by repeating.
-			slog.Warn("ota: a held failure report could not be delivered, dropping it",
-				"job_id", hex.EncodeToString(cmd.ID[:]), "error", err)
+			slog.Warn("ota: a held message could not be delivered, dropping it",
+				append(describeHeld(cmd), "error", err)...)
 			continue
 		}
-		slog.Info("ota: held failure report delivered",
-			"job_id", hex.EncodeToString(cmd.ID[:]), "code", Error(cmd.StateData))
+		slog.Info("ota: held message delivered", describeHeld(cmd)...)
 	}
 }
 
@@ -446,10 +473,15 @@ func (f *OTAFSM) runResume(ctx context.Context) stateFn {
 	}
 
 	slog.Info("ota: interrupted deploy found, resuming", "job_id", job.IDHex())
-	// The recovered job holds the deploy slot exactly like a freshly delivered one
-	// would, so a job arriving now is refused with -49 instead of queueing up behind it.
-	f.busy.Store(true)
+	// The recovered job holds the command slot exactly like a freshly delivered one
+	// would, so a command arriving now is refused with -49 instead of queueing up
+	// behind it. Resume runs before the broker is up, so nothing can hold the slot
+	// yet; if something does, the job is closed rather than run alongside it.
 	f.job = job
+	if !f.slot.TryAcquire(slotHolder) {
+		return f.fail(ErrDeployInProgress,
+			fmt.Errorf("ota: the command slot is held by %q", f.slot.Holder()))
+	}
 	return f.runStartOTA
 }
 
@@ -544,16 +576,20 @@ func removeQuietly(paths ...string) {
 // Apps, some installed by hand from App Lab, so there is no single "deployed App" to
 // announce, and announcing one anyway would be a claim this process cannot make.
 //
-// A failure to publish is logged and dropped. Nothing retries it, and nothing
-// remembers the digest afterwards, so the Cloud job stays open until the operator
-// looks. That is the accepted cost of not making a false claim on every boot.
+// With the broker down it is held in the outbox and sent when the broker returns —
+// exactly once still: holding is not re-announcing. It is lost only if the daemon
+// stops before then, the outbox being memory. A publish that fails while connected is
+// logged and dropped; that is the accepted cost of not making a false claim on every
+// boot.
 func (f *OTAFSM) announceInstalled(digest [32]byte) {
+	cmd := command.OTABeginCmd{SHA256: digest}
 	if !f.isConnected() {
-		slog.Warn("ota: broker not connected, the install confirmation could not be sent",
-			"sha256", hex.EncodeToString(digest[:]))
+		// Held, not dropped: it is the one message that closes a successful deploy.
+		f.hold(cmd)
 		return
 	}
-	if err := f.publish(command.OTABeginCmd{SHA256: digest}); err != nil {
+	f.flushOutbox()
+	if err := f.publish(cmd); err != nil {
 		slog.Warn("ota: install confirmation publish failed",
 			"sha256", hex.EncodeToString(digest[:]), "error", err)
 		return
@@ -723,7 +759,7 @@ func (f *OTAFSM) runFlashOTA(ctx context.Context) stateFn {
 // bounded the same way. It is also at a different level from the timeouts the
 // installer itself needs: this one measures silence on the progress callback and
 // knows nothing about the transport, while connect and read deadlines on the stream
-// belong to the installer and surface as appinstaller.ErrFailed.
+// belong to the installer and surface as appcli.ErrFailed.
 func (f *OTAFSM) install(ctx context.Context, req appinstaller.Request) error {
 	ictx, cancel := context.WithCancel(ctx)
 	defer cancel()

@@ -3,7 +3,7 @@
 // SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-package appinstaller
+package appcli
 
 import (
 	"bytes"
@@ -58,15 +58,14 @@ func install(t *testing.T, srv *httptest.Server, onProgress ProgressFunc) error 
 	if onProgress == nil {
 		onProgress = func(int32) {}
 	}
-	req := Request{BundlePath: writeBundleFile(t, []byte("bundle")), SHA256: "00"}
-	return NewAppCLI(srv.URL).Install(context.Background(), req, onProgress)
+	return New(srv.URL).Install(context.Background(), writeBundleFile(t, []byte("bundle")), onProgress)
 }
 
 // The request is the contract with arduino-app-cli's handler: PUT on the install
 // path, prepare=true (it defaults to false, and a deploy without it would leave an App
 // that cannot start), and the bundle — every byte of it — in the multipart field
 // "file".
-func TestAppCLIUploadsTheBundleAsMultipart(t *testing.T) {
+func TestInstallUploadsTheBundleAsMultipart(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789abcdef"), 64<<10) // 1 MiB: several pipe writes
 	var got []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,8 +89,7 @@ func TestAppCLIUploadsTheBundleAsMultipart(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	req := Request{BundlePath: writeBundleFile(t, content)}
-	if err := NewAppCLI(srv.URL+"/").Install(context.Background(), req, func(int32) {}); err != nil {
+	if err := New(srv.URL+"/").Install(context.Background(), writeBundleFile(t, content), func(int32) {}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	if !bytes.Equal(got, content) {
@@ -103,7 +101,7 @@ func TestAppCLIUploadsTheBundleAsMultipart(t *testing.T) {
 // percentages from the container pull, fractional ones from the models, progress:100
 // BEFORE done, and the SERVER_CLOSED error after it — which must not turn a success
 // into a failure.
-func TestAppCLIFollowsASuccessfulInstall(t *testing.T) {
+func TestInstallFollowsASuccessfulInstall(t *testing.T) {
 	stream := "event: heartbeat\n\n" +
 		"event: message\ndata: {\"message\":\"downloading the containers\"}\n\n" +
 		"event: progress\ndata: {\"name\":\"containers\",\"progress\":0}\n\n" +
@@ -129,7 +127,7 @@ func TestAppCLIFollowsASuccessfulInstall(t *testing.T) {
 }
 
 // The Cloud's progress bar must never go backwards, and never past 100.
-func TestAppCLIProgressIsMonotonicAndCapped(t *testing.T) {
+func TestInstallProgressIsMonotonicAndCapped(t *testing.T) {
 	stream := "event: progress\ndata: {\"progress\":40}\n\n" +
 		"event: progress\ndata: {\"progress\":10}\n\n" +
 		"event: progress\ndata: {\"progress\":250}\n\n" +
@@ -147,7 +145,7 @@ func TestAppCLIProgressIsMonotonicAndCapped(t *testing.T) {
 // prefixes are in: the code its render package sets, and the message with the prefix
 // in front. Each must reach the caller as its own sentinel, because each is its own
 // Cloud error code.
-func TestAppCLIClassifiesStreamErrors(t *testing.T) {
+func TestInstallClassifiesStreamErrors(t *testing.T) {
 	cases := []struct {
 		name, code, message string
 		want                error
@@ -191,7 +189,7 @@ func TestAppCLIClassifiesStreamErrors(t *testing.T) {
 
 // Without a prefix there is nothing finer to say than "the install failed" — including
 // for a bad_request, which lumps three Cloud codes together.
-func TestAppCLIUnprefixedStreamErrorIsAGenericFailure(t *testing.T) {
+func TestInstallUnprefixedStreamErrorIsAGenericFailure(t *testing.T) {
 	for _, code := range []string{"bad_request", "INTERNAL_SERVER_ERROR", "something_new"} {
 		t.Run(code, func(t *testing.T) {
 			stream := fmt.Sprintf("event: error\ndata: {\"code\":%q,\"message\":\"bad request: x is empty\"}\n\n", code) + streamClosed
@@ -207,7 +205,7 @@ func TestAppCLIUnprefixedStreamErrorIsAGenericFailure(t *testing.T) {
 // A stream that ends before a verdict leaves the outcome unknown: RFC-14 §5.10 -41.
 // SERVER_CLOSED arriving first is the ordinary way that happens, a bare close or a
 // cut connection are the others.
-func TestAppCLIStreamWithoutAVerdictIsUnavailable(t *testing.T) {
+func TestInstallStreamWithoutAVerdictIsUnavailable(t *testing.T) {
 	progress := "event: progress\ndata: {\"progress\":10}\n\n"
 	for name, stream := range map[string]string{
 		"server closed": progress + streamClosed,
@@ -228,7 +226,7 @@ func TestAppCLIStreamWithoutAVerdictIsUnavailable(t *testing.T) {
 }
 
 // Refusals before the stream opens: {"details": ...} with an HTTP status.
-func TestAppCLIClassifiesHTTPRefusals(t *testing.T) {
+func TestInstallClassifiesHTTPRefusals(t *testing.T) {
 	cases := []struct {
 		name    string
 		status  int
@@ -260,22 +258,20 @@ func TestAppCLIClassifiesHTTPRefusals(t *testing.T) {
 	}
 }
 
-func TestAppCLIUnreachableIsUnavailable(t *testing.T) {
+func TestInstallUnreachableIsUnavailable(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	url := srv.URL
 	srv.Close() // nothing listens there any more
 
-	req := Request{BundlePath: writeBundleFile(t, []byte("bundle"))}
-	err := NewAppCLI(url).Install(context.Background(), req, func(int32) {})
+	err := New(url).Install(context.Background(), writeBundleFile(t, []byte("bundle")), func(int32) {})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("got %v, want ErrUnavailable", err)
 	}
 }
 
 // A bundle that cannot be read is our failure, not arduino-app-cli's absence.
-func TestAppCLIMissingBundleIsAFailedInstall(t *testing.T) {
-	req := Request{BundlePath: filepath.Join(t.TempDir(), "gone.zip")}
-	err := NewAppCLI("http://127.0.0.1:1").Install(context.Background(), req, func(int32) {})
+func TestInstallMissingBundleIsAFailedInstall(t *testing.T) {
+	err := New("http://127.0.0.1:1").Install(context.Background(), filepath.Join(t.TempDir(), "gone.zip"), func(int32) {})
 	if !errors.Is(err, ErrFailed) || errors.Is(err, ErrUnavailable) {
 		t.Fatalf("got %v, want ErrFailed and not ErrUnavailable", err)
 	}
@@ -283,7 +279,7 @@ func TestAppCLIMissingBundleIsAFailedInstall(t *testing.T) {
 
 // Cancellation — a shutdown, or the caller's stall watchdog — is returned as-is, and
 // no progress is reported after it: the caller's state machine has moved on.
-func TestAppCLICancellationIsReturnedAsIs(t *testing.T) {
+func TestInstallCancellationIsReturnedAsIs(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _, _ = r.FormFile("file")
@@ -301,11 +297,11 @@ func TestAppCLICancellationIsReturnedAsIs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var after []int32
 	cancelled := false
-	req := Request{BundlePath: writeBundleFile(t, []byte("bundle"))}
+	bundle := writeBundleFile(t, []byte("bundle"))
 
 	done := make(chan error, 1)
 	go func() {
-		done <- NewAppCLI(srv.URL).Install(ctx, req, func(p int32) {
+		done <- New(srv.URL).Install(ctx, bundle, func(p int32) {
 			if cancelled {
 				after = append(after, p)
 			}
@@ -333,6 +329,7 @@ func assertOnlySpecific(t *testing.T, err, want error) {
 	for _, other := range []error{
 		ErrUnavailable, ErrNoSpace, ErrArchiveRejected, ErrInvalidAppYaml, ErrNotCompatible,
 		ErrAlreadyExists, ErrExtraction, ErrResourceNoSpace, ErrResourceDownload,
+		ErrNotPrepared, ErrAnotherAppRunning,
 	} {
 		if other != want && errors.Is(err, other) {
 			t.Errorf("%v also matches %v", err, other)

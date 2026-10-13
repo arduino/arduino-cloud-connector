@@ -31,7 +31,9 @@
 // channel is subscribed and Device.begin is out — and stays live through
 // AwaitingThingID, SyncingLastValues and Steady alike, so a board that is never
 // assigned a thing remains deployable. Every state that reads a downlink command
-// therefore routes OTA commands first, via deliverOTA.
+// therefore routes OTA commands first, via deliverDeviceCommand. The App lifecycle
+// commands (package internal/applifecycle, RFC-16) ride along on exactly the same
+// terms, and share the deploy's command slot: one Cloud command at a time.
 //
 // The process runs on its own goroutine, and deliverOTA is a non-blocking
 // hand-off, so a multi-gigabyte download never stalls this FSM's event loop:
@@ -58,7 +60,10 @@ import (
 	"sync"
 	"time"
 
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
+	"github.com/arduino/arduino-cloud-connector/internal/applifecycle"
+	"github.com/arduino/arduino-cloud-connector/internal/cmdslot"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	"github.com/arduino/arduino-cloud-connector/internal/keystore"
@@ -172,6 +177,11 @@ type FSM struct {
 	// using newFSM), in which case OTA commands are logged and ignored.
 	ota *ota.OTAFSM
 
+	// apps carries out the App lifecycle commands (RFC-16), on the same terms as ota:
+	// its own goroutine, fed from the downlink, and the same command slot, so a
+	// lifecycle command and a deploy never run at once. Nil alongside ota.
+	apps *applifecycle.Process
+
 	// run-goroutine-private state (no external access)
 	state       State
 	thingID     command.ThingID
@@ -210,9 +220,14 @@ func New(cfg config.Config, ks *keystore.Keystore, reg *variables.Registry, clie
 	// FSM uses for the broker, so the storage client needs the keystore — hence it
 	// is wired here and not in newFSM, which tests use without one. The downloader
 	// owns the transfer (resume, verification); the storage client owns the HTTP.
-	// arduino-app-cli installs the verified bundle (RFC-14 §5.4).
+	// arduino-app-cli installs the verified bundle (RFC-14 §5.4) and carries out the
+	// lifecycle commands (RFC-16). Both take the one command slot: the board runs one
+	// Cloud command at a time, whatever its kind.
 	dl := downloader.New(cfg, storageapi.NewClient(cfg, ks))
-	f.ota = ota.New(cfg, deviceID, client, dl, appinstaller.NewAppCLI(cfg.AppCLIURL))
+	cli := appcli.New(cfg.AppCLIURL)
+	slot := &cmdslot.Slot{}
+	f.ota = ota.New(cfg, deviceID, client, dl, appinstaller.AppCLI(cli), slot)
+	f.apps = applifecycle.New(cfg, deviceID, client, cli, slot)
 	return f, nil
 }
 
@@ -277,6 +292,16 @@ func (f *FSM) Run(ctx context.Context) {
 		defer func() {
 			cancelOTA()
 			<-f.ota.Done()
+		}()
+	}
+	// The lifecycle commands likewise outlive a reconnect, and are stopped before the
+	// broker is disconnected.
+	if f.apps != nil {
+		appsCtx, cancelApps := context.WithCancel(ctx)
+		go f.apps.Run(appsCtx)
+		defer func() {
+			cancelApps()
+			<-f.apps.Done()
 		}()
 	}
 
@@ -432,7 +457,7 @@ func (f *FSM) runAwaitingThingID(ctx context.Context) stateFn {
 				// An App deploy needs no thing, so a job may well arrive while we are
 				// still waiting for one — potentially for as long as the board exists,
 				// if none is ever assigned. Dispatch it instead of dropping it.
-				if f.deliverOTA(e.msg.Cmd) {
+				if f.deliverDeviceCommand(e.msg.Cmd) {
 					continue
 				}
 				msg, ok := e.msg.Cmd.Inner().(command.ThingUpdateCmd)
@@ -518,7 +543,7 @@ func (f *FSM) runSyncingLastValues(ctx context.Context) stateFn {
 				slog.Info("cloud: broker connection lost during LastValues sync", "error", e.err)
 				return f.runReconnecting
 			case evCommandMessage:
-				if f.deliverOTA(e.msg.Cmd) {
+				if f.deliverDeviceCommand(e.msg.Cmd) {
 					continue
 				}
 				switch msg := e.msg.Cmd.Inner().(type) {
@@ -569,7 +594,7 @@ func (f *FSM) runSteady(ctx context.Context) stateFn {
 // a non-nil stateFn if the message forces a state transition; nil if the
 // command was handled in-place and the FSM stays in Steady.
 func (f *FSM) handleSteadyCommand(cmd command.Cmd) stateFn {
-	if f.deliverOTA(cmd) {
+	if f.deliverDeviceCommand(cmd) {
 		return nil
 	}
 	switch msg := cmd.Inner().(type) {
@@ -745,10 +770,37 @@ func (f *FSM) deliverOTA(cmd command.Cmd) bool {
 	return true
 }
 
-// setOTAConnected tells the OTA process whether the broker link is usable.
+// deliverAppCommand hands an App lifecycle command (RFC-16) to its process. It
+// returns true when cmd was one, so the caller stops dispatching it. Like a deploy, a
+// lifecycle command needs no thing, so deliverOTA's callers call this too.
+func (f *FSM) deliverAppCommand(cmd command.Cmd) bool {
+	msg, ok := cmd.Inner().(command.AppCommandCmd)
+	if !ok {
+		return false
+	}
+	if f.apps == nil {
+		slog.Warn("cloud: App command received but the app lifecycle process is not available",
+			"operation_id", msg.OperationID)
+		return true
+	}
+	f.apps.Deliver(msg)
+	return true
+}
+
+// deliverDeviceCommand dispatches the commands that need only the broker — an App
+// deploy and an App lifecycle command — and returns true when cmd was one of them.
+func (f *FSM) deliverDeviceCommand(cmd command.Cmd) bool {
+	return f.deliverOTA(cmd) || f.deliverAppCommand(cmd)
+}
+
+// setOTAConnected tells the OTA and the App lifecycle processes whether the broker
+// link is usable.
 func (f *FSM) setOTAConnected(v bool) {
 	if f.ota != nil {
 		f.ota.SetConnected(v)
+	}
+	if f.apps != nil {
+		f.apps.SetConnected(v)
 	}
 }
 

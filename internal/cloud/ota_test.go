@@ -70,7 +70,7 @@ func newTestFSMWithOTA(t *testing.T, storage *downloadertest.FakeDownloader, ins
 		lastValuesTimeout: 2 * time.Second,
 	}
 
-	otaFSM := ota.New(cfg, deviceID, client, storage, inst)
+	otaFSM := ota.New(cfg, deviceID, client, storage, inst, nil)
 	f.ota = otaFSM
 
 	return client, f, otaFSM

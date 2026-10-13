@@ -8,7 +8,7 @@ package ota
 import (
 	"errors"
 
-	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	storageapi "github.com/arduino/arduino-cloud-connector/internal/storage-api"
 )
@@ -259,7 +259,7 @@ func (e Error) String() string {
 // errInstallStalled is the one failure this package decides for itself: the install
 // went silent for longer than InstallTimeout and the stall watchdog cancelled it.
 //
-// It is a sentinel, like downloader's and app-installer's, so decodeError classifies
+// It is a sentinel, like downloader's and app-cli's, so decodeError classifies
 // every failure the same way regardless of which layer produced it. Unlike theirs it
 // is unexported, because nothing outside this package raises or reads it.
 var errInstallStalled = errors.New("ota: install produced no progress")
@@ -274,7 +274,7 @@ var errInstallStalled = errors.New("ota: install produced no progress")
 //
 // Three packages are matched because three layers can fail, and which one did is
 // informative: storage-api reports what the network and the storage service said,
-// downloader reports what happened to the bytes on this disk, and app-installer
+// downloader reports what happened to the bytes on this disk, and app-cli
 // reports whether the handover to arduino-app-cli started at all and how it ended.
 //
 // fallback is what an unrecognised error becomes, and it is the caller's to choose
@@ -321,27 +321,27 @@ func decodeError(err error, fallback Error) Error {
 	// only arduino-app-cli can give, and they exist so that "app-cli said no" reaches
 	// the operator as a reason rather than as a generic install failure. All of them
 	// wrap ErrFailed, so they must be matched before it.
-	case errors.Is(err, appinstaller.ErrUnavailable):
+	case errors.Is(err, appcli.ErrUnavailable):
 		return ErrInstallerUnavailable
-	case errors.Is(err, appinstaller.ErrNoSpace):
+	case errors.Is(err, appcli.ErrNoSpace):
 		// The same code as downloader.ErrNoSpace on purpose: RFC-14 §5.10 has one
 		// "disk full" reason for the bundle, whichever process ran out of room.
 		return ErrNoDiskSpace
-	case errors.Is(err, appinstaller.ErrArchiveRejected):
+	case errors.Is(err, appcli.ErrArchiveRejected):
 		return ErrArchiveRejected
-	case errors.Is(err, appinstaller.ErrInvalidAppYaml):
+	case errors.Is(err, appcli.ErrInvalidAppYaml):
 		return ErrInvalidAppYaml
-	case errors.Is(err, appinstaller.ErrNotCompatible):
+	case errors.Is(err, appcli.ErrNotCompatible):
 		return ErrAppNotCompatible
-	case errors.Is(err, appinstaller.ErrAlreadyExists):
+	case errors.Is(err, appcli.ErrAlreadyExists):
 		return ErrAppAlreadyExists
-	case errors.Is(err, appinstaller.ErrExtraction):
+	case errors.Is(err, appcli.ErrExtraction):
 		return ErrExtraction
-	case errors.Is(err, appinstaller.ErrResourceNoSpace):
+	case errors.Is(err, appcli.ErrResourceNoSpace):
 		return ErrResourceNoDiskSpace
-	case errors.Is(err, appinstaller.ErrResourceDownload):
+	case errors.Is(err, appcli.ErrResourceDownload):
 		return ErrResourceDownload
-	case errors.Is(err, appinstaller.ErrFailed):
+	case errors.Is(err, appcli.ErrFailed):
 		return ErrInstallFailed
 
 	// Raised here.

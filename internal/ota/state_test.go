@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"testing"
 
-	appinstaller "github.com/arduino/arduino-cloud-connector/internal/app-installer"
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 	"github.com/arduino/arduino-cloud-connector/internal/downloader"
 	storageapi "github.com/arduino/arduino-cloud-connector/internal/storage-api"
 )
@@ -23,11 +23,11 @@ var everySentinel = []error{
 	downloader.ErrTooLarge, downloader.ErrNoSpace, downloader.ErrBadSize,
 	downloader.ErrTransfer, downloader.ErrDigestMismatch, downloader.ErrTimeout,
 	downloader.ErrOpenFile, downloader.ErrWriteFile,
-	appinstaller.ErrUnavailable, appinstaller.ErrFailed, appinstaller.ErrNoSpace,
-	appinstaller.ErrArchiveRejected, appinstaller.ErrInvalidAppYaml,
-	appinstaller.ErrNotCompatible, appinstaller.ErrAlreadyExists,
-	appinstaller.ErrExtraction, appinstaller.ErrResourceNoSpace,
-	appinstaller.ErrResourceDownload,
+	appcli.ErrUnavailable, appcli.ErrFailed, appcli.ErrNoSpace,
+	appcli.ErrArchiveRejected, appcli.ErrInvalidAppYaml,
+	appcli.ErrNotCompatible, appcli.ErrAlreadyExists,
+	appcli.ErrExtraction, appcli.ErrResourceNoSpace,
+	appcli.ErrResourceDownload,
 	errInstallStalled,
 }
 
@@ -61,16 +61,16 @@ func TestDecodeError(t *testing.T) {
 		// Handover to the installing service. The specific verdicts must win over
 		// the generic one they wrap — that ordering IS the difference between telling
 		// the operator "app.yaml does not validate" and telling them "install failed".
-		{"installer unavailable", appinstaller.ErrUnavailable, ErrInstallerUnavailable},
-		{"install failed", appinstaller.ErrFailed, ErrInstallFailed},
-		{"archive rejected", appinstaller.ErrArchiveRejected, ErrArchiveRejected},
-		{"invalid app.yaml", appinstaller.ErrInvalidAppYaml, ErrInvalidAppYaml},
-		{"not compatible", appinstaller.ErrNotCompatible, ErrAppNotCompatible},
-		{"installer out of space", appinstaller.ErrNoSpace, ErrNoDiskSpace},
-		{"already exists", appinstaller.ErrAlreadyExists, ErrAppAlreadyExists},
-		{"extraction", appinstaller.ErrExtraction, ErrExtraction},
-		{"resources: no space", appinstaller.ErrResourceNoSpace, ErrResourceNoDiskSpace},
-		{"resources: download", appinstaller.ErrResourceDownload, ErrResourceDownload},
+		{"installer unavailable", appcli.ErrUnavailable, ErrInstallerUnavailable},
+		{"install failed", appcli.ErrFailed, ErrInstallFailed},
+		{"archive rejected", appcli.ErrArchiveRejected, ErrArchiveRejected},
+		{"invalid app.yaml", appcli.ErrInvalidAppYaml, ErrInvalidAppYaml},
+		{"not compatible", appcli.ErrNotCompatible, ErrAppNotCompatible},
+		{"installer out of space", appcli.ErrNoSpace, ErrNoDiskSpace},
+		{"already exists", appcli.ErrAlreadyExists, ErrAppAlreadyExists},
+		{"extraction", appcli.ErrExtraction, ErrExtraction},
+		{"resources: no space", appcli.ErrResourceNoSpace, ErrResourceNoDiskSpace},
+		{"resources: download", appcli.ErrResourceDownload, ErrResourceDownload},
 
 		// Raised here.
 		{"install stalled", errInstallStalled, ErrInstallTimeout},
@@ -113,11 +113,11 @@ func TestDecodeErrorSeesThroughWrapping(t *testing.T) {
 	}{
 		"joined": {errors.Join(errors.New("context"), downloader.ErrNoSpace), ErrNoDiskSpace},
 		// The shape appinstaller.Unavailable actually returns.
-		"formatted": {fmt.Errorf("%w: no endpoint", appinstaller.ErrUnavailable), ErrInstallerUnavailable},
+		"formatted": {fmt.Errorf("%w: no endpoint", appcli.ErrUnavailable), ErrInstallerUnavailable},
 		// The shape a real arduino-app-cli client would return: its own message
 		// wrapped around a specific verdict, which itself wraps ErrFailed.
 		"specific verdict, wrapped": {
-			fmt.Errorf("%w: app.yaml line 3", appinstaller.ErrInvalidAppYaml), ErrInvalidAppYaml,
+			fmt.Errorf("%w: app.yaml line 3", appcli.ErrInvalidAppYaml), ErrInvalidAppYaml,
 		},
 	}
 	for name, tc := range cases {
@@ -151,7 +151,7 @@ func TestEverySentinelMapsToADistinctCode(t *testing.T) {
 	// The one legitimate overlap is "disk full": RFC-14 §5.10 gives the bundle a
 	// single -40 whether the daemon or arduino-app-cli ran out of room, so the two
 	// sentinels share it by design. Listed here, so any other duplicate still fails.
-	shared := map[error]bool{appinstaller.ErrNoSpace: true}
+	shared := map[error]bool{appcli.ErrNoSpace: true}
 	seen := map[Error]error{}
 	for _, s := range everySentinel {
 		if shared[s] {

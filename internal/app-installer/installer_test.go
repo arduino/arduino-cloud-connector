@@ -8,7 +8,15 @@ package appinstaller
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
+
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 )
 
 func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
@@ -19,58 +27,13 @@ func TestUnavailableFailsWithErrUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("Unavailable installer reported success")
 	}
-	if !errors.Is(err, ErrUnavailable) {
+	if !errors.Is(err, appcli.ErrUnavailable) {
 		t.Errorf("error does not match ErrUnavailable: %v", err)
 	}
 	// It must NOT masquerade as an install that started and then failed — the bundle
 	// is untouched and the two map to different Cloud error codes.
-	if errors.Is(err, ErrFailed) {
+	if errors.Is(err, appcli.ErrFailed) {
 		t.Errorf("an installer that was never reached reported ErrFailed: %v", err)
-	}
-}
-
-// The specific verdicts refine ErrFailed rather than replacing it, so both
-// questions a caller can ask keep working: "did the install succeed?" and "what
-// exactly did arduino-app-cli object to?".
-//
-// Which matters because internal/ota classifies specific-first: if one of these ever
-// stopped matching ErrFailed, an unhandled verdict would fall through to the deploy
-// phase's fallback instead of being reported as an install failure at all.
-func TestSpecificVerdictsRefineErrFailed(t *testing.T) {
-	verdicts := map[string]error{
-		"no space":            ErrNoSpace,
-		"archive rejected":    ErrArchiveRejected,
-		"invalid app.yaml":    ErrInvalidAppYaml,
-		"not compatible":      ErrNotCompatible,
-		"already exists":      ErrAlreadyExists,
-		"extraction":          ErrExtraction,
-		"resources: no space": ErrResourceNoSpace,
-		"resources: download": ErrResourceDownload,
-	}
-	for name, verdict := range verdicts {
-		t.Run(name, func(t *testing.T) {
-			if !errors.Is(verdict, ErrFailed) {
-				t.Errorf("%v does not match ErrFailed", verdict)
-			}
-			// The install did start, so it is not the "no installer" case.
-			if errors.Is(verdict, ErrUnavailable) {
-				t.Errorf("%v matches ErrUnavailable", verdict)
-			}
-			// And they stay distinguishable from one another, which is the whole
-			// reason they exist: each is a different code on the operator's screen.
-			for otherName, other := range verdicts {
-				if otherName != name && errors.Is(verdict, other) {
-					t.Errorf("%s is indistinguishable from %s", name, otherName)
-				}
-			}
-		})
-	}
-	// The generic sentinel must NOT match the specific ones, or every unqualified
-	// install failure would be reported as whichever one happened to be checked first.
-	for name, verdict := range verdicts {
-		if errors.Is(ErrFailed, verdict) {
-			t.Errorf("a plain ErrFailed matches %s", name)
-		}
 	}
 }
 
@@ -98,5 +61,39 @@ func TestFuncAdaptsToInstaller(t *testing.T) {
 	}
 	if len(progress) != 2 || progress[0] != 10 || progress[1] != 100 {
 		t.Errorf("progress forwarded: got %v want [10 100]", progress)
+	}
+}
+
+// The adapter hands the bundle path to arduino-app-cli and its progress back, on
+// Install's own goroutine — which the real client guarantees by reading the stream
+// there.
+func TestAppCLIAdapterInstallsThroughTheClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Fatalf("no bundle uploaded: %v", err)
+		}
+		defer file.Close()
+		if body, _ := io.ReadAll(file); string(body) != "bundle" || header.Filename != "job.zip" {
+			t.Errorf("uploaded %q as %q", body, header.Filename)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: progress\ndata: {\"progress\":40}\n\n"+
+			"event: done\ndata: {}\n\n")
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "job.zip")
+	if err := os.WriteFile(path, []byte("bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var seen []int32
+	err := AppCLI(appcli.New(srv.URL)).Install(context.Background(), Request{BundlePath: path},
+		func(p int32) { seen = append(seen, p) })
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !slices.Equal(seen, []int32{40}) {
+		t.Errorf("progress: got %v want [40]", seen)
 	}
 }

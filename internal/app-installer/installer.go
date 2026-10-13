@@ -8,10 +8,10 @@
 //
 // The split of responsibilities is the point of the package: internal/ota owns the
 // deploy protocol — the state machine, the Cloud messages and the wire error codes —
-// while everything about talking to the installing service lives here. The
-// production implementation is AppCLI, an arduino-app-cli client (RFC-14 §5.4, §6.1):
-// one request that uploads the bundle and starts the install, answered by a stream
-// that reports it.
+// while the installing service sits behind the Installer interface. The production
+// implementation is AppCLI, which installs through the arduino-app-cli client in
+// internal/app-cli (RFC-14 §5.4, §6.1): one request that uploads the bundle and
+// starts the install, answered by a stream that reports it.
 //
 // It has no notion of an OTA job, a state machine or a wire code. Callers hand it a
 // path and a digest; it hands back progress and a typed error. Mapping those errors
@@ -24,7 +24,7 @@
 // implementation is worth stating up front: it starts a job in another process and
 // then follows it, which means holding a Server-Sent Events stream open for minutes.
 // arduino-app-cli offers no way to re-attach to an install whose stream dropped, so a
-// dropped stream is a failed install (ErrUnavailable), not something to retry.
+// dropped stream is a failed install (appcli.ErrUnavailable), not something to retry.
 //
 // None of that shows from the outside. Install blocks until the install is finished,
 // exactly like Download does. The contract that makes that safe is documented on
@@ -33,9 +33,10 @@ package appinstaller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
+
+	appcli "github.com/arduino/arduino-cloud-connector/internal/app-cli"
 )
 
 // Installer installs a downloaded App bundle on the board.
@@ -65,11 +66,11 @@ type Installer interface {
 	// the state machine has moved on — is a data race, and one that would surface
 	// only under a real install.
 	//
-	// Errors must match one of the sentinels below through errors.Is, so the caller
-	// can classify the outcome without knowing anything about the transport — and
-	// must be as specific as the service allows, because each sentinel reaches the
-	// operator as a different Cloud error code. A context cancellation is returned
-	// as-is.
+	// Errors must match one of the internal/app-cli sentinels through errors.Is, so
+	// the caller can classify the outcome without knowing anything about the
+	// transport — and must be as specific as the service allows, because each
+	// sentinel reaches the operator as a different Cloud error code. A context
+	// cancellation is returned as-is.
 	Install(ctx context.Context, req Request, onProgress ProgressFunc) error
 }
 
@@ -98,60 +99,6 @@ type Request struct {
 // ProgressFunc reports install progress as a percentage (0–100). It must not block.
 type ProgressFunc func(percent int32)
 
-// Failure sentinels. Every failure this package reports is one of these: either no
-// installer could be reached at all, or the install did not complete.
-//
-// # Why the failure is typed rather than just "it failed"
-//
-// Each of these reaches the operator as a different Arduino IoT Cloud error code
-// (RFC-14 §5.10, mapped in internal/ota.decodeError), and that is the whole reason the
-// distinctions exist: "the archive is malformed", "app.yaml does not validate", "this
-// App does not fit this board" and "it installed but its containers could not be
-// downloaded" are different things for the person looking at a failed deploy, and only
-// arduino-app-cli is in a position to tell them apart.
-//
-// That makes them a requirement on the install stream, not just a Go detail: every
-// stream must end in exactly one terminal outcome — done (success), or one of the
-// specific failures below. If the handover degrades to "non-zero exit", the specific
-// codes collapse back into ErrFailed and the operator is told nothing useful.
-//
-// The specific verdicts wrap ErrFailed, so a caller that only wants to know whether
-// the install succeeded still matches with errors.Is(err, ErrFailed) — which also
-// makes ErrFailed the right fallback for an install failure nobody classified.
-var (
-	// ErrUnavailable: the installing service could not be reached, so the install
-	// never started — or its stream closed without a terminal event, which is the
-	// same thing seen from the other end. The bundle on disk is untouched and still
-	// valid.
-	ErrUnavailable = errors.New("appinstaller: no app installer available")
-	// ErrFailed: the install did not succeed and the reason is not one of the four
-	// below.
-	ErrFailed = errors.New("appinstaller: install failed")
-
-	// ErrArchiveRejected: the archive is not a valid bundle. The digest matched
-	// before the handover, so it is malformed at origin, not corrupted in transit.
-	ErrArchiveRejected = fmt.Errorf("%w: archive rejected", ErrFailed)
-	// ErrInvalidAppYaml: app.yaml is missing, unparsable, or fails validation.
-	ErrInvalidAppYaml = fmt.Errorf("%w: invalid app.yaml", ErrFailed)
-	// ErrNotCompatible: the App does not fit this board — the installed bricks
-	// version, the hardware, or a runtime too old to deploy it.
-	ErrNotCompatible = fmt.Errorf("%w: app not compatible with this board", ErrFailed)
-	// ErrNoSpace: the installer ran out of disk space while taking the bundle in.
-	ErrNoSpace = fmt.Errorf("%w: no disk space for the bundle", ErrFailed)
-	// ErrAlreadyExists: a release of the same name is already installed.
-	ErrAlreadyExists = fmt.Errorf("%w: app already installed", ErrFailed)
-	// ErrExtraction: the bundle could not be extracted onto the board's disk.
-	ErrExtraction = fmt.Errorf("%w: extraction failed", ErrFailed)
-
-	// The two below happen AFTER the App is installed, while downloading the
-	// containers and models it needs to run: the release stays on the board.
-
-	// ErrResourceNoSpace: no disk space left for the App's additional resources.
-	ErrResourceNoSpace = fmt.Errorf("%w: no disk space for the app resources", ErrFailed)
-	// ErrResourceDownload: downloading the App's additional resources failed.
-	ErrResourceDownload = fmt.Errorf("%w: app resources download failed", ErrFailed)
-)
-
 // Func adapts a function to Installer, for tests and for wiring a trivial
 // implementation. The concurrency contract on Installer.Install applies to it too.
 type Func func(ctx context.Context, req Request, onProgress ProgressFunc) error
@@ -169,6 +116,15 @@ func Unavailable() Installer {
 		slog.Error("appinstaller: no installer wired — bundle downloaded but cannot be installed",
 			"bundle", req.BundlePath,
 			"detail", "no arduino-app-cli client configured")
-		return fmt.Errorf("%w: no installer configured", ErrUnavailable)
+		return fmt.Errorf("%w: no installer configured", appcli.ErrUnavailable)
+	})
+}
+
+// AppCLI installs through arduino-app-cli. Its Install reads the install stream on
+// the caller's goroutine, so the concurrency contract on Installer holds by
+// construction.
+func AppCLI(c *appcli.Client) Installer {
+	return Func(func(ctx context.Context, req Request, onProgress ProgressFunc) error {
+		return c.Install(ctx, req.BundlePath, appcli.ProgressFunc(onProgress))
 	})
 }
