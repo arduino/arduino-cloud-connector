@@ -10,11 +10,6 @@
 #
 # INSTALL_TIMEOUT is 3s here (the default is 10 minutes), so each stall costs
 # about three seconds.
-#
-# KNOWN DAEMON ISSUE (2026-10-13, HANDOFF session (ay)) -- RED until fixed: the
-# daemon publishes a deploy's outcome BEFORE it releases its command slot, so
-# job2, sent as soon as job1's Fail arrives, is refused with -49. Passes
-# against a daemon that releases the slot first.
 name: app-deploy-app-cli-down
 strict_events: true
 install_timeout: 3s

@@ -670,3 +670,71 @@ func TestErrorCodesMatchRFC16(t *testing.T) {
 		}
 	}
 }
+
+// ── the slot and the outcome ─────────────────────────────────────────────────
+
+// outcomeWatcher records who held the slot when each outcome (a success or a
+// failure, not a progress) was published, and delivers the next command as soon as
+// one is — the earliest moment the Cloud could send it. The delivery runs on its own
+// goroutine, as the MQTT callback would: from inside the publish, a refusal would
+// try to publish too and wait on the lock the outcome's publish holds.
+type outcomeWatcher struct {
+	fakePublisher
+	slot *cmdslot.Slot
+	next func()
+
+	hmu     sync.Mutex
+	holders []string
+	once    sync.Once
+}
+
+func (w *outcomeWatcher) PublishCommand(deviceID string, cmd command.Cmd) error {
+	if r, ok := cmd.Inner().(command.AppCommandResponseCmd); ok && r.Status != command.AppCommandInProgress {
+		w.hmu.Lock()
+		w.holders = append(w.holders, w.slot.Holder())
+		w.hmu.Unlock()
+		w.once.Do(func() { go w.next() })
+	}
+	return w.fakePublisher.PublishCommand(deviceID, cmd)
+}
+
+// The outcome is the Cloud's signal that the board is free. A command sent the moment
+// it arrives must be run, not refused -49 for a command that is already over — and so
+// the slot must be free before the outcome is published, whichever way the command
+// ended (found by the E2E suite, test/e2e/scenarios/app-command-errors.yaml's family).
+func TestTheSlotIsFreeBeforeTheOutcomeIsPublished(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first command.AppCommandCmd
+		cli   *fakeCLI
+	}{
+		{"success", startCmd("op-1", param(0)), &fakeCLI{}},
+		{"failure", startCmd("op-1", param(0)), &fakeCLI{startErr: fmt.Errorf("%w: boom", appcli.ErrFailed)}},
+		{"not supported", command.AppCommandCmd{AppName: "target", Command: command.AppDelete, OperationID: "op-1"}, &fakeCLI{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			slot := &cmdslot.Slot{}
+			var p *Process
+			w := &outcomeWatcher{slot: slot}
+			w.next = func() {
+				p.Deliver(command.AppCommandCmd{AppName: "target", Command: command.AppSetDefault, OperationID: "op-2"})
+			}
+			p = New(config.Config{InstallTimeout: 5 * time.Second}, "device-1", w, tc.cli, slot)
+			p.SetConnected(true)
+			ctx, cancel := context.WithCancel(context.Background())
+			go p.Run(ctx)
+			defer func() { cancel(); <-p.Done() }()
+
+			p.Deliver(tc.first)
+			got := waitForOutcome(t, &w.fakePublisher, "op-2")
+			if got.status != command.AppCommandSucceeded {
+				t.Errorf("the command sent on op-1's outcome got %+v, want a success", got)
+			}
+			w.hmu.Lock()
+			defer w.hmu.Unlock()
+			if len(w.holders) == 0 || w.holders[0] != "" {
+				t.Errorf("slot holders at each outcome = %q; the first must be free", w.holders)
+			}
+		})
+	}
+}

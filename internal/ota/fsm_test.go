@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -593,10 +594,11 @@ func TestOTAFSMAcceptsAJobAfterThePreviousOneEnds(t *testing.T) {
 			content := []byte("bundle for " + tc.name)
 			final := sha256.Sum256(content)
 
-			var installs int
+			// Atomic: the installer runs on the FSM goroutine, the waits below on this one.
+			var installs atomic.Int32
 			inst := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error {
-				installs++
-				if installs == 1 {
+				n := installs.Add(1)
+				if n == 1 {
 					return tc.firstErr
 				}
 				return nil
@@ -609,12 +611,12 @@ func TestOTAFSMAcceptsAJobAfterThePreviousOneEnds(t *testing.T) {
 
 			f.Deliver(updateCmdWithID([16]byte{1}, final))
 			waitFor(t, "the first job to finish", func() bool {
-				return installs == 1 && f.Snapshot().State == StateIdle
+				return installs.Load() == 1 && f.Snapshot().State == StateIdle
 			})
 
 			second := updateCmdWithID([16]byte{2}, final)
 			f.Deliver(second)
-			waitFor(t, "the second job to install", func() bool { return installs == 2 })
+			waitFor(t, "the second job to install", func() bool { return installs.Load() == 2 })
 
 			for _, r := range pub.failReports() {
 				if r.code == ErrDeployInProgress {
@@ -1341,4 +1343,134 @@ func TestInstallHandoverMapsPathAndDigest(t *testing.T) {
 	if req.SHA256 != hexOf(digest) {
 		t.Errorf("sha256: got %q want %q", req.SHA256, hexOf(digest))
 	}
+}
+
+// slotWatcher records who held the command slot at the moment each outcome message —
+// OTABeginCmd, or an OTAProgressCmd in Fail — was published.
+type slotWatcher struct {
+	*fakePublisher
+	slot *cmdslot.Slot
+
+	mu      sync.Mutex
+	holders []string
+}
+
+func (w *slotWatcher) PublishCommand(deviceID string, cmd command.Cmd) error {
+	outcome := false
+	switch c := cmd.Inner().(type) {
+	case command.OTABeginCmd:
+		outcome = true
+	case command.OTAProgressCmd:
+		outcome = State(c.State) == StateFail
+	}
+	if outcome {
+		w.mu.Lock()
+		w.holders = append(w.holders, w.slot.Holder())
+		w.mu.Unlock()
+	}
+	return w.fakePublisher.PublishCommand(deviceID, cmd)
+}
+
+func (w *slotWatcher) outcomeHolders() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.holders...)
+}
+
+// The outcome is the Cloud's signal that the board is free, and the next command can
+// follow it at once. So the slot must already be free when the outcome is published:
+// released after it, a command sent on the outcome is refused -49 for a deploy that is
+// over (found by test/e2e/scenarios/app-deploy-install-errors.yaml).
+func TestOTAFSMFreesTheSlotBeforeThePublishedOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		installErr error
+	}{
+		{"success", nil},
+		{"failure", fmt.Errorf("%w: unpack", appcli.ErrFailed)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := []byte("bundle for " + tc.name)
+			final := sha256.Sum256(content)
+			slot := &cmdslot.Slot{}
+			inst := appinstaller.Func(func(context.Context, appinstaller.Request, appinstaller.ProgressFunc) error {
+				return tc.installErr
+			})
+			_, pub, cfg := newTestFSM(t, nil, nil)
+			w := &slotWatcher{fakePublisher: pub, slot: slot}
+			f := New(cfg, "device-1", w, &downloadertest.FakeDownloader{Content: content}, inst, slot)
+			stop := runFSM(t, f)
+			defer stop()
+			f.SetConnected(true)
+			waitForIdle(t, f)
+
+			f.Deliver(updateCmd(final))
+			waitFor(t, "the outcome", func() bool { return len(w.outcomeHolders()) == 1 })
+			if got := w.outcomeHolders()[0]; got != "" {
+				t.Errorf("the slot was held by %q when the outcome was published; it must be free", got)
+			}
+		})
+	}
+}
+
+// The slot is released exactly once per deploy. Its holder name is the same for every
+// deploy, so a second, late release would free the NEXT deploy's slot and let a third
+// one run alongside it.
+func TestOTAFSMDoesNotReleaseTheNextDeploysSlot(t *testing.T) {
+	content := []byte("a bundle")
+	final := sha256.Sum256(content)
+	slot := &cmdslot.Slot{}
+	var installs atomic.Int32
+	gate := make(chan struct{})
+	inst := appinstaller.Func(func(ctx context.Context, _ appinstaller.Request, _ appinstaller.ProgressFunc) error {
+		if installs.Add(1) == 1 {
+			return fmt.Errorf("%w: unpack", appcli.ErrFailed)
+		}
+		// The second deploy stays in its install, holding the slot, until the test has
+		// looked at it.
+		select {
+		case <-gate:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	_, pub, cfg := newTestFSM(t, nil, nil)
+	var f *OTAFSM
+	// The next deploy is delivered the moment the first one's Fail is published, which
+	// is before the first one has finished winding down.
+	w := &onOutcome{fakePublisher: pub, fn: func() { f.Deliver(updateCmdWithID([16]byte{2}, final)) }}
+	f = New(cfg, "device-1", w, &downloadertest.FakeDownloader{Content: content}, inst, slot)
+	stop := runFSM(t, f)
+	defer stop()
+	f.SetConnected(true)
+	waitForIdle(t, f)
+
+	f.Deliver(updateCmdWithID([16]byte{1}, final))
+	waitFor(t, "the second deploy to reach its install", func() bool { return installs.Load() == 2 })
+	if got := slot.Holder(); got != slotHolder {
+		t.Errorf("slot holder while the second deploy installs = %q, want %q", got, slotHolder)
+	}
+	for _, r := range pub.failReports() {
+		if r.code == ErrDeployInProgress {
+			t.Errorf("the deploy sent on the first one's Fail was refused: %+v", r)
+		}
+	}
+	close(gate)
+	waitFor(t, "the second deploy to confirm", func() bool { return pub.hasDigest(final) })
+}
+
+// onOutcome runs fn once, synchronously, when the first Fail report is published —
+// the earliest moment the Cloud could send its next command.
+type onOutcome struct {
+	*fakePublisher
+	fn   func()
+	once sync.Once
+}
+
+func (o *onOutcome) PublishCommand(deviceID string, cmd command.Cmd) error {
+	err := o.fakePublisher.PublishCommand(deviceID, cmd)
+	if c, ok := cmd.Inner().(command.OTAProgressCmd); ok && State(c.State) == StateFail {
+		o.once.Do(o.fn)
+	}
+	return err
 }

@@ -180,8 +180,8 @@ func (p *Process) Run(ctx context.Context) {
 		case <-p.connUp:
 			p.flush()
 		case cmd := <-p.queue:
+			// execute releases the slot itself, before the outcome goes out.
 			p.execute(ctx, cmd)
-			p.release(cmd.OperationID)
 		}
 	}
 }
@@ -199,12 +199,18 @@ func (p *Process) execute(ctx context.Context, cmd command.AppCommandCmd) {
 	default:
 		slog.Warn("applifecycle: command not supported yet",
 			"operation_id", cmd.OperationID, "command", cmd.Command)
+		p.release(cmd.OperationID)
 		p.fail(cmd.OperationID, ErrGenericFailure)
 	}
 }
 
 // finish reports a command's outcome.
+//
+// The slot is released FIRST: the outcome is the Cloud's signal that the board is
+// free, and the next command can follow it at once — released after it, that command
+// would be refused with -49 for one that is already over.
 func (p *Process) finish(ctx context.Context, cmd command.AppCommandCmd, err error) {
+	p.release(cmd.OperationID)
 	if err == nil {
 		slog.Info("applifecycle: command succeeded", "operation_id", cmd.OperationID, "command", cmd.Command)
 		p.respond(command.AppCommandResponseCmd{OperationID: cmd.OperationID, Status: command.AppCommandSucceeded})

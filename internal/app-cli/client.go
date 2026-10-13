@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -110,7 +111,17 @@ func (c *Client) request(parent context.Context, method, path string, body io.Re
 		}
 		return nil, nil, err
 	}
-	return resp, func() { _ = resp.Body.Close(); cancel() }, nil
+	return resp, func() { closeLogged(resp.Body, "response body", path); cancel() }, nil
+}
+
+// closeLogged closes c and logs a failure at debug level, without returning it. By the
+// time it runs the operation's outcome is decided — a body read to its verdict or
+// abandoned, a bundle opened read-only — so a close error cannot change that outcome
+// and must not turn a success into a failure; it is only worth a trace.
+func closeLogged(c io.Closer, what, where string) {
+	if err := c.Close(); err != nil {
+		slog.Debug("appcli: close failed", "what", what, "where", where, "error", err)
+	}
 }
 
 // readFailed classifies a failure to read a plain response's body.
@@ -134,7 +145,7 @@ func (c *Client) stream(ctx context.Context, req *http.Request, onProgress Progr
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer closeLogged(resp.Body, "event stream", req.URL.Path)
 	if err := checkStream(resp, refused); err != nil {
 		return err
 	}

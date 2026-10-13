@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -287,10 +288,7 @@ func awaitSequence(ctx context.Context, sc *Context, base map[string]any, key st
 	if values != nil {
 		runs = runs[:0]
 		for _, v := range values {
-			params := make(map[string]any, len(base)+1)
-			for k, bv := range base {
-				params[k] = bv
-			}
+			params := maps.Clone(base)
 			params[key] = v
 			runs = append(runs, params)
 		}

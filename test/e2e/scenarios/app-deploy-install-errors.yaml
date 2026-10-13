@@ -20,11 +20,6 @@
 #   job10 HTTP 500 before the stream, no prefix       -41
 #   job11 installed                                   OTA.begin
 #   job12 the same App again                          -50  (app_already_exists, decided by the fake's state)
-#
-# KNOWN DAEMON ISSUE (2026-10-13, HANDOFF session (ay)) -- RED until fixed: the
-# daemon publishes a deploy's outcome (Fail, OTA.begin) BEFORE it releases its
-# command slot, so the next job, sent as soon as the outcome arrives, is
-# refused with -49. Passes against a daemon that releases the slot first.
 name: app-deploy-install-errors
 strict_events: true
 

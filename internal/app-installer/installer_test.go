@@ -73,7 +73,7 @@ func TestAppCLIAdapterInstallsThroughTheClient(t *testing.T) {
 		if err != nil {
 			t.Fatalf("no bundle uploaded: %v", err)
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 		if body, _ := io.ReadAll(file); string(body) != "bundle" || header.Filename != "job.zip" {
 			t.Errorf("uploaded %q as %q", body, header.Filename)
 		}

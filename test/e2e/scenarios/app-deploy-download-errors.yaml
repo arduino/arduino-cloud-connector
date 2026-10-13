@@ -11,11 +11,6 @@
 #   job6  storage answers 503, then the bundle: retried, then installed
 #
 # job6 costs the downloader's first back-off, about 2-3s.
-#
-# KNOWN DAEMON ISSUE (2026-10-13, HANDOFF session (ay)) -- RED until fixed: the
-# daemon publishes a deploy's outcome BEFORE it releases its command slot, so
-# the next job, sent as soon as the outcome arrives, is refused with -49.
-# Passes against a daemon that releases the slot first.
 name: app-deploy-download-errors
 strict_events: true
 

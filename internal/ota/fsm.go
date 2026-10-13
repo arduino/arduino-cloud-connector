@@ -295,9 +295,13 @@ func (f *OTAFSM) Deliver(cmd command.OTAUpdateCmd) {
 	}
 }
 
-// releaseSlot lets the next job in. Called when a deploy is over — successfully or
-// not — and never before its cleanup, so a job accepted right afterwards cannot find
-// the previous one's bundle or record still on disk.
+// releaseSlot lets the next job in. Called once per deploy, when it is over —
+// successfully or not — and BEFORE the message that tells the Cloud so, since a
+// command may follow that message at once. Releasing before the cleanup is safe: a
+// job delivered now only takes the slot and queues, and the run goroutine accepts it
+// from Idle, after the previous one's bundle and record are gone. Called at most once
+// per deploy: the holder name is shared, so a second call could free the NEXT job's
+// slot.
 func (f *OTAFSM) releaseSlot() { f.slot.Release(slotHolder) }
 
 // slotHolder names the deploy in the shared command slot. One deploy runs at a time,
@@ -733,14 +737,19 @@ func (f *OTAFSM) runFlashOTA(ctx context.Context) stateFn {
 	// The bundle also does not stay: at multiple GB it is removed on completion
 	// (RFC-14 §5.9).
 	f.cleanUpJob(job)
+	f.job = nil
+	f.bundle = ""
+
+	// Free the slot BEFORE confirming, too. The confirmation is the Cloud's signal that
+	// the board is free, and the next command can follow it at once: released after it,
+	// that command would be refused with -49 for a deploy that is already over. Nothing
+	// is left to protect — the job is cleaned up — and a job accepted now only queues:
+	// the run goroutine picks it up from Idle, after this.
+	f.releaseSlot()
 	f.announceInstalled(job.SHA256)
 
 	slog.Info("ota: app deploy completed",
 		"job_id", job.IDHex(), "installed_sha256", hex.EncodeToString(job.SHA256[:]))
-
-	f.job = nil
-	f.bundle = ""
-	f.releaseSlot()
 	return f.runIdle
 }
 
@@ -824,6 +833,11 @@ func (f *OTAFSM) install(ctx context.Context, req appinstaller.Request) error {
 // outbox field) and the process carries on, so the next job is accepted normally
 // instead of colliding with a deploy that is over in all but name.
 func (f *OTAFSM) runFail(ctx context.Context) stateFn {
+	// Free the slot before the report goes out: the report is the Cloud's signal that
+	// the board is free, and a command sent straight after it must not be refused -49
+	// for a deploy that is over. Safe ahead of the cleanup below, because a job accepted
+	// now only queues — the run goroutine takes it from Idle, after the cleanup.
+	f.releaseSlot()
 	// transition publishes OTAProgressCmd(8, failCode) — do it before clearing
 	// the job, which the message is keyed by.
 	f.transition(StateFail)
@@ -843,7 +857,8 @@ func (f *OTAFSM) runFail(ctx context.Context) stateFn {
 	}
 	f.job, f.bundle = nil, ""
 	f.failCode, f.failCause = ErrNone, nil
-	f.releaseSlot()
+	// No release here: the slot went before the report, and by now it may belong to
+	// the next job — the holder name is the same for every deploy.
 	return f.runIdle
 }
 

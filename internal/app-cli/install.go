@@ -32,7 +32,7 @@ func (c *Client) Install(ctx context.Context, bundlePath string, onProgress Prog
 	if err != nil {
 		return fmt.Errorf("%w: open the bundle: %v", ErrFailed, err)
 	}
-	defer f.Close()
+	defer closeLogged(f, "bundle", bundlePath)
 
 	// The body is streamed rather than buffered: a bundle can be several GB.
 	bundle := &readTracker{r: f}
@@ -70,7 +70,7 @@ func (c *Client) Install(ctx context.Context, bundlePath string, onProgress Prog
 		}
 		return err
 	}
-	defer resp.Body.Close()
+	defer closeLogged(resp.Body, "event stream", installPath)
 
 	if err := checkStream(resp, installRefused); err != nil {
 		return err

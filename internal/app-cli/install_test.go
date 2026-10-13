@@ -79,7 +79,7 @@ func TestInstallUploadsTheBundleAsMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FormFile(file): %v", err)
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 		if header.Filename != "0123abcd.zip" {
 			t.Errorf("file name: got %q", header.Filename)
 		}
