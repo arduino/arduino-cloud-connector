@@ -117,3 +117,42 @@ func TestEncode_AppCommandCmd_MatchesTheCloudBytes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, mustHex(t, "da00013001 84 6a617070313a302e312e30 01 646f702d31 01"), got)
 }
+
+func TestEncode_AppsListCmd(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cmd  command.AppsListCmd
+		want string
+	}{
+		// DA 00013000                     # tag(77824)
+		//    86                           # array(6): two Apps × 3
+		//       6A 617070313A302E312E30   # "app1:0.1.0"
+		//       01                        # 1 running
+		//       F5                        # true, default
+		//       6A 617070323A312E302E30   # "app2:1.0.0"
+		//       20                        # -1 failure
+		//       F4                        # false
+		"two apps": {command.AppsListCmd{Apps: []command.AppInfo{
+			{Name: "app1:0.1.0", Status: command.AppRunning, Default: true},
+			{Name: "app2:1.0.0", Status: command.AppFailure},
+		}}, "da00013000 86 6a617070313a302e312e30 01 f5 6a617070323a312e302e30 20 f4"},
+		// array(0): a board with no Apps.
+		"no apps": {command.AppsListCmd{}, "da00013000 80"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := command.Encode(command.From(tc.cmd))
+			require.NoError(t, err)
+			require.Equal(t, mustHex(t, tc.want), got)
+		})
+	}
+}
+
+func TestDecode_AppsListCmd_RoundTripsAndRejectsAPartialApp(t *testing.T) {
+	cmd, err := command.Decode(mustHex(t, "da00013000 83 6a617070313a302e312e30 00 f4"))
+	require.NoError(t, err)
+	require.Equal(t, command.AppsListCmd{Apps: []command.AppInfo{
+		{Name: "app1:0.1.0", Status: command.AppStopped},
+	}}, cmd.Inner())
+
+	_, err = command.Decode(mustHex(t, "da00013000 82 6a617070313a302e312e30 00"))
+	require.Error(t, err)
+}

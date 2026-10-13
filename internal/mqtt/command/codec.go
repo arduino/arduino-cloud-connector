@@ -37,6 +37,7 @@ type tagEntry struct {
 //	0x10900  TimezoneUpdateCmd    Down
 //	0x11000  ThingDetachCmd       Down
 //	0x11100  DeviceNetConfigCmd   Up   (tag emitted by its own MarshalCBOR)
+//	0x13000  AppsListCmd            Up   (RFC-16; tag emitted by its own MarshalCBOR)
 //	0x13001  AppCommandCmd          Down (RFC-16; tag emitted by its own MarshalCBOR)
 //	0x13002  AppCommandResponseCmd  Up   (RFC-16; tag emitted by its own MarshalCBOR)
 var registeredTags = []tagEntry{
@@ -52,6 +53,7 @@ var registeredTags = []tagEntry{
 	{0x10900, reflect.TypeOf(TimezoneUpdateCmd{})},
 	{0x11000, reflect.TypeOf(ThingDetachCmd{})},
 	{0x11100, reflect.TypeOf(DeviceNetConfigCmd{})},
+	{tagAppsList, reflect.TypeOf(AppsListCmd{})},
 	{tagAppCommand, reflect.TypeOf(AppCommandCmd{})},
 	{tagAppCommandResponse, reflect.TypeOf(AppCommandResponseCmd{})},
 }
@@ -116,7 +118,7 @@ func (c Cmd) String() string {
 // mqtt.Client.PublishCommand. The type constraint prevents wrapping arbitrary
 // structs or downlink-only types (ThingUpdateCmd, ThingDetachCmd, etc.).
 func From[T DeviceBeginCmd | DeviceNetConfigCmd | ThingBeginCmd | LastValuesBeginCmd |
-	OTABeginCmd | OTAProgressCmd | TimezoneRequestCmd | AppCommandResponseCmd](v T) Cmd {
+	OTABeginCmd | OTAProgressCmd | TimezoneRequestCmd | AppsListCmd | AppCommandResponseCmd](v T) Cmd {
 	return Cmd{inner: v}
 }
 

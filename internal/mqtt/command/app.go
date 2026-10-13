@@ -12,13 +12,76 @@ import (
 )
 
 // The App lifecycle messages (RFC-16 §3). Their arrays have a variable length — the
-// command's parameter is optional, a successful response has no details — which the
-// codec TagSet's fixed `toarray` layout cannot express, so both types marshal
-// themselves, tag included, like DeviceNetConfigCmd.
+// apps list grows with the Apps, the command's parameter is optional, a successful
+// response has no details — which the codec TagSet's fixed `toarray` layout cannot
+// express, so every type marshals itself, tag included, like DeviceNetConfigCmd.
 const (
+	tagAppsList           uint64 = 0x013000
 	tagAppCommand         uint64 = 0x013001
 	tagAppCommandResponse uint64 = 0x013002
 )
+
+// AppStatus is the state of an App in an AppsListCmd.
+type AppStatus int64
+
+const (
+	AppRunning AppStatus = 1
+	AppStopped AppStatus = 0
+	AppFailure AppStatus = -1
+)
+
+// AppInfo is one App of an AppsListCmd.
+type AppInfo struct {
+	// Name is "<name>:<version>" (RFC-16), the same string an AppCommandCmd names.
+	Name    string
+	Status  AppStatus
+	Default bool
+}
+
+// AppsListCmd (tag 0x013000, Up) reports every App installed on the board (RFC-16 §3)
+// as one flat array, three elements per App:
+//
+//	[name_1, status_1, default_1, name_2, status_2, default_2, …]
+//
+// An empty array is legal and means the board has no Apps — never "not known yet".
+type AppsListCmd struct {
+	Apps []AppInfo
+}
+
+// MarshalCBOR implements cbor.Marshaler.
+func (c AppsListCmd) MarshalCBOR() ([]byte, error) {
+	content := make([]any, 0, 3*len(c.Apps))
+	for _, a := range c.Apps {
+		content = append(content, a.Name, int64(a.Status), a.Default)
+	}
+	return cbor.Marshal(cbor.Tag{Number: tagAppsList, Content: content})
+}
+
+// UnmarshalCBOR implements cbor.Unmarshaler, so the shape round-trips in tests.
+func (c *AppsListCmd) UnmarshalCBOR(data []byte) error {
+	var items []cbor.RawMessage
+	if err := cbor.Unmarshal(data, &items); err != nil {
+		return fmt.Errorf("apps list: %w", err)
+	}
+	if len(items)%3 != 0 {
+		return fmt.Errorf("apps list: array of %d elements, want a multiple of 3", len(items))
+	}
+	out := AppsListCmd{Apps: make([]AppInfo, len(items)/3)}
+	for i := range out.Apps {
+		a := &out.Apps[i]
+		if err := cbor.Unmarshal(items[3*i], &a.Name); err != nil {
+			return fmt.Errorf("apps list: app %d name: %w", i, err)
+		}
+		if err := cbor.Unmarshal(items[3*i+1], (*int64)(&a.Status)); err != nil {
+			return fmt.Errorf("apps list: app %d status: %w", i, err)
+		}
+		if err := cbor.Unmarshal(items[3*i+2], &a.Default); err != nil {
+			return fmt.Errorf("apps list: app %d default: %w", i, err)
+		}
+	}
+	*c = out
+	return nil
+}
 
 // AppCommand is what an AppCommandCmd asks for.
 type AppCommand int64
