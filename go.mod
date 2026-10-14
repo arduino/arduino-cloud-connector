@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/arduino/go-paths-helper v1.14.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
-	github.com/fxamacker/cbor/v2 v2.9.4
+	github.com/fxamacker/cbor/v2 v2.9.6
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
