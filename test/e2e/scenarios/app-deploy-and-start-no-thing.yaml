@@ -1,0 +1,66 @@
+# app-deploy-and-start on a board with NO thing attached.
+#
+# The deploy and the lifecycle commands are device commands, gated on the
+# broker connection and not on a thing (RFC-14 §5.1, RFC-16): a board that
+# nobody has attached to a thing yet must still take an App. So the cloud
+# never answers Thing.begin here -- the daemon keeps resending it, which is
+# tolerated -- and the whole flow runs from AwaitingThingID, with the exact
+# same sequence of reports as the base scenario.
+name: app-deploy-and-start-no-thing
+strict_events: true
+
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+  app_cli:
+    install:
+      - { respond: ok, progress: [0, 50, 100] }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  # No Thing.update: the board waits for a thing for the whole scenario.
+  - await_daemon_cloud_state: { state: AwaitingThingID, timeout: 30s }
+
+  # ── the deploy ─────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call:
+          bundle: app1
+          occurrence: 1
+          status: 206
+          client_cert_cn: "{device_id}"
+          client_cert_valid: true
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call:
+          endpoint: install
+          occurrence: 1
+          prepare: "true"
+          bundle: app1
+          outcome: installed
+  # The install's own progress, every one forwarded.
+  - expect_ota_progress: { id: job1, state: FlashOTA, state_data: [0, 50, 100] }
+  - expect_ota_begin: { bundle: app1 }
+
+  # ── the start ──────────────────────────────────────────────────────────────
+  - cloud_app_start: { app: "app1:0.1.0", op_id: op1 }
+  - expect_app_cli_call: { endpoint: list, occurrence: 1, apps: 1 }
+  - expect_app_cli_call: { endpoint: start, app: "app1:0.1.0", outcome: started }
+  - expect_app_command_response: { op_id: op1, status: progress, details: [0, 100] }
+  - expect_app_command_response: { op_id: op1, status: ok }

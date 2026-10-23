@@ -1,0 +1,81 @@
+# A start while another App is running (RFC-16 §3, start's parameter).
+#
+# The board already runs `old:1.0.0`. The cloud deploys `app1` and starts it:
+#
+#   1. no parameter (= 1): the daemon lists the Apps, stops every one that is
+#      running -- old:1.0.0 -- and only then starts app1. The stop's progress
+#      is not forwarded (it is not the command the cloud sent), the start's is;
+#   2. parameter 1 on the App that is ALREADY running: it is stopped and
+#      started again, because arduino-app-cli refuses to start an App that is
+#      up;
+#   3. parameter 0 while app1 runs: no list, no stop -- arduino-app-cli is asked
+#      to start old:1.0.0 as it is, refuses with AnotherAppRunning, and the
+#      cloud gets -2.
+#
+# The fake arduino-app-cli decides every answer from its own state, so the
+# order of the calls is what the scenario checks: a start before the stop
+# would be refused by the fake and the scenario would fail on the outcome.
+name: app-start-replaces-running
+strict_events: true
+
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+  app_cli:
+    apps:
+      - { id: "old:1.0.0", status: running, default: true }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── deploy app1 next to the running App ────────────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, outcome: installed }
+  - expect_ota_progress: { id: job1, state: FlashOTA, state_data: [0, 100] }
+  - expect_ota_begin: { bundle: app1 }
+
+  # ── 1. start app1: old:1.0.0 is stopped first ──────────────────────────────
+  - cloud_app_start: { app: "app1:0.1.0", op_id: op1 }
+  - expect_app_cli_call: { endpoint: list, occurrence: 1, apps: 2 }
+  - expect_app_cli_call: { endpoint: stop, app: "old:1.0.0", outcome: stopped }
+  - expect_app_cli_call: { endpoint: start, app: "app1:0.1.0", outcome: started }
+  - expect_app_command_response: { op_id: op1, status: progress, details: [0, 100] }
+  - expect_app_command_response: { op_id: op1, status: ok }
+
+  # ── 2. start app1 again: it is restarted ───────────────────────────────────
+  - cloud_app_start: { app: "app1:0.1.0", op_id: op2, parameter: 1 }
+  - expect_app_cli_call: { endpoint: list, occurrence: 2 }
+  - expect_app_cli_call: { endpoint: stop, app: "app1:0.1.0", outcome: stopped }
+  - expect_app_cli_call: { endpoint: start, app: "app1:0.1.0", outcome: started }
+  - expect_app_command_response: { op_id: op2, status: progress, details: [0, 100] }
+  - expect_app_command_response: { op_id: op2, status: ok }
+
+  # ── 3. parameter 0: refused, nothing stopped ───────────────────────────────
+  - cloud_app_start: { app: "old:1.0.0", op_id: op3, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "old:1.0.0", outcome: another_app_running }
+  - expect_app_command_response: { op_id: op3, status: fail, details: -2 }
