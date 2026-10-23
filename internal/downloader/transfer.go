@@ -36,6 +36,12 @@ type transfer struct {
 	// than once per chunk.
 	capacityChecked bool
 
+	// lastProgress is when onProgress last ran — or the download started. It belongs
+	// to the transfer, not to one chunk: kept per chunk, the timer would restart at
+	// every chunk boundary and a link that fetches a chunk faster than the interval
+	// would never report at all.
+	lastProgress time.Time
+
 	// noRange records that storage answered a ranged request with a full 200
 	// response, so this transfer cannot be chunked — the body has to be consumed in
 	// one pass. Set by fetchChunk.

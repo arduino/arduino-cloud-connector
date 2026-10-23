@@ -131,6 +131,55 @@ func TestDownloadReportsProgress(t *testing.T) {
 	}
 }
 
+func TestDownloadReportsCompletionOnce(t *testing.T) {
+	// A transfer shorter than the interval still says when every byte is in: with
+	// the timer never due, the completion is the one and only report.
+	body := content(5000)
+	d := testDownloader(t, &storageapitest.FakeClient{Content: body})
+
+	type call struct{ written, total int64 }
+	var calls []call
+	err := d.Download(context.Background(), testReq(destIn(t.TempDir()), body),
+		func(written, total int64) { calls = append(calls, call{written, total}) })
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	want := call{int64(len(body)), int64(len(body))}
+	if len(calls) != 1 || calls[0] != want {
+		t.Errorf("progress calls: got %v want [%v]", calls, want)
+	}
+}
+
+func TestDownloadProgressTimerSpansChunks(t *testing.T) {
+	// The interval runs over the whole transfer, not over each chunk: restarted at
+	// every chunk boundary, a link that fetches a chunk faster than the interval
+	// would never report, however large the artefact.
+	body := content(5000) // 5 chunks
+	d := testDownloader(t, &storageapitest.FakeClient{Content: body})
+	// Every reading of the clock moves it one second on, so each chunk alone takes
+	// a few seconds and the whole transfer many.
+	clock := time.Unix(0, 0)
+	d.now = func() time.Time {
+		clock = clock.Add(time.Second)
+		return clock
+	}
+	d.progressInterval = 4 * time.Second
+
+	var periodic int
+	err := d.Download(context.Background(), testReq(destIn(t.TempDir()), body),
+		func(written, _ int64) {
+			if written < int64(len(body)) {
+				periodic++
+			}
+		})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if periodic == 0 {
+		t.Error("no periodic progress across 5 chunks: the interval restarts at every chunk")
+	}
+}
+
 func TestDownloadAcceptsANilProgressFunc(t *testing.T) {
 	body := content(1200)
 	d := testDownloader(t, &storageapitest.FakeClient{Content: body})

@@ -58,10 +58,8 @@ const (
 	// checkpointInterval is how many bytes may be written before the resume record
 	// is updated. It is the upper bound on transfer redone after a crash.
 	checkpointInterval = int64(8) << 20 // 8 MiB
-	// progressInterval is the onProgress cadence. 10 s matches the MCU firmware-OTA
-	// cadence (OTAInterfaceDefault::parseOta), which is what the Arduino Cloud UI
-	// already expects for a deploy (RFC-14 §5.3).
-	progressInterval = 10 * time.Second
+	// progressInterval is the onProgress cadence.
+	progressInterval = 2 * time.Second
 )
 
 // Chunk retry policy.
@@ -106,7 +104,8 @@ type Downloader interface {
 	// cancellation) keeps the partial — that is what resume is for.
 	//
 	// onProgress, if non-nil, is called periodically with the bytes written so far
-	// and the total size (0 while still unknown). It must not block.
+	// and the total size (0 while still unknown), and once more when every byte has
+	// arrived — before the artefact is verified. It must not block.
 	//
 	// Errors match one of the Err* sentinels below, or one of storage-api's, via
 	// errors.Is — except a context cancellation, which is returned as-is so callers

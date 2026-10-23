@@ -68,6 +68,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -80,6 +81,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job2, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job2, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job2, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -92,6 +94,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job3, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job3, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job3, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -104,6 +107,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job4, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job4, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job4, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -116,6 +120,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job5, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job5, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job5, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -129,6 +134,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job6, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job6, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job6, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -142,6 +148,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job7, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job7, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job7, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -155,6 +162,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job8, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job8, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job8, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: error }
@@ -167,6 +175,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job9, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job9, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job9, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: status }
@@ -179,6 +188,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job10, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job10, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job10, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: status }
@@ -191,6 +201,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job11, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job11, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job11, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: ok }
@@ -204,6 +215,7 @@ steps:
   - expect_any_order:
       - expect_ota_progress: { id: job12, state: Fetch, state_data: 0 }
       - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job12, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job12, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call: { endpoint: install, bundle: app1, respond: ok }

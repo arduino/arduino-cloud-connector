@@ -878,15 +878,19 @@ step (an extra one is left unclaimed, which `strict_events` catches). Absent
 matches any value.
 
 What `state_data` holds depends on the state: `0` on entering a state, the
-bytes written so far during `Fetch` (only every 10s, so never with the default
-bundle size), the percentage arduino-app-cli streamed during `FlashOTA`, and the
-negative error code (RFC-14 §5.10) in `Fail`.
+bytes written so far during `Fetch` (every 2s, so never with the default bundle
+size, and once more with the whole size when the last byte has arrived — before
+the digest check, so a download that fails it still reports it), the
+percentage arduino-app-cli streamed during `FlashOTA`, and the negative error
+code (RFC-14 §5.10) in `Fail`.
 
 ```yaml
-# a deploy that installs: each state on entry, then every install progress
+# a deploy that installs: each state on entry, the download's end, then every
+# install progress
 - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
 - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
 - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+- expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
 - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
 - expect_ota_progress: { id: job1, state: FlashOTA, state_data: [0, 50, 100] }
 
@@ -1307,8 +1311,9 @@ Three things to know, because they decide where a step can go:
    entering `Fetch` and then calls storage, reports entering `FlashOTA` and
    then calls arduino-app-cli, and in both pairs the report travels over MQTT
    and the call over HTTP -- `app-deploy-and-start.yaml` groups them. What
-   comes back from a fake (an install's progress, a start's responses) is
-   caused by the call, so it is always after it and needs no group.
+   comes back from a fake (the `Fetch` report of a finished download, an
+   install's progress, a start's responses) is caused by the call, so it is
+   always after it and needs no group.
 3. **Do not wait on a state between two protocol events.** Status polls are
    recorded only on change, so the poll that first reports `provisioned` can
    arrive *after* the MQTT connect; consuming it would skip past the connect

@@ -88,6 +88,8 @@ func follow(ctx context.Context, body io.Reader, onProgress ProgressFunc, v verd
 			// Values can be fractional (66.66667 while three models download), and
 			// must never go backwards on the Cloud's progress bar.
 			last = max(last, min(p.Progress, 100))
+			slog.Debug("appcli: arduino-app-cli progress",
+				"raw", p.Progress, "reported", int32(last))
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}

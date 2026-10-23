@@ -46,6 +46,7 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 		return err
 	}
 	defer t.close()
+	t.lastProgress = started
 
 	if t.written > 0 {
 		slog.Info("downloader: resuming interrupted download",
@@ -55,6 +56,12 @@ func (d *downloader) Download(ctx context.Context, req Request, onProgress Progr
 	if err := d.run(ctx, t, req, onProgress); err != nil {
 		return d.abandon(t, req.DestPath, err)
 	}
+
+	// Every byte is in. Said once, whatever the timer: a transfer shorter than the
+	// interval would otherwise end without a single report, and the caller could not
+	// tell when it did. It comes before the verification, so it means "received",
+	// not "usable".
+	onProgress(t.written, t.total)
 
 	// The gate between "downloaded" and "usable" — see verify.
 	if err := d.verify(ctx, t, req.ExpectedSHA256); err != nil {
@@ -345,7 +352,6 @@ func (d *downloader) stream(t *transfer, body io.Reader, onProgress ProgressFunc
 		chunkEnd = t.total
 	}
 	lastCheckpoint := t.written
-	lastProgress := d.now()
 
 	for {
 		n, readErr := body.Read(buf)
@@ -359,9 +365,9 @@ func (d *downloader) stream(t *transfer, body io.Reader, onProgress ProgressFunc
 				}
 				lastCheckpoint = t.written
 			}
-			if now := d.now(); now.Sub(lastProgress) >= d.progressInterval {
+			if now := d.now(); now.Sub(t.lastProgress) >= d.progressInterval {
 				onProgress(t.written, t.total)
-				lastProgress = now
+				t.lastProgress = now
 			}
 		}
 

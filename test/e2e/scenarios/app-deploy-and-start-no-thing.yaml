@@ -45,6 +45,7 @@ steps:
           status: 206
           client_cert_cn: "{device_id}"
           client_cert_valid: true
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call:

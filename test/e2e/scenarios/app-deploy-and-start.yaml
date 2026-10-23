@@ -5,7 +5,8 @@
 #
 #   - the deploy reports every RFC-14 state it passes through, in order, for
 #     the job the cloud named: OtaAvailable, StartOTA, Fetch, FlashOTA;
-#   - the bundle is downloaded from storage with the device certificate;
+#   - the bundle is downloaded from storage with the device certificate, and
+#     the end of the download is reported with its byte count;
 #   - arduino-app-cli receives exactly the bundle the cloud announced (the fake
 #     resolves the uploaded digest back to `app1`), with prepare=true;
 #   - every install progress arduino-app-cli streams is forwarded, and the
@@ -61,6 +62,7 @@ steps:
           status: 206
           client_cert_cn: "{device_id}"
           client_cert_valid: true
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
   - expect_any_order:
       - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
       - expect_app_cli_call:
