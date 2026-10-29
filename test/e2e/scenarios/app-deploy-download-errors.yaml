@@ -1,0 +1,109 @@
+# Download failures, each propagated to the cloud with its RFC-14 §5.10 code.
+# One deploy per case, in sequence; none reaches arduino-app-cli -- nothing is
+# installed from a download that failed (strict_events fails on any install
+# call nobody expected).
+#
+#   job1  storage serves the right length and the wrong bytes   -6   (the digest gate on the FILE)
+#   job2  storage answers 404                                    -14
+#   job3  storage answers 403 (an expired grant)                 -14
+#   job4  the URL is http://, refused before any request         -9
+#   job5  the cloud announces a digest the bundle does not have   -6
+#   job6  storage answers 503, then the bundle: retried, then installed
+#
+# job6 costs the downloader's first back-off, about 2-3s.
+name: app-deploy-download-errors
+strict_events: true
+
+fakes:
+  storage:
+    app1:
+      app: "app1:0.1.0"
+      responses:
+        - { respond: corrupt }
+        - { respond: status, status: 404 }
+        - { respond: status, status: 403 }
+        - { respond: ok }
+        - { respond: status, status: 503 }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── job1: corrupt bytes ───────────────────────────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, respond: corrupt, status: 206 }
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
+  - expect_ota_progress: { id: job1, state: Fail, state_data: -6 }
+
+  # ── job2: 404 ──────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job2, bundle: app1 }
+  - expect_ota_progress: { id: job2, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job2, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job2, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, respond: status, status: 404 }
+  - expect_ota_progress: { id: job2, state: Fail, state_data: -14 }
+
+  # ── job3: 403 ──────────────────────────────────────────────────────────────
+  - cloud_ota: { id: job3, bundle: app1 }
+  - expect_ota_progress: { id: job3, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job3, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job3, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, respond: status, status: 403 }
+  - expect_ota_progress: { id: job3, state: Fail, state_data: -14 }
+
+  # ── job4: http:// -- no request at all ─────────────────────────────────────
+  - cloud_ota: { id: job4, bundle: app1, url: "http://127.0.0.1:9/bundles/app1" }
+  - expect_ota_progress: { id: job4, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job4, state: StartOTA, state_data: 0 }
+  - expect_ota_progress: { id: job4, state: Fetch, state_data: 0 }
+  - expect_ota_progress: { id: job4, state: Fail, state_data: -9 }
+
+  # ── job5: the announced digest is not the bundle's ─────────────────────────
+  - cloud_ota:
+      id: job5
+      bundle: app1
+      sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+  - expect_ota_progress: { id: job5, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job5, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job5, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, respond: ok, status: 206 }
+  - expect_ota_progress: { id: job5, state: Fetch, state_data: 4096 }
+  - expect_ota_progress: { id: job5, state: Fail, state_data: -6 }
+
+  # ── job6: 503 is transient: retried, then installed ────────────────────────
+  - cloud_ota: { id: job6, bundle: app1 }
+  - expect_ota_progress: { id: job6, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job6, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job6, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, respond: status, status: 503 }
+  - expect_storage_call: { bundle: app1, respond: ok, status: 206, timeout: 20s }
+  - expect_ota_progress: { id: job6, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job6, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, outcome: installed }
+  - expect_ota_progress: { id: job6, state: FlashOTA, state_data: [0, 100] }
+  - expect_ota_begin: { bundle: app1 }

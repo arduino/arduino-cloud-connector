@@ -15,7 +15,7 @@
 //	                          reprovision request from REST
 //
 // The thing-handshake / MQTT-steady-state logic lives in the nested Cloud FSM
-// (package internal/daemon/cloud) and is spawned by the Run state.
+// (package internal/cloud) and is spawned by the Run state.
 //
 // The daemon does NOT persist its own state. On restart the post-internet state
 // is derived from the provisioning Service's State (itself derived from the
@@ -40,8 +40,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arduino/arduino-cloud-connector/internal/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/config"
-	"github.com/arduino/arduino-cloud-connector/internal/daemon/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/keystore"
 	"github.com/arduino/arduino-cloud-connector/internal/mqtt"
 	"github.com/arduino/arduino-cloud-connector/internal/provisioning"
