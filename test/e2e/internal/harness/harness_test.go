@@ -65,10 +65,18 @@ func TestEnvCoversEveryDaemonSetting(t *testing.T) {
 	for _, key := range []string{
 		EnvPort, EnvDataDir, EnvProvisioningAPI, EnvMQTTBroker,
 		EnvMQTTCAFile, EnvNTPProbeHost, EnvLogLevel, EnvSocket,
+		EnvAppCLIURL, EnvAppDownloadDir,
 	} {
 		if env[key] == "" {
 			t.Errorf("%s is not set", key)
 		}
+	}
+	if got := env[EnvAppCLIURL]; got != w.AppCLI.URL() {
+		t.Errorf("%s = %q, want the fake arduino-app-cli", EnvAppCLIURL, got)
+	}
+	// Unset unless a scenario asks: the daemon's own default is the one to test.
+	if _, set := env[EnvInstallTimeout]; set {
+		t.Errorf("%s is set without a scenario asking for it", EnvInstallTimeout)
 	}
 	if got := env[EnvProvisioningAPI]; got != w.ProvAPI.URL() {
 		t.Errorf("%s = %q, want the fake API", EnvProvisioningAPI, got)
@@ -226,4 +234,15 @@ func dialClosed(addr string) error {
 	}
 	_ = conn.Close()
 	return fmt.Errorf("%s still accepts connections", addr)
+}
+
+func TestInstallTimeoutReachesTheDaemon(t *testing.T) {
+	w, err := SetupServers(Config{InstallTimeout: 3 * time.Second})
+	if err != nil {
+		t.Fatalf("SetupServers: %v", err)
+	}
+	defer w.Teardown(context.Background()) //nolint:errcheck
+	if got := w.Env()[EnvInstallTimeout]; got != "3s" {
+		t.Errorf("%s = %q, want 3s", EnvInstallTimeout, got)
+	}
 }

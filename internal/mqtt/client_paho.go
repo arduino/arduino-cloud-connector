@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
@@ -379,9 +378,9 @@ func (c *pahoClient) PublishProperty(thingID string, payload []byte) error {
 }
 
 // buildTLSConfig constructs the mTLS configuration from the device certificate
-// and cloud private key stored in the keystore. RootCAs pins cfg.MQTTCAFile
-// (the private CN=Arduino CA, absent from system roots) when set, else uses
-// system roots.
+// and cloud private key stored in the keystore. RootCAs comes from
+// config.CloudRootCAs: cfg.MQTTCAFile (the private CN=Arduino CA, absent from
+// system roots) when set, else system roots.
 func (c *pahoClient) buildTLSConfig() (*tls.Config, error) {
 	certPEM, err := c.ks.DeviceCertPEM()
 	if err != nil {
@@ -404,7 +403,7 @@ func (c *pahoClient) buildTLSConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("build X.509 key pair: %w", err)
 	}
 
-	pool, err := brokerRootCAs(c.cfg.MQTTCAFile)
+	pool, err := c.cfg.CloudRootCAs()
 	if err != nil {
 		return nil, err
 	}
@@ -418,24 +417,4 @@ func (c *pahoClient) buildTLSConfig() (*tls.Config, error) {
 		MaxVersion:   tls.VersionTLS12, // broker is TLS 1.2-only; a TLS 1.3 ClientHello is rejected (alert 70)
 		RootCAs:      pool,             // nil = system roots
 	}, nil
-}
-
-// brokerRootCAs returns the certificate pool used to verify the broker's
-// server certificate. When caFile is empty it returns (nil, nil) so the caller
-// falls back to the system root store; when set, the file must contain at
-// least one PEM-encoded certificate, which becomes the sole trusted root (CA
-// pinning, as done on the boards).
-func brokerRootCAs(caFile string) (*x509.CertPool, error) {
-	if caFile == "" {
-		return nil, nil
-	}
-	caPEM, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("read MQTT CA file %q: %w", caFile, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("MQTT CA file %q: no certificates parsed", caFile)
-	}
-	return pool, nil
 }

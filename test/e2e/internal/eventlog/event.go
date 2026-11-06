@@ -33,9 +33,14 @@ type Source string
 
 const (
 	SourceProvisioningAPI Source = "provisioning_api"
-	SourceNTP             Source = "ntp"
-	SourceMQTT            Source = "mqtt"
-	SourceSSE             Source = "sse"
+	// SourceStorage is the fake storage the daemon downloads App bundles from.
+	SourceStorage Source = "storage"
+	// SourceAppCLI is the fake arduino-app-cli the daemon installs, starts and
+	// stops Apps through.
+	SourceAppCLI Source = "app_cli"
+	SourceNTP    Source = "ntp"
+	SourceMQTT   Source = "mqtt"
+	SourceSSE    Source = "sse"
 	// SourceApp is the harness acting as an app against the daemon's REST API:
 	// starting provisioning, putting a variable value. It is the write side of
 	// the app role, where SourceSSE is the read side.
@@ -118,7 +123,7 @@ type Event struct {
 // context: useful when reading a failure, never assertable by absence.
 func (e Event) Significant() bool {
 	switch e.Source {
-	case SourceProvisioningAPI, SourceSSE:
+	case SourceProvisioningAPI, SourceStorage, SourceAppCLI, SourceSSE:
 		return true
 	case SourceDaemonProcess:
 		return e.Kind == KindProcessExit

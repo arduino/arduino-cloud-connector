@@ -8,6 +8,7 @@ package wire
 import (
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // Command tag numbers, on the command channel (/a/d/<device_id>/c/up and
@@ -31,6 +32,13 @@ const (
 	TagTimezoneUpdate   uint64 = 0x10900 // down
 	TagThingDetach      uint64 = 0x11000 // down
 	TagDeviceNetConfig  uint64 = 0x11100 // up
+
+	// The App lifecycle family (RFC-16 §3). Not in CBOR.h: these messages are
+	// Linux-only, so the reference is the RFC's own tables, restated here for the
+	// same reason as the rest.
+	TagAppsList           uint64 = 0x13000 // up
+	TagAppCommand         uint64 = 0x13001 // down
+	TagAppCommandResponse uint64 = 0x13002 // up
 )
 
 // Command names as scenarios write them and as the timeline prints them.
@@ -47,6 +55,10 @@ const (
 	CmdTimezoneUpdate   = "Timezone.update"
 	CmdThingDetach      = "Thing.detach"
 	CmdDeviceNetConfig  = "DeviceNetConfig"
+
+	CmdAppsList           = "Apps.list"
+	CmdAppCommand         = "App.command"
+	CmdAppCommandResponse = "App.commandResponse"
 )
 
 // commandNames is the tag-to-name map. An unknown tag is reported by number so
@@ -64,6 +76,43 @@ var commandNames = map[uint64]string{
 	TagTimezoneUpdate:   CmdTimezoneUpdate,
 	TagThingDetach:      CmdThingDetach,
 	TagDeviceNetConfig:  CmdDeviceNetConfig,
+
+	TagAppsList:           CmdAppsList,
+	TagAppCommand:         CmdAppCommand,
+	TagAppCommandResponse: CmdAppCommandResponse,
+}
+
+// App lifecycle commands, the second element of App.command (RFC-16 §3).
+var appCommandNames = map[int64]string{
+	0: "stop",
+	1: "start",
+	2: "delete",
+	3: "set_default",
+}
+
+// AppCommandCode is the wire number of an App.command command name, the inverse
+// of appCommandNames.
+func AppCommandCode(name string) (int64, bool) {
+	for code, n := range appCommandNames {
+		if n == name {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+// App command response statuses, the second element of App.commandResponse.
+var appStatusNames = map[int64]string{
+	0: "ok",
+	1: "fail",
+	2: "progress",
+}
+
+// App states in Apps.list.
+var appStateNames = map[int64]string{
+	1:  "running",
+	0:  "stopped",
+	-1: "failure",
 }
 
 // Network adapter type IDs, the first element of DeviceNetConfig. Restated
@@ -170,6 +219,18 @@ func DecodeCommand(payload []byte) (Command, error) {
 		if err := decodeOTAProgress(items, &cmd); err != nil {
 			return Command{}, err
 		}
+	case TagAppCommand:
+		if err := decodeAppCommand(items, &cmd); err != nil {
+			return Command{}, err
+		}
+	case TagAppCommandResponse:
+		if err := decodeAppCommandResponse(items, &cmd); err != nil {
+			return Command{}, err
+		}
+	case TagAppsList:
+		if err := decodeAppsList(items, &cmd); err != nil {
+			return Command{}, err
+		}
 	default:
 		// An unknown command is still worth putting on the timeline: the tag
 		// and the element count say what arrived.
@@ -241,7 +302,7 @@ func decodeOTAProgress(items []any, cmd *Command) error {
 	if err != nil {
 		return err
 	}
-	state, err := intAt(items, 1, "state")
+	state, err := simpleAt(items, 1, "state")
 	if err != nil {
 		return err
 	}
@@ -254,10 +315,112 @@ func decodeOTAProgress(items []any, cmd *Command) error {
 		return err
 	}
 	cmd.Fields["id"] = hex.EncodeToString(id)
-	cmd.Fields["state"] = state
+	cmd.Fields["state"] = int64(state)
 	cmd.Fields["state_data"] = stateData
 	cmd.Fields["timestamp"] = timestamp
 	return nil
+}
+
+// decodeAppCommand reads [app, command, op_id(, parameter)]. Only the harness
+// sends it; decoding it keeps the timeline readable if one is ever recorded.
+func decodeAppCommand(items []any, cmd *Command) error {
+	if len(items) != 3 && len(items) != 4 {
+		return fmt.Errorf("wire: App.command has %d element(s), want 3 or 4", len(items))
+	}
+	app, err := stringAt(items, 0, "app")
+	if err != nil {
+		return err
+	}
+	code, err := intAt(items, 1, "command")
+	if err != nil {
+		return err
+	}
+	opID, err := stringAt(items, 2, "op_id")
+	if err != nil {
+		return err
+	}
+	cmd.Fields["app"] = app
+	cmd.Fields["command"] = nameOr(appCommandNames, code)
+	cmd.Fields["op_id"] = opID
+	if len(items) == 4 {
+		p, err := intAt(items, 3, "parameter")
+		if err != nil {
+			return err
+		}
+		cmd.Fields["parameter"] = p
+	}
+	return nil
+}
+
+// decodeAppCommandResponse reads [op_id, status(, details)].
+//
+// elements is recorded because it carries a rule of its own: a success has NO
+// details (RFC-16 §3), and an attribute that is merely absent cannot be asserted
+// on, while `elements: 2` can.
+func decodeAppCommandResponse(items []any, cmd *Command) error {
+	if len(items) != 2 && len(items) != 3 {
+		return fmt.Errorf("wire: App.commandResponse has %d element(s), want 2 or 3", len(items))
+	}
+	opID, err := stringAt(items, 0, "op_id")
+	if err != nil {
+		return err
+	}
+	status, err := intAt(items, 1, "status")
+	if err != nil {
+		return err
+	}
+	cmd.Fields["op_id"] = opID
+	cmd.Fields["status"] = nameOr(appStatusNames, status)
+	cmd.Fields["elements"] = len(items)
+	if len(items) == 3 {
+		details, err := intAt(items, 2, "details")
+		if err != nil {
+			return err
+		}
+		cmd.Fields["details"] = details
+	}
+	return nil
+}
+
+// decodeAppsList reads the flat [name, state, default, ...] array. The apps are
+// recorded as one comma-separated "name=state" string, a trailing * marking the
+// default, so a whole list is one attribute a scenario can compare.
+func decodeAppsList(items []any, cmd *Command) error {
+	if len(items)%3 != 0 {
+		return fmt.Errorf("wire: Apps.list has %d element(s), want a multiple of 3", len(items))
+	}
+	apps := make([]string, 0, len(items)/3)
+	for i := 0; i < len(items); i += 3 {
+		name, err := stringAt(items, i, "app name")
+		if err != nil {
+			return err
+		}
+		state, err := intAt(items, i+1, "app state")
+		if err != nil {
+			return err
+		}
+		def, ok := items[i+2].(bool)
+		if !ok {
+			return fmt.Errorf("wire: app default is %T, want a bool", items[i+2])
+		}
+		entry := name + "=" + nameOr(appStateNames, state)
+		if def {
+			entry += "*"
+		}
+		apps = append(apps, entry)
+	}
+	cmd.Fields["apps"] = strings.Join(apps, ",")
+	cmd.Fields["count"] = len(apps)
+	return nil
+}
+
+// nameOr names a protocol number, or spells it out when this package does not
+// know it, so an unexpected value is visible rather than silently mapped.
+func nameOr(names map[int64]string, n int64) string {
+	if name, ok := names[n]; ok {
+		return name
+	}
+	return fmt.Sprintf("unknown(%d)", n)
 }
 
 func commandName(tag uint64) string {
@@ -299,9 +462,8 @@ func EncodeTimezoneUpdate(offset int32, until uint32) []byte {
 	return appendInt(b, int64(until))
 }
 
-// EncodeOTAUpdate pushes OTA metadata. The daemon does not implement it; it is
-// here so a scenario can check that an unimplemented command is ignored
-// without wedging the connection.
+// EncodeOTAUpdate starts an App deploy (RFC-14): the job id, the bundle URL, the
+// digest the cloud believes is installed and the one the download must hash to.
 func EncodeOTAUpdate(id []byte, url string, initialSHA, finalSHA []byte) []byte {
 	b := appendTag(nil, TagOTAUpdate)
 	b = appendArrayHeader(b, 4)
@@ -309,6 +471,24 @@ func EncodeOTAUpdate(id []byte, url string, initialSHA, finalSHA []byte) []byte 
 	b = appendText(b, url)
 	b = appendBytes(b, initialSHA)
 	return appendBytes(b, finalSHA)
+}
+
+// EncodeAppCommand asks the board to act on one of its Apps (RFC-16 §3):
+// [app, command, op_id] or, with a parameter, [app, command, op_id, parameter].
+func EncodeAppCommand(app string, command int64, opID string, parameter *int64) []byte {
+	n := 3
+	if parameter != nil {
+		n = 4
+	}
+	b := appendTag(nil, TagAppCommand)
+	b = appendArrayHeader(b, n)
+	b = appendText(b, app)
+	b = appendInt(b, command)
+	b = appendText(b, opID)
+	if parameter != nil {
+		b = appendInt(b, *parameter)
+	}
+	return b
 }
 
 func encodeStringCommand(tag uint64, value string) []byte {
@@ -348,6 +528,21 @@ func bytesAt(items []any, i int, field string) ([]byte, error) {
 		return nil, fmt.Errorf("wire: %s is %T, want a byte string", field, v)
 	}
 	return b, nil
+}
+
+// simpleAt reads a CBOR simple value. An integer is refused on purpose: the C++
+// library sends the OTA state as a simple value, and a daemon that sent an integer
+// instead would be speaking a dialect no firmware speaks.
+func simpleAt(items []any, i int, field string) (Simple, error) {
+	v, err := itemAt(items, i, field)
+	if err != nil {
+		return 0, err
+	}
+	s, ok := v.(Simple)
+	if !ok {
+		return 0, fmt.Errorf("wire: %s is %T, want a CBOR simple value", field, v)
+	}
+	return s, nil
 }
 
 func intAt(items []any, i int, field string) (int64, error) {
