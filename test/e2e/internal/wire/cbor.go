@@ -69,6 +69,11 @@ const (
 	simpleNull  = 22
 )
 
+// Simple is an unassigned CBOR simple value (0…19, the one-byte form). The
+// protocol uses one for the OTA progress state, which the C++ library encodes with
+// cbor_encode_simple_value rather than as an integer.
+type Simple uint8
+
 // Tag is a CBOR tagged value: the protocol wraps every command in one.
 type Tag struct {
 	Number  uint64
@@ -340,6 +345,9 @@ func decodeArg(data []byte) (uint64, []byte, error) {
 func decodeSimple(data []byte) (any, []byte, error) {
 	ai := data[0] & 0x1f
 	rest := data[1:]
+	if ai < simpleFalse {
+		return Simple(ai), rest, nil
+	}
 	switch ai {
 	case simpleFalse:
 		return false, rest, nil

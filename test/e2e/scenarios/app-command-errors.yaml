@@ -1,0 +1,124 @@
+# Lifecycle commands that fail, each answered with its RFC-16 v10 code. One
+# command after another on the same board, every App already installed.
+#
+#   start  ghost:1, unknown to arduino-app-cli (500 before the stream)      -3
+#   start  not_prepared                                                    -1
+#   start  parameter 7: neither 0 nor 1, refused without calling app-cli   -3
+#   start  the App list cannot be read (app-cli hangs up)                  -41  (no start is attempted)
+#   start  NoDiskSpace                                                     -40
+#   start  AppNotCompatible                                                -44
+#   start  an unprefixed INTERNAL_SERVER_ERROR                             -3
+#   start  the stream ends mid-way                                         -41  (its progress forwarded first)
+#   start  no answer at all                                                -3   after INSTALL_TIMEOUT (RFC-16 has no timeout code)
+#   stop   ghost:1                                                         -3
+#   stop   app-cli hangs up                                                -41
+#   default ghost:1                                                        -3
+#   default an unprefixed 500                                              -3
+#   default app-cli hangs up                                               -41
+#
+# Every start but the list one passes parameter 0, so the daemon goes straight
+# to the start and the timeline holds one call per command.
+name: app-command-errors
+strict_events: true
+install_timeout: 3s
+
+fakes:
+  app_cli:
+    apps:
+      - { id: "a:1.0.0" }
+    start:
+      - { respond: ok }
+      - { respond: error, code: not_prepared, message: "image ghcr.io/x/y:1 is missing" }
+      - { respond: error, message: "NoDiskSpace: no space left on device" }
+      - { respond: error, message: "AppNotCompatible: the app requires board unoq-2" }
+      - { respond: error, message: "docker compose up failed" }
+      - { respond: drop, progress: [10] }
+      - { respond: hang }
+    list:
+      - { respond: drop }
+    stop:
+      - { respond: ok }
+      - { respond: drop }
+    default:
+      - { respond: ok }
+      - { respond: status, status: 500, details: "unable to edit the app" }
+      - { respond: drop }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── start ──────────────────────────────────────────────────────────────────
+  - cloud_app_start: { app: "ghost:1", op_id: e1, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "ghost:1", outcome: unknown_app }
+  - expect_app_command_response: { op_id: e1, status: fail, details: -3 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e2, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: error }
+  - expect_app_command_response: { op_id: e2, status: fail, details: -1 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e3, parameter: 7 }
+  - expect_app_command_response: { op_id: e3, status: fail, details: -3 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e4 }
+  - expect_app_cli_call: { endpoint: list, respond: drop }
+  - expect_app_command_response: { op_id: e4, status: fail, details: -41 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e5, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: error }
+  - expect_app_command_response: { op_id: e5, status: fail, details: -40 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e6, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: error }
+  - expect_app_command_response: { op_id: e6, status: fail, details: -44 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e7, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: error }
+  - expect_app_command_response: { op_id: e7, status: fail, details: -3 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e8, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: drop }
+  - expect_app_command_response: { op_id: e8, status: progress, details: 10 }
+  - expect_app_command_response: { op_id: e8, status: fail, details: -41 }
+
+  - cloud_app_start: { app: "a:1.0.0", op_id: e9, parameter: 0 }
+  - expect_app_cli_call: { endpoint: start, app: "a:1.0.0", respond: hang }
+  - expect_app_command_response: { op_id: e9, status: fail, details: -3, timeout: 10s }
+
+  # ── stop ───────────────────────────────────────────────────────────────────
+  - cloud_app_stop: { app: "ghost:1", op_id: s1 }
+  - expect_app_cli_call: { endpoint: stop, app: "ghost:1", outcome: unknown_app }
+  - expect_app_command_response: { op_id: s1, status: fail, details: -3 }
+
+  - cloud_app_stop: { app: "a:1.0.0", op_id: s2 }
+  - expect_app_cli_call: { endpoint: stop, app: "a:1.0.0", respond: drop }
+  - expect_app_command_response: { op_id: s2, status: fail, details: -41 }
+
+  # ── set-default ────────────────────────────────────────────────────────────
+  - cloud_app_set_default: { app: "ghost:1", op_id: d1 }
+  - expect_app_cli_call: { endpoint: default, app: "ghost:1", outcome: unknown_app }
+  - expect_app_command_response: { op_id: d1, status: fail, details: -3 }
+
+  - cloud_app_set_default: { app: "a:1.0.0", op_id: d2 }
+  - expect_app_cli_call: { endpoint: default, app: "a:1.0.0", respond: status }
+  - expect_app_command_response: { op_id: d2, status: fail, details: -3 }
+
+  - cloud_app_set_default: { app: "a:1.0.0", op_id: d3 }
+  - expect_app_cli_call: { endpoint: default, app: "a:1.0.0", respond: drop }
+  - expect_app_command_response: { op_id: d3, status: fail, details: -41 }

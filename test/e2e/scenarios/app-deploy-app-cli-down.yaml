@@ -1,0 +1,97 @@
+# arduino-app-cli going away or going silent during an install, and commands
+# arriving while one is in progress.
+#
+#   job1  the install stream ends mid-way, without the closing pair   -41
+#   job2  the install never answers, not even the headers            -47 after INSTALL_TIMEOUT
+#         ...and while job2 hangs:
+#   job3  a second deploy                                            -49, and job2 is untouched
+#   op1   a start                                                    -49 on the lifecycle channel
+#   job4  the install streams some progress and then falls silent    -47, timed from the LAST progress
+#
+# INSTALL_TIMEOUT is 3s here (the default is 10 minutes), so each stall costs
+# about three seconds.
+name: app-deploy-app-cli-down
+strict_events: true
+install_timeout: 3s
+
+fakes:
+  storage:
+    app1: { app: "app1:0.1.0" }
+  app_cli:
+    apps:
+      - { id: "a:1.0.0" }
+    install:
+      - { respond: drop, progress: [10] }
+      - { respond: hang }
+      - { respond: hang, progress: [0, 30] }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── job1: the stream ends without a verdict ───────────────────────────────
+  - cloud_ota: { id: job1, bundle: app1 }
+  - expect_ota_progress: { id: job1, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job1, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job1, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: drop }
+  - expect_ota_progress: { id: job1, state: FlashOTA, state_data: 10 }
+  - expect_ota_progress: { id: job1, state: Fail, state_data: -41 }
+
+  # ── job2: silence from the start ───────────────────────────────────────────
+  - cloud_ota: { id: job2, bundle: app1 }
+  - expect_ota_progress: { id: job2, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job2, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job2, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job2, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job2, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: hang }
+
+  # ── job3 and op1 while job2 holds the slot ─────────────────────────────────
+  # Refused straight away and keyed by THEIR ids: job3 gets one Fail and no
+  # state before it, and nothing reaches storage or arduino-app-cli.
+  - cloud_ota: { id: job3, bundle: app1 }
+  - expect_ota_progress: { id: job3, state: Fail, state_data: -49 }
+  - cloud_app_start: { app: "a:1.0.0", op_id: op1 }
+  - expect_app_command_response: { op_id: op1, status: fail, details: -49 }
+
+  # job2's watchdog, still counting from its own start.
+  - expect_ota_progress: { id: job2, state: Fail, state_data: -47, timeout: 10s }
+
+  # ── job4: progress, then silence ───────────────────────────────────────────
+  - cloud_ota: { id: job4, bundle: app1 }
+  - expect_ota_progress: { id: job4, state: OtaAvailable, state_data: 0 }
+  - expect_ota_progress: { id: job4, state: StartOTA, state_data: 0 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job4, state: Fetch, state_data: 0 }
+      - expect_storage_call: { bundle: app1, status: 206 }
+  - expect_ota_progress: { id: job4, state: Fetch, state_data: 4096 }
+  - expect_any_order:
+      - expect_ota_progress: { id: job4, state: FlashOTA, state_data: 0 }
+      - expect_app_cli_call: { endpoint: install, bundle: app1, respond: hang }
+  - expect_ota_progress: { id: job4, state: FlashOTA, state_data: [0, 30] }
+  - expect_ota_progress: { id: job4, state: Fail, state_data: -47, timeout: 10s }

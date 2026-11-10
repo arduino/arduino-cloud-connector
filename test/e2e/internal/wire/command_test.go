@@ -113,6 +113,20 @@ func TestDecodeUplinkCommands(t *testing.T) {
 				"netmask":      "",
 			},
 		},
+		{
+			// The C++ vector (test_command_encode.cpp): tag(0x10200)
+			// [ h'000102…0f', simple(1), -1, 100 ] -- the state is E1, a simple value.
+			name:     "ota progress",
+			payload:  "da00010200 84 50 000102030405060708090a0b0c0d0e0f e1 20 1864",
+			wantName: CmdOTAProgress,
+			wantTag:  TagOTAProgress,
+			wantFields: map[string]any{
+				"id":         "000102030405060708090a0b0c0d0e0f",
+				"state":      int64(1),
+				"state_data": int64(-1),
+				"timestamp":  int64(100),
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,6 +204,9 @@ func TestDecodeCommandRejectsMalformedPayloads(t *testing.T) {
 		{"net config with no type", "da000111008 0"},
 		{"wifi net config with no ssid", "da000111008101"},
 		{"trailing bytes after the command", "da000107008165312e322e3300"},
+		// The same OTA progress with the state as the integer 01: not what any
+		// firmware sends.
+		{"ota progress with an integer state", "da00010200 84 50 000102030405060708090a0b0c0d0e0f 01 20 1864"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,6 +304,10 @@ func TestCommandTagNumbers(t *testing.T) {
 		CmdTimezoneUpdate:   0x10900,
 		CmdThingDetach:      0x11000,
 		CmdDeviceNetConfig:  0x11100,
+		// RFC-16 §3: family 0x0130, counting in the low byte.
+		CmdAppsList:           0x13000,
+		CmdAppCommand:         0x13001,
+		CmdAppCommandResponse: 0x13002,
 	}
 	if len(commandNames) != len(want) {
 		t.Fatalf("the harness knows %d commands, the table lists %d", len(commandNames), len(want))

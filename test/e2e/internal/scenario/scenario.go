@@ -30,7 +30,9 @@ import (
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/appclient"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/harness"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/appcli"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/provapi"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/storage"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/steps"
 )
 
@@ -59,8 +61,13 @@ type Scenario struct {
 	// stop_daemon falls back to a kill -- and never for one that is merely
 	// flaky: CI runs on Linux, so a skip here must not hide a real failure.
 	SkipOnOS []string `yaml:"skip_on_os"`
-	Fakes    Fakes    `yaml:"fakes"`
-	Steps    []Step   `yaml:"steps"`
+	// InstallTimeout is the daemon's stall watchdog on arduino-app-cli
+	// (ARDUINO_CLOUD_CONNECTOR__INSTALL_TIMEOUT), for a scenario that waits for
+	// it to fire. Absent leaves the daemon's default, 10 minutes. It is read
+	// before the daemon starts, which is why it is not a step.
+	InstallTimeout time.Duration `yaml:"install_timeout"`
+	Fakes          Fakes         `yaml:"fakes"`
+	Steps          []Step        `yaml:"steps"`
 
 	// Path is where it was loaded from, for an error that has to name the file.
 	Path string `yaml:"-"`
@@ -80,6 +87,22 @@ type Fakes struct {
 	// ProvisioningAPI queues responses per endpoint, keyed by the short names
 	// the API uses: "csr" and "complete".
 	ProvisioningAPI map[string][]provapi.Directive `yaml:"provisioning_api"`
+	// Storage declares the App bundles the cloud can deploy, by name, each with
+	// the App it stands for and its own queue of responses.
+	Storage map[string]storage.Bundle `yaml:"storage"`
+	// AppCLI is the fake arduino-app-cli: the Apps already on the board and a
+	// queue of responses per endpoint.
+	AppCLI AppCLIFakes `yaml:"app_cli"`
+}
+
+// AppCLIFakes configures the fake arduino-app-cli.
+type AppCLIFakes struct {
+	Apps    []appcli.App       `yaml:"apps"`
+	Install []appcli.Directive `yaml:"install"`
+	Start   []appcli.Directive `yaml:"start"`
+	Stop    []appcli.Directive `yaml:"stop"`
+	List    []appcli.Directive `yaml:"list"`
+	Default []appcli.Directive `yaml:"default"`
 }
 
 // Step is one entry of the steps list: a single-key mapping whose key is the
@@ -317,7 +340,37 @@ func applyFakes(w *harness.World, f Fakes) error {
 			return err
 		}
 	}
+	for _, name := range sortedNames(f.Storage) {
+		if err := w.Storage.Add(name, f.Storage[name]); err != nil {
+			return err
+		}
+	}
+	if err := w.AppCLI.SetApps(f.AppCLI.Apps); err != nil {
+		return err
+	}
+	for endpoint, directives := range map[appcli.Endpoint][]appcli.Directive{
+		appcli.EndpointInstall: f.AppCLI.Install,
+		appcli.EndpointStart:   f.AppCLI.Start,
+		appcli.EndpointStop:    f.AppCLI.Stop,
+		appcli.EndpointList:    f.AppCLI.List,
+		appcli.EndpointDefault: f.AppCLI.Default,
+	} {
+		if err := w.AppCLI.Queue(endpoint, directives...); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// sortedNames makes the order bundles are declared in, and so the order of any
+// error, independent of map iteration.
+func sortedNames[V any](m map[string]V) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // endpointFor maps the short names a scenario writes onto the endpoints the

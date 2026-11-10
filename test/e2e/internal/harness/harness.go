@@ -3,9 +3,10 @@
 // SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package harness wires the pieces together into a World: the CA, the three
-// servers the daemon talks to, the app-role client, the daemon process itself
-// and the scenario variable bag.
+// Package harness wires the pieces together into a World: the CA, the servers
+// the daemon talks to (provisioning API, connectivity probe, broker, storage and
+// arduino-app-cli), the app-role client, the daemon process itself and the
+// scenario variable bag.
 //
 // World lives in its own package rather than in scenario, and that is not
 // filing: steps need the World, scenario needs the step registry, so putting
@@ -38,9 +39,11 @@ import (
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/daemonproc"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/eventlog"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/pki"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/appcli"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/broker"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/ntp"
 	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/provapi"
+	"github.com/arduino/arduino-cloud-connector/test/e2e/internal/servers/storage"
 )
 
 // The daemon's configuration environment.
@@ -53,6 +56,9 @@ const (
 	EnvProvisioningAPI = "ARDUINO_CLOUD_CONNECTOR__PROVISIONING_API"
 	EnvNTPProbeHost    = "ARDUINO_CLOUD_CONNECTOR__NTP_PROBE_HOST"
 	EnvLogLevel        = "ARDUINO_CLOUD_CONNECTOR__LOG_LEVEL"
+	EnvAppCLIURL       = "ARDUINO_CLOUD_CONNECTOR__APP_CLI_URL"
+	EnvAppDownloadDir  = "ARDUINO_CLOUD_CONNECTOR__APP_DOWNLOAD_DIR"
+	EnvInstallTimeout  = "ARDUINO_CLOUD_CONNECTOR__INSTALL_TIMEOUT"
 )
 
 // Defaults for a scenario that does not care.
@@ -80,6 +86,9 @@ type Config struct {
 	LogLevel           string
 	StatusPollInterval time.Duration
 	ReadyTimeout       time.Duration
+	// InstallTimeout is the daemon's stall watchdog on arduino-app-cli, for a
+	// scenario that waits for it to fire. The daemon's default when zero.
+	InstallTimeout time.Duration
 }
 
 // World is everything a step can touch.
@@ -89,13 +98,16 @@ type World struct {
 	ProvAPI *provapi.Server
 	NTP     *ntp.Server
 	Broker  *broker.Server
+	Storage *storage.Server
+	AppCLI  *appcli.Server
 	App     *appclient.Client
 	Daemon  *daemonproc.Process
 	Vars    *Bag
 
-	DataDir   string
-	CAFile    string
-	DaemonURL string
+	DataDir     string
+	DownloadDir string
+	CAFile      string
+	DaemonURL   string
 
 	cfg        Config
 	workDirOwn bool // the harness created it and must remove it
@@ -136,12 +148,13 @@ func SetupServers(cfg Config) (*World, error) {
 	}
 
 	w := &World{
-		Log:        eventlog.New(),
-		Vars:       NewBag(),
-		cfg:        cfg,
-		workDirOwn: owned,
-		DataDir:    filepath.Join(workDir, "data"),
-		CAFile:     filepath.Join(workDir, "ca.pem"),
+		Log:         eventlog.New(),
+		Vars:        NewBag(),
+		cfg:         cfg,
+		workDirOwn:  owned,
+		DataDir:     filepath.Join(workDir, "data"),
+		DownloadDir: filepath.Join(workDir, "app-download"),
+		CAFile:      filepath.Join(workDir, "ca.pem"),
 	}
 	if err := os.MkdirAll(w.DataDir, 0o755); err != nil {
 		w.cleanupWorkDir(workDir)
@@ -180,6 +193,18 @@ func SetupServers(cfg Config) (*World, error) {
 		w.cleanupWorkDir(workDir)
 		return nil, err
 	}
+	// Storage is signed by the same CA as the broker, because the daemon pins
+	// both to MQTT_CA_FILE.
+	if w.Storage, err = storage.Start(storage.Options{Log: w.Log, CA: ca}); err != nil {
+		_ = w.closeServers()
+		w.cleanupWorkDir(workDir)
+		return nil, err
+	}
+	if w.AppCLI, err = appcli.Start(appcli.Options{Log: w.Log, Resolve: w.Storage.Lookup}); err != nil {
+		_ = w.closeServers()
+		w.cleanupWorkDir(workDir)
+		return nil, err
+	}
 
 	port, err := freePort()
 	if err != nil {
@@ -198,6 +223,7 @@ func SetupServers(cfg Config) (*World, error) {
 	w.Vars.Set("thing_id", cfg.ThingID)
 	w.Vars.Set("api_url", w.ProvAPI.URL())
 	w.Vars.Set("broker_url", w.Broker.URL())
+	w.Vars.Set("app_cli_url", w.AppCLI.URL())
 	w.Vars.Set("ntp_addr", w.NTP.Addr())
 	w.Vars.Set("daemon_url", w.DaemonURL)
 	w.Vars.Set("data_dir", w.DataDir)
@@ -212,7 +238,7 @@ func (w *World) Env() map[string]string {
 	if _, p, err := net.SplitHostPort(trimScheme(w.DaemonURL)); err == nil {
 		port = p
 	}
-	return map[string]string{
+	env := map[string]string{
 		EnvPort:            port,
 		EnvDataDir:         w.DataDir,
 		EnvProvisioningAPI: w.ProvAPI.URL(),
@@ -220,11 +246,18 @@ func (w *World) Env() map[string]string {
 		EnvMQTTCAFile:      w.CAFile,
 		EnvNTPProbeHost:    w.NTP.Addr(),
 		EnvLogLevel:        w.cfg.LogLevel,
+		EnvAppCLIURL:       w.AppCLI.URL(),
+		// Like the data directory: the default is under /var/lib.
+		EnvAppDownloadDir: w.DownloadDir,
 		// The unix socket is pointed at the work directory rather than left at
 		// its default: the default lives under /run, which the suite has no
 		// business writing to, and binding it is non-fatal anyway.
 		EnvSocket: filepath.Join(w.cfg.WorkDir, "daemon.sock"),
 	}
+	if w.cfg.InstallTimeout > 0 {
+		env[EnvInstallTimeout] = w.cfg.InstallTimeout.String()
+	}
+	return env
 }
 
 // StartDaemon spawns the binary and waits for its REST listener.
@@ -305,6 +338,14 @@ func (w *World) Teardown(ctx context.Context) error {
 
 func (w *World) closeServers() error {
 	var errs []error
+	if w.AppCLI != nil {
+		errs = append(errs, w.AppCLI.Close())
+		w.AppCLI = nil
+	}
+	if w.Storage != nil {
+		errs = append(errs, w.Storage.Close())
+		w.Storage = nil
+	}
 	if w.Broker != nil {
 		errs = append(errs, w.Broker.Close())
 		w.Broker = nil

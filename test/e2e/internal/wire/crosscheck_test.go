@@ -144,6 +144,42 @@ func TestHarnessDecodesWhatTheDaemonPublishes(t *testing.T) {
 				"timestamp":  int64(4),
 			},
 		},
+		{
+			name:     "App.commandResponse in progress",
+			cmd:      command.From(command.AppCommandResponseCmd{OperationID: "op-1", Status: command.AppCommandInProgress, Details: ptr(int32(50))}),
+			wantName: wire.CmdAppCommandResponse,
+			wantTag:  wire.TagAppCommandResponse,
+			wantFields: map[string]any{
+				"op_id": "op-1", "status": "progress", "elements": 3, "details": int64(50),
+			},
+		},
+		{
+			name:     "App.commandResponse failed",
+			cmd:      command.From(command.AppCommandResponseCmd{OperationID: "op-1", Status: command.AppCommandFailed, Details: ptr(int32(-49))}),
+			wantName: wire.CmdAppCommandResponse,
+			wantTag:  wire.TagAppCommandResponse,
+			wantFields: map[string]any{
+				"op_id": "op-1", "status": "fail", "elements": 3, "details": int64(-49),
+			},
+		},
+		{
+			// The success carries no details at all, which is what `elements` pins.
+			name:       "App.commandResponse succeeded",
+			cmd:        command.From(command.AppCommandResponseCmd{OperationID: "op-1", Status: command.AppCommandSucceeded}),
+			wantName:   wire.CmdAppCommandResponse,
+			wantTag:    wire.TagAppCommandResponse,
+			wantFields: map[string]any{"op_id": "op-1", "status": "ok", "elements": 2},
+		},
+		{
+			name: "Apps.list",
+			cmd: command.From(command.AppsListCmd{Apps: []command.AppInfo{
+				{Name: "app1:0.1.0", Status: command.AppRunning, Default: true},
+				{Name: "app2:1.0.0", Status: command.AppStopped},
+			}}),
+			wantName:   wire.CmdAppsList,
+			wantTag:    wire.TagAppsList,
+			wantFields: map[string]any{"apps": "app1:0.1.0=running*,app2:1.0.0=stopped", "count": 2},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,6 +248,20 @@ func TestDaemonDecodesWhatTheHarnessPublishes(t *testing.T) {
 				URL:        "https://example.invalid/fw.bin",
 				InitialSHA: [32]byte{},
 				FinalSHA:   [32]byte{},
+			},
+		},
+		{
+			name:    "App.command start with a parameter",
+			payload: wire.EncodeAppCommand("app1:0.1.0", 1, "op-1", ptr(int64(0))),
+			want: command.AppCommandCmd{
+				AppName: "app1:0.1.0", Command: command.AppStart, OperationID: "op-1", Parameter: ptr(int64(0)),
+			},
+		},
+		{
+			name:    "App.command set-default without a parameter",
+			payload: wire.EncodeAppCommand("app1:0.1.0", 3, "op-2", nil),
+			want: command.AppCommandCmd{
+				AppName: "app1:0.1.0", Command: command.AppSetDefault, OperationID: "op-2",
 			},
 		},
 	}
@@ -352,3 +402,5 @@ func TestDaemonAcceptsAnEmptyHarnessBatch(t *testing.T) {
 		t.Errorf("got %#v, want no variables", vars)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

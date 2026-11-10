@@ -200,7 +200,8 @@ func TestDecodeRejectsMalformedInput(t *testing.T) {
 		{"indefinite-length byte string", "5f42010243030405ff"},
 		{"indefinite-length array", "9f018202039f0405ffff"},
 		{"reserved additional information", "1c"},
-		{"unsupported simple value", "f0"},
+		{"undefined simple value", "f7"},
+		{"two-byte simple value", "f820"},
 		{"truncated half float", "f93e"},
 		{"truncated double float", "fb3ff80000"},
 		{"tag with no content", "c1"},
@@ -217,6 +218,23 @@ func TestDecodeRejectsMalformedInput(t *testing.T) {
 // An integer past int64 stays a uint64 rather than wrapping to a negative
 // number, because a silently negative length or timestamp is worse than a type
 // the caller has to notice.
+// The unassigned one-byte simple values decode as Simple, distinct from both the
+// integers and the booleans that share major type 7.
+func TestDecodeUnassignedSimpleValue(t *testing.T) {
+	for hex, want := range map[string]Simple{"e0": 0, "e5": 5, "e8": 8, "f3": 19} {
+		got, err := Decode(mustHex(t, hex))
+		if err != nil {
+			t.Fatalf("Decode(%s): %v", hex, err)
+		}
+		if got != want {
+			t.Errorf("Decode(%s) = %#v (%T), want Simple(%d)", hex, got, got, want)
+		}
+	}
+	if got, _ := Decode(mustHex(t, "f4")); got != false {
+		t.Errorf("Decode(f4) = %#v, want false: 20 is not an unassigned simple value", got)
+	}
+}
+
 func TestDecodeHugeUnsignedStaysUnsigned(t *testing.T) {
 	got, err := Decode(mustHex(t, "1bffffffffffffffff"))
 	if err != nil {

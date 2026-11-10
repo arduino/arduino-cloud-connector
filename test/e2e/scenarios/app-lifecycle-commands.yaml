@@ -1,0 +1,67 @@
+# The lifecycle commands on Apps that are already installed (RFC-16 §3):
+# stop, set-default and delete. No deploy: the fake arduino-app-cli starts
+# with the Apps on it.
+#
+#   - stop: one call, its progress forwarded (stop IS the command here), then
+#     ok with no details. Stopping a stopped App is a success too, because
+#     arduino-app-cli's stop is idempotent;
+#   - set-default: one PATCH carrying {"default": true} and nothing else,
+#     no progress, ok. The previous default is not touched by the daemon --
+#     arduino-app-cli keeps one default and overwrites it;
+#   - delete: not supported yet, answered -3 without calling arduino-app-cli
+#     at all (strict_events would fail on a call nobody expected).
+name: app-lifecycle-commands
+strict_events: true
+
+fakes:
+  app_cli:
+    apps:
+      - { id: "a:1.0.0", status: running }
+      - { id: "b:1.0.0", status: stopped, default: true }
+
+tolerate:
+  - { source: mqtt, cmd: Thing.begin }
+
+steps:
+  - await_daemon_state: { state: Provisioning, timeout: 30s }
+  - get_device_identity: {}
+  - start_provisioning: {}
+  - expect_api_call: { endpoint: provision/csr, timeout: 30s }
+  - expect_api_call: { endpoint: provision/complete, timeout: 30s }
+  - expect_mqtt_connect: { timeout: 60s }
+  - expect_mqtt_subscribe: { topic: "/a/d/{device_id}/c/dw" }
+  - expect_mqtt_publish: { cmd: Device.begin }
+  - expect_mqtt_publish: { cmd: DeviceNetConfig }
+  - expect_mqtt_publish: { cmd: Thing.begin, thing_id: "" }
+  - cloud_publish: { cmd: Thing.update, thing_id: "{thing_id}" }
+  - expect_mqtt_subscribe: { topic: "/a/t/{thing_id}/e/i" }
+  - expect_mqtt_publish: { cmd: LastValues.begin }
+  - cloud_publish: { cmd: LastValues.update, values: [] }
+  - await_daemon_cloud_state: { state: Steady, thing_id: "{thing_id}", timeout: 30s }
+
+  # ── stop ───────────────────────────────────────────────────────────────────
+  - cloud_app_stop: { app: "a:1.0.0", op_id: stop1 }
+  - expect_app_cli_call: { endpoint: stop, app: "a:1.0.0", outcome: stopped }
+  - expect_app_command_response: { op_id: stop1, status: progress, details: 100 }
+  - expect_app_command_response: { op_id: stop1, status: ok }
+
+  # Again, on the now stopped App: still a success.
+  - cloud_app_stop: { app: "a:1.0.0", op_id: stop2 }
+  - expect_app_cli_call: { endpoint: stop, app: "a:1.0.0", outcome: stopped, occurrence: 2 }
+  - expect_app_command_response: { op_id: stop2, status: progress, details: 100 }
+  - expect_app_command_response: { op_id: stop2, status: ok }
+
+  # ── set-default ────────────────────────────────────────────────────────────
+  - cloud_app_set_default: { app: "a:1.0.0", op_id: def1 }
+  - expect_app_cli_call:
+      endpoint: default
+      method: PATCH
+      app: "a:1.0.0"
+      default: true
+      fields: default
+      outcome: default_set
+  - expect_app_command_response: { op_id: def1, status: ok }
+
+  # ── delete: not supported yet ──────────────────────────────────────────────
+  - cloud_app_delete: { app: "b:1.0.0", op_id: del1 }
+  - expect_app_command_response: { op_id: del1, status: fail, details: -3 }
