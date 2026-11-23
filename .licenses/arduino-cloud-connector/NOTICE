@@ -1355,7 +1355,7 @@ version(s), and exceptions or additional permissions here}."
   You may add additional accurate notices of copyright ownership.
 
 *****
-github.com/fxamacker/cbor/v2@v2.9.6
+github.com/fxamacker/cbor/v2@v2.10.0
 
 MIT License
 
@@ -1381,7 +1381,7 @@ SOFTWARE.
 
 -----
 
-Copyright © 2019-2024 [Faye Amacker](https://github.com/fxamacker).
+Copyright © 2019-2026 [Faye Amacker](https://github.com/fxamacker).
 
 fxamacker/cbor is licensed under the MIT License.  See [LICENSE](LICENSE) for the full license text.
 
