@@ -136,6 +136,51 @@ func TestEncode_DeviceNetConfigCmd_EthernetDHCP(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
+func TestEncode_OTAProgressCmd(t *testing.T) {
+	// The C++ vector, test_command_encode.cpp "Encode the OtaProgressCmdUp message".
+	// The state is a CBOR simple value (E1), not the integer 01 a uint8 would give:
+	// the C++ encoder uses cbor_encode_simple_value.
+	//
+	// DA 00010200                             # tag(66048)
+	//    84                                   # array(4)
+	//       50                                # bytes(16)
+	//          000102030405060708090A0B0C0D0E0F
+	//       E1                                # simple(1)
+	//       20                                # negative(0)
+	//       18 64                             # unsigned(100)
+	want := []byte{
+		0xda, 0x00, 0x01, 0x02, 0x00, 0x84, 0x50, 0x00,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0xe1,
+		0x20, 0x18, 0x64,
+	}
+	got, err := command.Encode(command.From(command.OTAProgressCmd{
+		ID:        [16]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf},
+		State:     1,
+		StateData: -1,
+		Timestamp: 100,
+	}))
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
+// Every OTA state the daemon sends is one byte, E0+state — Fail (8) included.
+func TestEncode_OTAProgressCmd_EveryStateIsASimpleValue(t *testing.T) {
+	for state := range command.OTAState(9) {
+		got, err := command.Encode(command.From(command.OTAProgressCmd{State: state}))
+		require.NoError(t, err)
+		// tag(5) + array head(1) + bytes(16) head(1) + 16 id bytes = 23 bytes before it.
+		require.Equal(t, 0xe0|byte(state), got[23], "state %d", state)
+	}
+}
+
+// From 20 up a simple value means false, true, null, undefined or nothing at all, so
+// such a state must be refused rather than sent as a boolean.
+func TestEncode_OTAProgressCmd_RefusesAStateBeyondTheSimpleRange(t *testing.T) {
+	_, err := command.Encode(command.From(command.OTAProgressCmd{State: 20}))
+	require.Error(t, err)
+}
+
 // ── Decode — cloud→device downlink ───────────────────────────────────────────
 
 const goldenThingID command.ThingID = "e4494d55-872a-4fd2-9646-92f87949394c"

@@ -111,12 +111,12 @@ tasks:
 
   test:cloud:
     desc: |
-      Run Cloud FSM tests (internal/daemon/cloud).
+      Run Cloud FSM tests (internal/cloud).
       Uses a fake in-process MQTT client with millisecond-scale back-off timers
       so the full handshake, detach, reassignment, and reconnect scenarios run
       without any real network access.
     cmds:
-      - go test -v -race ./internal/daemon/cloud/... {{.CLI_ARGS}}
+      - go test -v -race ./internal/cloud/... {{.CLI_ARGS}}
 
   test:protocol:
     desc: Run both CBOR command and SenML tests (shortcut for test:cbor + test:senml)

@@ -114,6 +114,17 @@ func (c *fakeClient) injectCommand(cmd command.Cmd) {
 	}
 }
 
+// injectProperty delivers an inbound property payload to the FSM as if the broker
+// sent it on the thing's property topic.
+func (c *fakeClient) injectProperty(payload []byte) {
+	c.mu.Lock()
+	fn := c.propFn
+	c.mu.Unlock()
+	if fn != nil {
+		fn(mqtt.PropertyMessage{Payload: payload})
+	}
+}
+
 // dropConnection simulates an unexpected broker disconnect.
 func (c *fakeClient) dropConnection(cause error) {
 	c.mu.Lock()

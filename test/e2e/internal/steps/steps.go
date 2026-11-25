@@ -106,6 +106,12 @@ func Default() Registry {
 			map[string]string{"state": "cloud_state"}),
 		"await_daemon_provisioning_state": awaitEvent(eventlog.SourceDaemonStatus, eventlog.KindStatusPoll,
 			map[string]string{"state": "provisioning"}),
+		// App deploy and lifecycle (apps.go).
+		"expect_storage_call":         awaitEvent(eventlog.SourceStorage, eventlog.KindHTTPRequest, nil),
+		"expect_app_cli_call":         awaitEvent(eventlog.SourceAppCLI, eventlog.KindHTTPRequest, nil),
+		"expect_ota_progress":         expectOTAProgress,
+		"expect_ota_begin":            expectOTABegin,
+		"expect_app_command_response": expectAppCommandResponse,
 
 		// ── actions ───────────────────────────────────────────────────────
 		"get_device_identity":   getDeviceIdentity,
@@ -118,6 +124,12 @@ func Default() Registry {
 		"cloud_publish_var":     cloudPublishVar,
 		"cloud_drop_connection": cloudDropConnection,
 		"stop_daemon":           stopDaemon,
+		// App deploy and lifecycle (apps.go).
+		"cloud_ota":             cloudOTA,
+		"cloud_app_start":       cloudAppCommand("start"),
+		"cloud_app_stop":        cloudAppCommand("stop"),
+		"cloud_app_set_default": cloudAppCommand("set_default"),
+		"cloud_app_delete":      cloudAppCommand("delete"),
 	}
 	// The group needs the registry it belongs to, to run the expectations it
 	// wraps, so it is added once the map exists.

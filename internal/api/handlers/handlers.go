@@ -14,8 +14,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/arduino/arduino-cloud-connector/internal/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/daemon"
-	"github.com/arduino/arduino-cloud-connector/internal/daemon/cloud"
 	"github.com/arduino/arduino-cloud-connector/internal/identity"
 	"github.com/arduino/arduino-cloud-connector/internal/provisioning"
 	"github.com/arduino/arduino-cloud-connector/internal/variables"
@@ -246,11 +246,11 @@ type steadyReporter interface {
 // An X-App-Client-ID sent here identifies the subscribing app: values this
 // same app PUTs (carrying the same header) are not echoed back on this stream.
 // Cloud-originated frames are unaffected and always delivered.
-func HandleVariableEvents(reg *variables.Registry, cloud steadyReporter) http.Handler {
+func HandleVariableEvents(reg *variables.Registry, steady steadyReporter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 
-		first, sub := reg.Subscribe(name, clientID(r), cloud.CloudSteady())
+		first, sub := reg.Subscribe(name, clientID(r), steady.CloudSteady())
 		defer reg.Unsubscribe(name, sub)
 
 		flusher, ok := w.(http.Flusher)

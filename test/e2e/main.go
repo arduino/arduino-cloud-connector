@@ -153,7 +153,7 @@ func run() error {
 // there. Keeping the World alive turns "start_daemon: timeout" into a report
 // with the daemon's last words in it.
 func runScenario(ctx context.Context, daemonBin string, sc scenario.Scenario, reg steps.Registry) eventlog.Result {
-	w, err := harness.SetupServers(harness.Config{DaemonBinary: daemonBin})
+	w, err := harness.SetupServers(harness.Config{DaemonBinary: daemonBin, InstallTimeout: sc.InstallTimeout})
 	if err != nil {
 		// No World means no log and no artifact; this is the one failure that
 		// can only be an error string.

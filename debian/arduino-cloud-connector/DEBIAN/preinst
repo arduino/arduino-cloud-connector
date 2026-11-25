@@ -6,6 +6,7 @@ ARDUINO_HOME="/home/arduino"
 
 # Path to the data directory.
 DATA_DIR="$ARDUINO_HOME/.local/share/arduino-cloud-connector"
+DOWNLOAD_DIR="$DATA_DIR/app-download"
 
 # dpkg runs this as root, so a plain `mkdir -p` would leave the missing
 # parents root-owned and other programs running as arduino could no longer
@@ -22,4 +23,8 @@ done
 # Check if the directory does NOT exist yet (First-time install)
 if [ ! -d "$DATA_DIR" ]; then
     install -d -o arduino -g arduino -m 700 "$DATA_DIR"
+fi
+
+if [ ! -d "$DOWNLOAD_DIR" ]; then
+    install -d -o arduino -g arduino -m 700 "$DOWNLOAD_DIR"
 fi
